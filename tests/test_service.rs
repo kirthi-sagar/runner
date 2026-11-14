@@ -59,6 +59,9 @@ fn unit_file_matches_installer_contract() {
     assert!(text.starts_with("[Unit]\n"));
     assert!(text.contains("ExecStart=/opt/runner/bin/runner start\n"));
     assert!(text.contains("EnvironmentFile=-%h/.config/runner/env\n"));
+    assert!(text.contains(
+        "Environment=\"PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\"\n"
+    ));
     assert!(text.contains("WantedBy=default.target\n"));
     assert!(text.ends_with('\n'));
 }

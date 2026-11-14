@@ -38,6 +38,9 @@ jobs:
           echo "=== Executing inside runner zero-freeze sandbox ==="
           cat /proc/self/cgroup || true
 
+      - name: Ensure cargo is in PATH
+        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
       - name: Run automated test suite
         run: cargo test --all-targets
 

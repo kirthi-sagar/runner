@@ -34,6 +34,7 @@ pub fn unit_file_contents(exec_start: &str) -> String {
          Restart=on-failure\n\
          RestartSec=5s\n\
          EnvironmentFile=-%h/.config/runner/env\n\
+         Environment=\"PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\"\n\
          Slice=runner.slice\n\
          KillMode=mixed\n\
          TimeoutStopSec=15s\n\
@@ -143,6 +144,7 @@ mod tests {
             "Restart=on-failure",
             "RestartSec=5s",
             "EnvironmentFile=-%h/.config/runner/env",
+            "Environment=\"PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\"",
             "Slice=runner.slice",
             "KillMode=mixed",
             "TimeoutStopSec=15s",

@@ -110,6 +110,7 @@ if [ "$MODE" = "system" ]; then
     UNIT_FILE="/etc/systemd/system/runner.service"
     EXEC_START="/usr/local/bin/runner start"
     ENV_LINE="EnvironmentFile=-/etc/runner/env"
+    PATH_LINE='Environment="PATH=/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin"'
     WANTED_BY="multi-user.target"
     RELOAD="systemctl daemon-reload"
 else
@@ -121,6 +122,7 @@ else
     UNIT_FILE="$HOME_DIR/.config/systemd/user/runner.service"
     EXEC_START="%h/.local/bin/runner start"
     ENV_LINE="EnvironmentFile=-%h/.config/runner/env"
+    PATH_LINE='Environment="PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"'
     WANTED_BY="default.target"
     RELOAD="systemctl --user daemon-reload"
 fi
@@ -190,6 +192,7 @@ ExecStart=$EXEC_START
 Restart=on-failure
 RestartSec=5s
 $ENV_LINE
+$PATH_LINE
 Slice=runner.slice
 KillMode=mixed
 TimeoutStopSec=15s

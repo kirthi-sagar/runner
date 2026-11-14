@@ -121,6 +121,7 @@ Existing self-hosted runners fail at this because:
 | **Infrastructure Overhead** | **Zero (Single static binary)** | Low (Directory install) | Very High (Kubernetes cluster) | Low (Docker CLI) | Managed SaaS |
 | **Distributed LAN Cache** | **Transparent (ACTIONS_CACHE_URL)**| No | Optional (MinIO / S3 setup) | Local Docker volume only | Cloud cache |
 | **macOS Apple Silicon Support** | **Darwin QoS (E-Core Pinning)** | Unmanaged | Not supported | Local Docker (Rosetta/arm) | Metered cloud |
+| **Multi-Provider CI** | **GitHub + GitLab + Bitbucket + Local** | GitHub only | GitHub only | GitHub emu only | GitHub (+ paid add-ons) |
 
 ---
 
@@ -298,3 +299,31 @@ caps through the local cgroups weight ladder, AFK Boost, and slot
 clamping, so foreign CI jobs yield to the donor's own apps. Discover LAN
 machines with `runner mesh list --lan`. Revoke by draining:
 `drain_node` via MCP stops new dispatches to a peer.
+
+---
+
+## 10. Universal Multi-Provider CI Matrix
+
+`runner` is a single, unified zero-freeze mesh across every CI source.
+One governor, one sandbox, one fleet — four providers behind the common
+`CiProvider` trait (`poll → claim → execute → complete`):
+
+1. **GitHub Actions**: Official wrapped worker with ephemeral JIT tokens.
+   Workflows target `runs-on: [self-hosted, runner]`; the coordinator
+   polls queued jobs, mints single-use JIT configs, and supervises the
+   official `actions/runner` binary in the tmpfs sandbox.
+2. **GitLab CI**: Native REST v4 runner protocol. Configure `[gitlab]`
+   (`url`, `runner_token`, `tags`) and tag jobs
+   `[zero-freeze, runner]`; `runner` long-polls `jobs/request`, executes
+   scripts sandboxed, and streams logs via trace chunks.
+3. **Bitbucket Pipelines**: Atlassian OAuth runner protocol. Configure
+   `[bitbucket]` (workspace, repo, runner UUID, OAuth client) and target
+   `runs-on: [zero-freeze, runner]`; steps execute sandboxed with chunked
+   log upload and `SUCCESS`/`FAILED` status reports.
+4. **Local Git / CLI**: Zero-freeze offline command execution for
+   developers, AI agents, and pre-commit hooks — no remote CI needed:
+   `runner exec -- <cmd> [args...]` runs anything under the PSI governor
+   with cgroup isolation, exit-code propagation, and timeout kill.
+
+Providers register in `ProviderRegistry` and poll independently: one
+provider's outage never stalls the others.

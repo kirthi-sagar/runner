@@ -32,6 +32,15 @@ fn reject_blocked_ip_literals(command: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Unique job id per execution: concurrent calls must never share a
+/// workspace directory (one call's scrub-on-drop would remove another's
+/// child working directory mid-spawn).
+fn next_job_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("exec-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::SeqCst))
+}
+
 /// Drive slice weights from live PSI until cancelled (250ms cadence).
 async fn govern_slice_while_running(slice: CgroupSlice) {
     let poller = PsiPoller::spawn();
@@ -67,8 +76,7 @@ pub async fn execute_local_sandboxed(
     reject_blocked_ip_literals(command)?;
 
     // Workspace lifetime spans the run so Drop scrubs it after exit.
-    let job_id = format!("exec-{}", std::process::id());
-    let workspace = Workspace::create(&sanitize_job_id(&job_id))
+    let workspace = Workspace::create(&sanitize_job_id(&next_job_id()))
         .context("workspace setup failed")?;
     let sandboxed = !no_sandbox && probe_userns();
 
@@ -138,8 +146,7 @@ pub async fn execute_captured(
     }
     reject_blocked_ip_literals(command)?;
 
-    let job_id = format!("exec-{}", std::process::id());
-    let workspace = Workspace::create(&sanitize_job_id(&job_id))
+    let workspace = Workspace::create(&sanitize_job_id(&next_job_id()))
         .context("workspace setup failed")?;
     let sandboxed = !no_sandbox && probe_userns();
 

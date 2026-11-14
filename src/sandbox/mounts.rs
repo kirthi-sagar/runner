@@ -215,8 +215,11 @@ mod tests {
     #[test]
     fn job_ids_cannot_escape_root() {
         assert_eq!(sanitize_job_id("../../etc"), "______etc");
-        let path = job_root().join(sanitize_job_id("../../etc"));
-        assert!(path.starts_with(job_root()));
+        // Single snapshot: a sibling test mutates RUNNER_JOB_ROOT, so the
+        // root must be read once for both join and containment check.
+        let root = job_root();
+        let path = root.join(sanitize_job_id("../../etc"));
+        assert!(path.starts_with(&root));
     }
 
     #[test]

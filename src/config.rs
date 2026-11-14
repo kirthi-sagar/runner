@@ -172,6 +172,50 @@ impl Default for GitlabConfig {
     }
 }
 
+/// Native Bitbucket Pipelines runner settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BitbucketConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default)]
+    pub repo_slug: String,
+    #[serde(default)]
+    pub runner_uuid: String,
+    #[serde(default)]
+    pub oauth_client_id: String,
+    #[serde(default)]
+    pub oauth_client_secret: String,
+    #[serde(default = "default_bitbucket_poll_secs")]
+    pub poll_secs: u64,
+    #[serde(default = "default_bitbucket_labels")]
+    pub labels: Vec<String>,
+}
+
+fn default_bitbucket_poll_secs() -> u64 {
+    10
+}
+
+fn default_bitbucket_labels() -> Vec<String> {
+    vec!["zero-freeze".to_string(), "linux".to_string(), "runner".to_string()]
+}
+
+impl Default for BitbucketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(),
+            workspace: String::new(),
+            repo_slug: String::new(),
+            runner_uuid: String::new(),
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
+            poll_secs: default_bitbucket_poll_secs(),
+            labels: default_bitbucket_labels(),
+        }
+    }
+}
+
 /// Env var carrying the GitHub token (`administration:write` for JIT).
 pub const GITHUB_TOKEN_ENV: &str = "RUNNER_GITHUB_TOKEN";
 
@@ -197,6 +241,8 @@ pub struct RunnerConfig {
     pub coordinator: CoordinatorConfig,
     #[serde(default)]
     pub gitlab: GitlabConfig,
+    #[serde(default)]
+    pub bitbucket: BitbucketConfig,
 }
 
 impl RunnerConfig {

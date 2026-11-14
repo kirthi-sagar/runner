@@ -6,10 +6,12 @@
 //! capacity. Provider-specific protocols live in submodules; everything
 //! downstream (sandboxing, governance, fleet state) is provider-agnostic.
 
+pub mod bitbucket;
 pub mod github;
 pub mod gitlab;
 pub mod local;
 
+pub use bitbucket::BitbucketProvider;
 pub use gitlab::GitlabProvider;
 
 use std::path::PathBuf;
@@ -81,13 +83,14 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    /// Stock registry: local execution plus disabled GitHub/GitLab
-    /// placeholders (enabled once tokens are configured).
+    /// Stock registry: local execution plus disabled GitHub/GitLab/
+    /// Bitbucket placeholders (enabled once tokens are configured).
     pub async fn default_registry() -> Self {
         let registry = Self::new();
         registry.register(Box::new(local::LocalProvider::new())).await;
         registry.register(Box::new(github::GithubProvider::disabled())).await;
         registry.register(Box::new(GitlabProvider::disabled())).await;
+        registry.register(Box::new(BitbucketProvider::disabled())).await;
         registry
     }
 

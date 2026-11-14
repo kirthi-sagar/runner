@@ -1,6 +1,6 @@
 [package]
 name = "runner"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Host supervisor, federated mesh coordinator, and sandbox hypervisor for GitHub Actions runners"
 license = "MIT"
@@ -31,6 +31,10 @@ serde_json = "1"
 toml = "0.8"
 anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.7", default-features = false, features = ["tokio", "json", "query", "http1"] }
+tower = "0.5"
+jsonwebtoken = "9"
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

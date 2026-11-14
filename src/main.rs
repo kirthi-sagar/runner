@@ -63,6 +63,21 @@ enum Commands {
         #[arg(long, default_value = "stdio")]
         transport: String,
     },
+    /// Start the enterprise web control plane (fleet API + OIDC SSO)
+    Server {
+        /// Listen address, e.g. 0.0.0.0:8080
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        listen: String,
+        /// OIDC issuer base URL (enables SSO with client id/secret)
+        #[arg(long)]
+        oidc_issuer: Option<String>,
+        /// OIDC client id
+        #[arg(long)]
+        client_id: Option<String>,
+        /// OIDC client secret
+        #[arg(long)]
+        client_secret: Option<String>,
+    },
     /// Federated mesh controls
     Mesh {
         #[command(subcommand)]
@@ -387,6 +402,37 @@ async fn main() -> Result<()> {
             state.write().await.seed_from_config(&config);
             let server = McpServer::new(ToolContext::new(state, config));
             server.serve_stdio().await?;
+        }
+        Commands::Server { listen, oidc_issuer, client_id, client_secret } => {
+            use runner::control_plane::auth::{OidcConfig, OidcManager, SessionStore};
+            use runner::control_plane::fleet::FleetRegistry;
+            use runner::control_plane::server::{AppState, serve_on};
+            let oidc = match (oidc_issuer, client_id, client_secret) {
+                (Some(issuer), Some(id), Some(secret)) => {
+                    eprintln!("runner: OIDC SSO enabled (issuer {issuer})");
+                    Some(OidcManager::new(OidcConfig {
+                        issuer_url: issuer.clone(),
+                        client_id: id,
+                        client_secret: secret,
+                        redirect_uri: format!("http://{listen}/auth/callback"),
+                    }))
+                }
+                (None, None, None) => {
+                    eprintln!("runner: OIDC disabled; fleet API only");
+                    None
+                }
+                _ => anyhow::bail!(
+                    "OIDC needs all of --oidc-issuer, --client-id, --client-secret"
+                ),
+            };
+            let state = AppState::new(
+                FleetRegistry::new(),
+                SessionStore::new(std::time::Duration::from_secs(3600)),
+                oidc,
+            );
+            let listener = tokio::net::TcpListener::bind(&listen).await?;
+            eprintln!("runner: control plane listening on {listen}");
+            serve_on(listener, state).await?;
         }
         Commands::Mesh { command } => match command {
             MeshCommands::Invite { role, max_cores, max_ram, ttl, name } => {

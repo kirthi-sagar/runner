@@ -11,6 +11,7 @@
 //! * Never mount `/home/*` into job sandboxes; block RFC 1918 egress.
 
 pub mod config;
+pub mod control_plane;
 pub mod github;
 pub mod governor;
 pub mod ipc;

@@ -327,3 +327,39 @@ One governor, one sandbox, one fleet — four providers behind the common
 
 Providers register in `ProviderRegistry` and poll independently: one
 provider's outage never stalls the others.
+
+---
+
+## 11. Enterprise Hardening (v0.3.0)
+
+Three production capabilities for regulated and large-scale fleets:
+
+### Native eBPF Egress Filtering
+
+`src/sandbox/ebpf.rs` generates socket-filter bytecode in pure Rust — no
+external `nftables` CLI execution. The program drops RFC 1918, `169.254/16`
+metadata, and IPv6 ULA destinations, allows only UDP 53 (DNS) and TCP 443
+(HTTPS), and default-drops everything else. `probe_ebpf()` detects
+unprivileged attach support at runtime without panicking.
+
+### Firecracker MicroVM Execution (Tier-1)
+
+`src/sandbox/microvm.rs` drives Firecracker's REST socket API: boot source,
+rootfs, vsock, `InstanceStart`, and graceful `SendCtrlAltDel` shutdown.
+`MicroVmSupervisor` polls socket readiness with timeout and cleans up on
+exit. `probe_kvm()` gates Tier-1 on `/dev/kvm` availability — hosts
+without KVM degrade gracefully to Tier-2 namespaces, never crashing.
+
+### Centralized Control Plane with OIDC SSO
+
+`runner server --listen 0.0.0.0:8080` starts the embedded Axum plane:
+
+- `GET /health` — liveness + version.
+- `GET /api/v1/fleet` — active runners, capacities, PSI telemetry.
+- `POST /api/v1/runners/register` — enroll a node, receive a bearer token.
+- `POST /api/v1/runners/heartbeat` — Bearer-authenticated telemetry.
+- `GET /auth/login` → OIDC redirect (Okta, Keycloak, Google Workspace).
+- `GET /auth/callback` — code exchange, RS256 JWKS verification, session.
+
+Stale runners past the heartbeat TTL are evicted automatically. Enable SSO
+with `--oidc-issuer`, `--client-id`, and `--client-secret`.

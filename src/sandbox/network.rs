@@ -7,6 +7,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// In-process eBPF egress program (no external `nftables` CLI needed).
+pub use super::ebpf::EgressFilterProgram;
+
 /// Reserved private ranges (RFC 1918).
 pub const RFC1918_CIDRS: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
 /// Link-local / cloud-metadata range.

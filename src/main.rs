@@ -72,6 +72,18 @@ enum Commands {
     Join {
         token: String,
     },
+    /// Execute a command locally inside the zero-freeze sandbox
+    Exec {
+        /// Command and arguments to execute
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+        /// Bypass user namespace sandboxing (run directly with cgroup governance)
+        #[arg(long, default_value_t = false)]
+        no_sandbox: bool,
+        /// Maximum execution timeout in minutes
+        #[arg(long, default_value_t = 60)]
+        timeout_mins: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -386,6 +398,18 @@ async fn main() -> Result<()> {
         },
         Commands::Join { token } => {
             cmd_join(&token).await?;
+        }
+        Commands::Exec { command, no_sandbox, timeout_mins } => {
+            let timeout = std::time::Duration::from_secs(timeout_mins.max(1) * 60);
+            match runner::providers::local::execute_local_sandboxed(&command, no_sandbox, timeout)
+                .await
+            {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("runner exec failed: {e:#}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
     Ok(())

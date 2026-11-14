@@ -17,6 +17,7 @@ pub mod ipc;
 pub mod mcp;
 pub mod mesh;
 pub mod pidfile;
+pub mod providers;
 pub mod sandbox;
 pub mod status;
 

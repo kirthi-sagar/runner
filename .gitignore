@@ -1,5 +1,7 @@
 /target
 target/
+AGENT_BUILD_PROMPT.md
+MUSE_CLI_PROMPT.md
 **/*.rs.bk
 *.swp
 *.tmp

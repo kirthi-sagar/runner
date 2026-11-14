@@ -115,6 +115,99 @@ pub async fn execute_local_sandboxed(
     Ok(status.code().unwrap_or(1))
 }
 
+/// Captured command output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Execute with piped stdio + extra env, capturing output (used by
+/// provider adapters that stream logs back, e.g. GitLab trace upload).
+/// Same sandboxing, governance, and timeout-kill contract as
+/// [`execute_local_sandboxed`].
+pub async fn execute_captured(
+    command: &[String],
+    env: &[(String, String)],
+    no_sandbox: bool,
+    timeout: Duration,
+) -> Result<ExecOutput> {
+    if command.is_empty() {
+        anyhow::bail!("no command to execute");
+    }
+    reject_blocked_ip_literals(command)?;
+
+    let job_id = format!("exec-{}", std::process::id());
+    let workspace = Workspace::create(&sanitize_job_id(&job_id))
+        .context("workspace setup failed")?;
+    let sandboxed = !no_sandbox && probe_userns();
+
+    let mut cmd = TokioCommand::new(&command[0]);
+    cmd.args(&command[1..])
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if sandboxed {
+        let spec = workspace
+            .sandbox_spec()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // SAFETY: pre_exec runs after fork in the child only.
+        unsafe {
+            cmd.pre_exec(move || crate::sandbox::mounts::sandbox_pre_exec(&spec));
+        }
+    } else {
+        cmd.current_dir(workspace.path());
+    }
+
+    let slice = CgroupSlice::system_default();
+    let _ = slice.ensure();
+    let governor = tokio::spawn(govern_slice_while_running(slice.clone()));
+
+    let mut child = cmd.spawn().context("failed to spawn command")?;
+    if let Some(pid) = child.id() {
+        let _ = std::fs::write(slice.path().join("cgroup.procs"), pid.to_string());
+    }
+    // Drain pipes on background tasks so output larger than the pipe buffer
+    // never deadlocks the child; `child` stays owned here for timeout kill.
+    let mut stdout_pipe = child.stdout.take().context("stdout pipe missing")?;
+    let mut stderr_pipe = child.stderr.take().context("stderr pipe missing")?;
+    let out_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf)
+            .await
+            .map(|_| buf)
+    });
+    let err_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut buf)
+            .await
+            .map(|_| buf)
+    });
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            governor.abort();
+            out_task.abort();
+            err_task.abort();
+            return Err(e.into());
+        }
+        Err(_) => {
+            child.kill().await.ok();
+            governor.abort();
+            out_task.abort();
+            err_task.abort();
+            anyhow::bail!("command timed out after {}s", timeout.as_secs());
+        }
+    };
+    governor.abort();
+    let stdout = out_task.await.context("stdout drain failed")?.context("stdout read failed")?;
+    let stderr = err_task.await.context("stderr drain failed")?.context("stderr read failed")?;
+    Ok(ExecOutput { code: status.code().unwrap_or(1), stdout, stderr })
+}
+
 /// Direct-execution provider (drives `runner exec`; no remote queue).
 pub struct LocalProvider {
     enabled: bool,

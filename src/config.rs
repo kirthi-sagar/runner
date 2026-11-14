@@ -129,6 +129,49 @@ impl Default for CoordinatorConfig {
     }
 }
 
+/// Native GitLab CI runner settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitlabConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_gitlab_url")]
+    pub url: String,
+    #[serde(default)]
+    pub runner_token: String,
+    #[serde(default = "default_gitlab_poll_secs")]
+    pub poll_secs: u64,
+    #[serde(default = "default_gitlab_tags")]
+    pub tags: Vec<String>,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_gitlab_url() -> String {
+    "https://gitlab.com".to_string()
+}
+
+fn default_gitlab_poll_secs() -> u64 {
+    10
+}
+
+fn default_gitlab_tags() -> Vec<String> {
+    vec!["zero-freeze".to_string(), "linux".to_string(), "runner".to_string()]
+}
+
+impl Default for GitlabConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_false(),
+            url: default_gitlab_url(),
+            runner_token: String::new(),
+            poll_secs: default_gitlab_poll_secs(),
+            tags: default_gitlab_tags(),
+        }
+    }
+}
+
 /// Env var carrying the GitHub token (`administration:write` for JIT).
 pub const GITHUB_TOKEN_ENV: &str = "RUNNER_GITHUB_TOKEN";
 
@@ -152,6 +195,8 @@ pub struct RunnerConfig {
     pub peers: Vec<PeerRecord>,
     #[serde(default)]
     pub coordinator: CoordinatorConfig,
+    #[serde(default)]
+    pub gitlab: GitlabConfig,
 }
 
 impl RunnerConfig {

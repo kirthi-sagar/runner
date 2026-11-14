@@ -7,7 +7,10 @@
 //! downstream (sandboxing, governance, fleet state) is provider-agnostic.
 
 pub mod github;
+pub mod gitlab;
 pub mod local;
+
+pub use gitlab::GitlabProvider;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -76,6 +79,16 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Stock registry: local execution plus disabled GitHub/GitLab
+    /// placeholders (enabled once tokens are configured).
+    pub async fn default_registry() -> Self {
+        let registry = Self::new();
+        registry.register(Box::new(local::LocalProvider::new())).await;
+        registry.register(Box::new(github::GithubProvider::disabled())).await;
+        registry.register(Box::new(GitlabProvider::disabled())).await;
+        registry
     }
 
     /// Register a provider (replaces any provider with the same name).

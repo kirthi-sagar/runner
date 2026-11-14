@@ -2,6 +2,8 @@
 
 /// GitHub REST API base.
 pub const API_BASE: &str = "https://api.github.com";
+/// Required on every call: GitHub rejects API requests without a UA (403).
+pub const USER_AGENT: &str = concat!("runner/", env!("CARGO_PKG_VERSION"));
 
 /// Token scope verdict for JIT issuance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,11 +50,11 @@ impl GithubClient {
         if token.trim().is_empty() {
             return Err("github token must not be empty".to_string());
         }
-        Ok(Self {
-            base_url: API_BASE.to_string(),
-            token,
-            http: reqwest::Client::new(),
-        })
+        let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .map_err(|e| format!("failed to build http client: {e}"))?;
+        Ok(Self { base_url: API_BASE.to_string(), token, http })
     }
 
     /// Point the client at a custom API base (tests, GHES).
@@ -74,7 +76,9 @@ impl GithubClient {
     }
 
     pub(crate) fn authed(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        req.bearer_auth(&self.token)
+        // Belt-and-suspenders: the builder already sets the UA client-wide,
+        // the per-request header guarantees it on every call.
+        req.bearer_auth(&self.token).header(reqwest::header::USER_AGENT, USER_AGENT)
     }
 
     pub fn org_jit_url(&self, org: &str) -> String {
@@ -125,6 +129,11 @@ mod tests {
     fn rejects_empty_token() {
         assert!(GithubClient::new("").is_err());
         assert!(GithubClient::new("ghp_x").is_ok());
+    }
+
+    #[test]
+    fn user_agent_is_versioned() {
+        assert_eq!(USER_AGENT, format!("runner/{}", env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

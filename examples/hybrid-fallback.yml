@@ -1,0 +1,27 @@
+# Hybrid fallback: prefer the local `runner` mesh, fall back to
+# GitHub-hosted runners when the mesh is offline or toggled off.
+#
+# Toggle: repository/org variable USE_LOCAL_RUNNER ("true" = local mesh).
+name: ci-hybrid
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ (vars.USE_LOCAL_RUNNER == 'true') && fromJSON('["self-hosted", "runner"]') || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: echo "run tests here (local mesh or GitHub-hosted)"
+
+  lint:
+    runs-on: ${{ (vars.USE_LOCAL_RUNNER == 'true') && fromJSON('["self-hosted", "runner"]') || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint
+        run: echo "run linter here (local mesh or GitHub-hosted)"

@@ -1,0 +1,39 @@
+# CI starter for `runner` — dispatches parallel jobs to the local mesh.
+#
+# Prerequisites: a `runner` coordinator polling this repo with labels
+# [self-hosted, runner] (see README.md Quickstart).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: [self-hosted, runner]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ${{ matrix.suite }} suite
+        run: echo "run ${{ matrix.suite }} tests here"
+
+  lint:
+    runs-on: [self-hosted, runner]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint
+        run: echo "run linter here"
+
+  typecheck:
+    runs-on: [self-hosted, runner]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Typecheck
+        run: echo "run typechecker here"

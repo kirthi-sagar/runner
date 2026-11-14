@@ -1,0 +1,6 @@
+//! Federated hybrid mesh: LAN discovery, WAN peers, cloud bursting.
+
+pub mod cloud;
+pub mod discovery;
+pub mod invite;
+pub mod peer;

@@ -1,4 +1,7 @@
 # runner
+
+[![CI](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml)
+
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
 > **Status**: Architectural Specification & Implementation Guide (Revision 4)  

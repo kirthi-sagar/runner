@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  cloud-verify:
+    name: GitHub Cloud Runner (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run automated test suite
+        run: cargo test --all-targets
+
+      - name: Run clippy linter
+        run: cargo clippy --all-targets -- -D warnings
+
+  dogfood-verify:
+    name: Dogfooding Runner (self-hosted zero-freeze)
+    runs-on: [self-hosted, runner]
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Sandbox Isolation & cgroup
+        run: |
+          echo "=== Executing inside runner zero-freeze sandbox ==="
+          cat /proc/self/cgroup || true
+
+      - name: Run automated test suite
+        run: cargo test --all-targets
+
+      - name: Run clippy linter
+        run: cargo clippy --all-targets -- -D warnings

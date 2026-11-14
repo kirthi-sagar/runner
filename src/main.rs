@@ -5,7 +5,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use runner::config::{DonorConfig, PeerRecord, RunnerConfig, github_token_from_env};
+use runner::config::{
+    DonorConfig, PeerRecord, RunnerConfig, github_token_from_env, load_env_file,
+};
 use runner::github::client::GithubClient;
 use runner::github::webhooks::{DispatchContext, JitScope, QueuePoller, run_coordinator};
 use runner::governor::cgroup::CgroupSlice;
@@ -87,6 +89,11 @@ enum Commands {
     Join {
         token: String,
     },
+    /// Manage the systemd user service (install/status/stop/start/uninstall)
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -124,6 +131,20 @@ enum MeshCommands {
         #[arg(long)]
         lan: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommands {
+    /// Write the user unit, enable it, and start the daemon
+    Install,
+    /// Show systemctl status of the user service
+    Status,
+    /// Stop the user service
+    Stop,
+    /// Start the user service
+    Start,
+    /// Stop, disable, and delete the user unit
+    Uninstall,
 }
 
 /// Load the mesh signing authority, generating + persisting a secret once.
@@ -338,6 +359,9 @@ fn cmd_stop(force: bool) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load ~/.config/runner/env first so every subcommand sees configured
+    // secrets without the user sourcing the file in shell.
+    let _ = load_env_file();
     let cli = Cli::parse();
     let config = RunnerConfig::load_or_default();
     match cli.command {
@@ -445,6 +469,13 @@ async fn main() -> Result<()> {
         Commands::Join { token } => {
             cmd_join(&token).await?;
         }
+        Commands::Service { command } => match command {
+            ServiceCommands::Install => runner::service::install()?,
+            ServiceCommands::Status => runner::service::status()?,
+            ServiceCommands::Stop => runner::service::stop()?,
+            ServiceCommands::Start => runner::service::start()?,
+            ServiceCommands::Uninstall => runner::service::uninstall()?,
+        },
         Commands::Exec { command, no_sandbox, timeout_mins } => {
             let timeout = std::time::Duration::from_secs(timeout_mins.max(1) * 60);
             match runner::providers::local::execute_local_sandboxed(&command, no_sandbox, timeout)

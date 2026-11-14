@@ -224,6 +224,77 @@ pub fn github_token_from_env() -> Option<String> {
     std::env::var(GITHUB_TOKEN_ENV).ok().filter(|t| !t.trim().is_empty())
 }
 
+/// Default environment file path (`~/.config/runner/env`).
+pub fn default_env_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("runner")
+            .join("env")
+    })
+}
+
+/// Parse shell-style `KEY=value` lines (comments, blanks, `export ` prefix,
+/// and surrounding single/double quotes handled). Malformed lines are skipped.
+pub fn parse_env_file(text: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for raw_line in text.lines() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line
+            .strip_prefix("export ")
+            .or_else(|| line.strip_prefix("export\t"))
+        {
+            line = rest.trim_start();
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let mut value = value.trim().to_string();
+        if value.len() >= 2 {
+            let bytes = value.as_bytes();
+            let (first, last) = (bytes[0], bytes[value.len() - 1]);
+            if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                value = value[1..value.len() - 1].to_string();
+            }
+        }
+        pairs.push((key.to_string(), value));
+    }
+    pairs
+}
+
+/// Load variables from the given env file, never overwriting variables that
+/// are already set. Missing/unreadable files load nothing. Returns the number
+/// of variables newly set.
+pub fn load_env_file_from(path: &std::path::Path) -> usize {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => return 0,
+    };
+    let mut loaded = 0;
+    for (key, value) in parse_env_file(&text) {
+        if std::env::var_os(&key).is_none() {
+            std::env::set_var(&key, &value);
+            loaded += 1;
+        }
+    }
+    loaded
+}
+
+/// Load `~/.config/runner/env` on startup when present, without overwriting
+/// existing environment variables. Returns the number newly set.
+pub fn load_env_file() -> usize {
+    default_env_path()
+        .map(|path| load_env_file_from(&path))
+        .unwrap_or(0)
+}
+
 /// Top-level supervisor configuration.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct RunnerConfig {
@@ -291,5 +362,51 @@ mod tests {
         let config: RunnerConfig = toml::from_str("[coordinator]\nauto_dispatch = true\n").unwrap();
         assert_eq!(config.coordinator.job_timeout_mins, 60);
         assert_eq!(config.coordinator.poll_secs, 15);
+    }
+
+    #[test]
+    fn env_file_parser_handles_shell_conventions() {
+        let text = "# comment\n\nexport RUNNER_GITHUB_TOKEN=\"ghp_secret==\"\nPLAIN=1\nSINGLE='a=b'\nEMPTY=\nBAD LINE\nNOEQUALS\n";
+        let pairs = parse_env_file(text);
+        assert_eq!(
+            pairs,
+            vec![
+                ("RUNNER_GITHUB_TOKEN".to_string(), "ghp_secret==".to_string()),
+                ("PLAIN".to_string(), "1".to_string()),
+                ("SINGLE".to_string(), "a=b".to_string()),
+                ("EMPTY".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_load_never_overwrites_existing_vars() {
+        let dir = crate::test_support::TempDir::new("runner-env-load").unwrap();
+        let path = dir.path().join("env");
+        fs::write(&path, "RUNNER_TEST_ENV_SENTINEL=from-file\nRUNNER_TEST_ENV_FRESH=from-file\n").unwrap();
+
+        let sentinel_key = "RUNNER_TEST_ENV_SENTINEL";
+        let fresh_key = "RUNNER_TEST_ENV_FRESH";
+        let prior_sentinel = std::env::var_os(sentinel_key);
+        let prior_fresh = std::env::var_os(fresh_key);
+        std::env::set_var(sentinel_key, "sentinel");
+        std::env::remove_var(fresh_key);
+
+        let loaded = load_env_file_from(&path);
+        assert_eq!(loaded, 1);
+        assert_eq!(std::env::var(sentinel_key).unwrap(), "sentinel");
+        assert_eq!(std::env::var(fresh_key).unwrap(), "from-file");
+
+        // Missing file loads nothing and does not fail.
+        assert_eq!(load_env_file_from(&dir.path().join("absent")), 0);
+
+        match prior_sentinel {
+            Some(v) => std::env::set_var(sentinel_key, v),
+            None => std::env::remove_var(sentinel_key),
+        }
+        match prior_fresh {
+            Some(v) => std::env::set_var(fresh_key, v),
+            None => std::env::remove_var(fresh_key),
+        }
     }
 }

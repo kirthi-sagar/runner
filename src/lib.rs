@@ -20,6 +20,7 @@ pub mod mesh;
 pub mod pidfile;
 pub mod providers;
 pub mod sandbox;
+pub mod service;
 pub mod status;
 
 /// Std-only unique temp dir guard for tests (no external crates).

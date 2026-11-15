@@ -28,7 +28,9 @@ Options:
 
 Without flags, root installs system-wide and everyone else installs
 per-user. The installer prefers ./target/release/runner, then
-./target/debug/runner, then builds with cargo when available.
+./target/debug/runner, then builds with cargo when available, and
+finally downloads a prebuilt release tarball (curl/wget) with
+SHA-256 verification.
 EOF
 }
 
@@ -96,8 +98,45 @@ elif command -v cargo >/dev/null 2>&1; then
     if [ "$DRY_RUN" -eq 0 ]; then cargo build --release -p runner-cli; fi
     BIN_SRC="./target/release/runner"
 else
-    log "error: no binary at ./target/release/runner and cargo not found"
-    exit 1
+    # Zero-dependency fallback: fetch a prebuilt release tarball.
+    case "$(uname -m)" in
+        x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+        *)
+            log "error: no local binary, no cargo, and unsupported architecture $(uname -m)"
+            exit 1
+            ;;
+    esac
+    if command -v curl >/dev/null 2>&1; then
+        downloader="curl -fsSL -o"
+    elif command -v wget >/dev/null 2>&1; then
+        downloader="wget -qO"
+    else
+        log "error: no local binary, no cargo, and neither curl nor wget available"
+        exit 1
+    fi
+    TARBALL="runner-v$VERSION-$TARGET.tar.gz"
+    BASE_URL="https://github.com/kirthi-sagar/runner/releases/download/v$VERSION"
+    TMP_DL="$(mktemp -d)"
+    log "fetching prebuilt $TARBALL"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] $downloader $TMP_DL/$TARBALL $BASE_URL/$TARBALL"
+        BIN_SRC="./target/release/runner"
+    else
+        # Word-split $downloader into command + flags (POSIX sh).
+        $downloader "$TMP_DL/$TARBALL" "$BASE_URL/$TARBALL"
+        $downloader "$TMP_DL/$TARBALL.sha256" "$BASE_URL/$TARBALL.sha256"
+        if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$TMP_DL" && sha256sum -c "$TARBALL.sha256") || {
+                log "error: checksum mismatch for $TARBALL"
+                exit 1
+            }
+        else
+            log "warning: sha256sum not found; skipping checksum verification"
+        fi
+        tar -xzf "$TMP_DL/$TARBALL" -C "$TMP_DL"
+        BIN_SRC="$TMP_DL/runner-v$VERSION-$TARGET/runner"
+    fi
 fi
 log "binary: $BIN_SRC"
 

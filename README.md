@@ -153,6 +153,14 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
+Zero-dependency install (downloads the prebuilt v0.3.0 binary with SHA-256 verification — no Rust toolchain needed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
+```
+
+Or build from source:
+
 ```bash
 # 1. Build (or let the installer build for you)
 cargo build --release -p runner-cli

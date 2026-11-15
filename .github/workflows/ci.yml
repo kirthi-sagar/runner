@@ -5,10 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   cloud-verify:
-    name: GitHub Cloud Runner (ubuntu-latest)
+    name: Production CI (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -17,13 +18,22 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format verification
+        run: cargo fmt --all -- --check
+
+      - name: Linting & static analysis
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run automated test suite
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-features
 
-      - name: Run clippy linter
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Documentation check
+        run: cargo doc --workspace --no-deps
 
   dogfood-verify:
     name: Dogfooding Runner (self-hosted zero-freeze)
@@ -42,7 +52,7 @@ jobs:
         run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - name: Run automated test suite
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
       - name: Run clippy linter
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings

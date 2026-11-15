@@ -34,27 +34,3 @@ jobs:
 
       - name: Documentation check
         run: cargo doc --workspace --no-deps
-
-  dogfood-verify:
-    name: Dogfooding Runner (self-hosted zero-freeze)
-    runs-on: [self-hosted, runner]
-    # Fork guard: external PRs run on cloud runners only, never on self-hosted iron.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    continue-on-error: true
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Verify Sandbox Isolation & cgroup
-        run: |
-          echo "=== Executing inside runner zero-freeze sandbox ==="
-          cat /proc/self/cgroup || true
-
-      - name: Ensure cargo is in PATH
-        run: echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-      - name: Run automated test suite
-        run: cargo test --workspace --all-targets
-
-      - name: Run clippy linter
-        run: cargo clippy --workspace --all-targets -- -D warnings

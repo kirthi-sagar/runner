@@ -4,3 +4,6 @@
 
 pub mod github;
 pub mod providers;
+
+#[cfg(test)]
+mod test_stub;

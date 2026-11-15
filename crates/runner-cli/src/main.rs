@@ -130,6 +130,20 @@ enum Commands {
         #[arg(long)]
         secret: Option<String>,
     },
+    /// Diagnose system readiness (kernel, cgroups, sandboxes, daemon, MCP)
+    Doctor {
+        /// Also validate enterprise policy loading and audit continuity
+        #[arg(long, default_value_t = false)]
+        enterprise: bool,
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Provider credential and connectivity checks
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommands,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -193,6 +207,15 @@ enum AuthCommands {
         /// Token value (prefer piping; never pass via shared shell history on multi-user hosts)
         #[arg(long)]
         token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderCommands {
+    /// Validate credentials and connectivity for one provider
+    Test {
+        /// Provider name: github|gitlab|bitbucket|local
+        provider: String,
     },
 }
 
@@ -694,6 +717,37 @@ fn cmd_mcp_install(target: &str) -> Result<()> {
     }
 }
 
+/// `runner doctor`: print the readiness report; exit 1 on any failure.
+async fn cmd_doctor(enterprise: bool, format: &str) -> Result<()> {
+    use runner_cli::doctor::{overall_ok, render_json, render_text, run_all};
+
+    let checks = run_all(enterprise).await;
+    match format.trim().to_ascii_lowercase().as_str() {
+        "text" => print!("{}", render_text(&checks)),
+        "json" => println!("{}", render_json(&checks)),
+        other => anyhow::bail!("unsupported doctor format {other:?}: want text|json"),
+    }
+    if overall_ok(&checks) {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
+/// `runner provider test`: print the connectivity verdict; exit 1 on failure.
+async fn cmd_provider_test(provider: &str, config: &RunnerConfig) -> Result<()> {
+    use runner_cli::provider::{render, test_provider, ProviderName};
+
+    let name = ProviderName::from_name(provider).map_err(|e| anyhow::anyhow!(e))?;
+    let report = test_provider(name, config).await;
+    print!("{}", render(&report));
+    if report.ok {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
 /// `runner exec --driver microvm`: route through the Tier-1 engine.
 /// Kernel/rootfs come from the sandbox config; exits nonzero with a clean
 /// message when KVM, images, or the Firecracker binary are unavailable.
@@ -876,6 +930,14 @@ async fn main() -> Result<()> {
         Commands::Listen { port, secret } => {
             cmd_listen(port, secret).await?;
         }
+        Commands::Doctor { enterprise, format } => {
+            cmd_doctor(enterprise, &format).await?;
+        }
+        Commands::Provider { command } => match command {
+            ProviderCommands::Test { provider } => {
+                cmd_provider_test(&provider, &config).await?;
+            }
+        },
         Commands::Exec {
             command,
             no_sandbox,

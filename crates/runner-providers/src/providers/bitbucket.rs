@@ -161,6 +161,7 @@ pub fn step_status_url(workspace: &str, repo_slug: &str, step_uuid: &str) -> Str
 pub struct BitbucketClient {
     oauth_client_id: String,
     oauth_client_secret: String,
+    token_url: String,
     http: reqwest::Client,
     cached: tokio::sync::Mutex<Option<(String, Instant)>>,
 }
@@ -170,16 +171,30 @@ impl BitbucketClient {
         Self {
             oauth_client_id: oauth_client_id.into(),
             oauth_client_secret: oauth_client_secret.into(),
+            token_url: OAUTH_TOKEN_URL.to_string(),
             http: reqwest::Client::new(),
             cached: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Point the OAuth grant at a custom token URL (tests).
+    pub fn with_token_url(mut self, token_url: impl Into<String>) -> Self {
+        self.token_url = token_url.into();
+        self
+    }
+
+    /// Validate credentials by performing the client-credentials grant.
+    /// Returns the token expiry on success.
+    pub async fn test_credentials(&self) -> Result<Instant> {
+        let (_, expires_at) = self.refresh_token().await?;
+        Ok(expires_at)
     }
 
     /// Fetch a fresh OAuth token (client credentials grant).
     async fn refresh_token(&self) -> Result<(String, Instant)> {
         let res = self
             .http
-            .post(OAUTH_TOKEN_URL)
+            .post(&self.token_url)
             .basic_auth(&self.oauth_client_id, Some(&self.oauth_client_secret))
             .form(&[("grant_type", "client_credentials")])
             .send()
@@ -427,6 +442,25 @@ impl ProviderAdapter for BitbucketProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn credentials_grant_against_stub() {
+        let (base, server) = crate::test_stub::serve_once(
+            200,
+            "OK",
+            &[],
+            r#"{"access_token":"tok","expires_in":3600,"token_type":"Bearer"}"#,
+        );
+        let client = BitbucketClient::new("id", "secret").with_token_url(base);
+        let expiry = client.test_credentials().await.unwrap();
+        assert!(expiry > Instant::now());
+        server.join().unwrap();
+
+        let (base, server) = crate::test_stub::serve_once(401, "Unauthorized", &[], "{}");
+        let client = BitbucketClient::new("id", "bad").with_token_url(base);
+        assert!(client.test_credentials().await.is_err());
+        server.join().unwrap();
+    }
 
     #[test]
     fn token_expiry_and_refresh_window() {

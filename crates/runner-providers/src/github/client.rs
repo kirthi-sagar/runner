@@ -100,6 +100,30 @@ impl GithubClient {
         )
     }
 
+    /// Authenticated identity (`GET /user` → login). Proves the token
+    /// is live and reports who it belongs to.
+    pub async fn whoami(&self) -> Result<String, String> {
+        let res = self
+            .authed(self.http.get(format!("{}/user", self.base_url)))
+            .send()
+            .await
+            .map_err(|e| format!("github user lookup failed: {e}"))?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err("github token rejected (401 unauthorized)".to_string());
+        }
+        if !res.status().is_success() {
+            return Err(format!("github user lookup: HTTP {}", res.status()));
+        }
+        let body: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| format!("github user body: {e}"))?;
+        body.get("login")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "github user lookup: missing login".to_string())
+    }
+
     /// Validate token scope via the advertised `x-oauth-scopes` header on a
     /// cheap authenticated call. Fine-grained tokens carry no header, so
     /// they report [`ScopeVerdict::UnverifiableOffline`] and are proven by
@@ -129,6 +153,31 @@ impl GithubClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn whoami_reports_login_and_rejects_401() {
+        let (base, server) = crate::test_stub::serve_once(200, "OK", &[], r#"{"login":"octo"}"#);
+        let client = GithubClient::new("tok").unwrap().with_base_url(base);
+        assert_eq!(client.whoami().await.unwrap(), "octo");
+        server.join().unwrap();
+
+        let (base, server) = crate::test_stub::serve_once(401, "Unauthorized", &[], "{}");
+        let client = GithubClient::new("bad").unwrap().with_base_url(base);
+        assert!(client.whoami().await.unwrap_err().contains("401"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_verdict_reads_advertised_header() {
+        let (base, server) =
+            crate::test_stub::serve_once(200, "OK", &[("x-oauth-scopes", "repo, gist")], "{}");
+        let client = GithubClient::new("tok").unwrap().with_base_url(base);
+        assert_eq!(
+            client.validate_token_scope().await.unwrap(),
+            ScopeVerdict::ClassicSufficient
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn rejects_empty_token() {

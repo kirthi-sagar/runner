@@ -361,6 +361,28 @@ impl ProviderAdapter for GitlabProvider {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn request_job_against_stub() {
+        let (base, server) = crate::test_stub::serve_once(204, "No Content", &[], "");
+        let client = GitlabClient::new(base);
+        assert!(client
+            .request_job("tok", &GitlabSystemInfo::local(), &[])
+            .await
+            .unwrap()
+            .is_none());
+        server.join().unwrap();
+
+        let (base, server) = crate::test_stub::serve_once(401, "Unauthorized", &[], "{}");
+        let client = GitlabClient::new(base);
+        assert!(client
+            .request_job("bad", &GitlabSystemInfo::local(), &[])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("401"));
+        server.join().unwrap();
+    }
+
     fn info() -> GitlabSystemInfo {
         GitlabSystemInfo {
             name: "t".to_string(),

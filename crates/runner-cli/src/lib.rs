@@ -2,5 +2,7 @@
 //! helpers and the live terminal monitor (the CLI entrypoint itself
 //! lives in `main.rs`).
 
+pub mod doctor;
+pub mod provider;
 pub mod service;
 pub mod top;

@@ -1,8 +1,8 @@
 //! Auth/audit/policy tests: the exact lib operations behind
-//! `runner auth`, `runner audit verify`, and `runner policy inspect`,
-//! exercised against isolated temp directories (never the real HOME).
+//! `runner auth`, `runner audit verify` / `export`, and `runner policy
+//! inspect`, exercised against isolated temp directories (never HOME).
 
-use runner::audit::{verify_file, AuditLog, VerifyOutcome};
+use runner::audit::{export_trail, verify_file, AuditLog, ExportError, VerifyOutcome};
 use runner::auth::{ProviderSlot, TokenStore};
 use runner::policy::{describe, load_or_permissive};
 use runner::telemetry::LogLevel;
@@ -61,6 +61,35 @@ fn audit_verify_detects_intact_tampered_and_absent_trails() {
     // Garbage line is tamper, not a crash.
     std::fs::write(&path, "not json\n").unwrap();
     assert!(!verify_file(&path).ok());
+}
+
+#[test]
+fn audit_export_streams_verified_jsonl_and_fails_closed() {
+    let dir = runner::test_support::TempDir::new("export-it").unwrap();
+    let missing = dir.path().join("nope.jsonl");
+    assert!(matches!(
+        export_trail(&missing),
+        Err(ExportError::Absent(_))
+    ));
+
+    let path = dir.path().join("audit.jsonl");
+    let mut log = AuditLog::open(&path).unwrap();
+    log.append(LogLevel::Info, "fleet", "runner-1 registered");
+    log.append(LogLevel::Warn, "governor", "throttled");
+    let jsonl = export_trail(&path).unwrap();
+    let lines: Vec<&str> = jsonl.lines().collect();
+    assert_eq!(lines.len(), 2);
+    for line in &lines {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(entry.get("hash").is_some());
+        assert!(entry.get("prev_hash").is_some());
+    }
+
+    // Tampering refuses the export: no partial segments leak.
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text = text.replacen("runner-1", "runner-2", 1);
+    std::fs::write(&path, text).unwrap();
+    assert!(matches!(export_trail(&path), Err(ExportError::Tampered(_))));
 }
 
 #[test]

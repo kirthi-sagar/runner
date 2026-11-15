@@ -67,6 +67,8 @@ enum Commands {
     Mcp {
         #[arg(long, default_value = "stdio")]
         transport: String,
+        #[command(subcommand)]
+        command: Option<McpCommands>,
     },
     /// Start the enterprise web control plane (fleet API + OIDC SSO)
     Server {
@@ -177,12 +179,34 @@ enum AuthCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum McpCommands {
+    /// Register the runner MCP server in an agent config (or print the snippet)
+    Install {
+        /// Agent config target
+        #[arg(long, default_value = "generic")]
+        target: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum AuditCommands {
     /// Cryptographically verify the SHA-256 chained audit trail
     Verify {
         /// Trail file (default ~/.config/runner/audit.jsonl)
         #[arg(long)]
         file: Option<std::path::PathBuf>,
+    },
+    /// Export the verified trail as JSONL for SIEM/compliance ingestion
+    Export {
+        /// Trail file (default ~/.config/runner/audit.jsonl)
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// Export format (only "jsonl" is supported)
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+        /// Output path (default: stdout stream)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -482,6 +506,52 @@ fn cmd_audit_verify(file: Option<std::path::PathBuf>) -> Result<()> {
     }
 }
 
+/// `runner audit export`: stream verified JSONL to stdout or a file.
+/// Fails closed (exit 1, nothing written) on any chain tampering.
+fn cmd_audit_export(
+    file: Option<std::path::PathBuf>,
+    format: &str,
+    out: Option<std::path::PathBuf>,
+) -> Result<()> {
+    use runner_enterprise::audit::{default_audit_path, export_trail, ExportError};
+
+    if !format.trim().eq_ignore_ascii_case("jsonl") {
+        anyhow::bail!("unsupported audit export format {format:?}: only \"jsonl\"");
+    }
+    let path = match file {
+        Some(path) => path,
+        None => default_audit_path().context("no HOME for audit path")?,
+    };
+    match export_trail(&path) {
+        Ok(jsonl) => match out {
+            Some(dest) => {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dest, jsonl)?;
+                println!("audit trail exported to {}", dest.display());
+                Ok(())
+            }
+            None => {
+                print!("{jsonl}");
+                Ok(())
+            }
+        },
+        Err(ExportError::Absent(path)) => {
+            println!(
+                "no audit trail at {} yet — nothing to export",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(ExportError::Tampered(reason) | ExportError::Io(reason)) => {
+            // Io here means the verified file vanished mid-export: fail closed too.
+            eprintln!("audit export refused: {reason}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `runner policy inspect`: show ceilings, gates, and air-gap status.
 fn cmd_policy_inspect(config: &RunnerConfig) {
     use runner_core::config::{effective_mode, ProfileMode};
@@ -508,6 +578,36 @@ fn cmd_policy_inspect(config: &RunnerConfig) {
             "off"
         }
     );
+}
+
+/// `runner mcp install`: register the stdio server in an agent config,
+/// or print the JSON snippet when the destination is unwritable.
+fn cmd_mcp_install(target: &str) -> Result<()> {
+    use runner_core::mcp::install::{
+        current_exe_string, default_target_path, install_to_file, snippet_json, McpTarget,
+    };
+
+    let target = McpTarget::from_name(target).map_err(|e| anyhow::anyhow!(e))?;
+    let exe = current_exe_string();
+    let path = default_target_path(target);
+    match path {
+        Some(path) => match install_to_file(&path, &exe) {
+            Ok(note) => {
+                println!("{note}");
+                println!("target: {}", target.name());
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("runner mcp install: {e}; printing snippet instead");
+                println!("{}", snippet_json(&exe));
+                Ok(())
+            }
+        },
+        None => {
+            println!("{}", snippet_json(&exe));
+            Ok(())
+        }
+    }
 }
 
 /// `runner exec --driver microvm`: route through the Tier-1 engine.
@@ -604,7 +704,11 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Commands::Mcp { transport } => {
+        Commands::Mcp { transport, command } => {
+            if let Some(McpCommands::Install { target }) = command {
+                cmd_mcp_install(&target)?;
+                return Ok(());
+            }
             if transport != "stdio" {
                 anyhow::bail!("unsupported mcp transport {transport:?}: only \"stdio\"");
             }
@@ -676,6 +780,7 @@ async fn main() -> Result<()> {
         },
         Commands::Audit { command } => match command {
             AuditCommands::Verify { file } => cmd_audit_verify(file)?,
+            AuditCommands::Export { file, format, out } => cmd_audit_export(file, &format, out)?,
         },
         Commands::Policy { command } => match command {
             PolicyCommands::Inspect => cmd_policy_inspect(&config),

@@ -212,6 +212,47 @@ pub fn verify_file(path: &Path) -> VerifyOutcome {
     }
 }
 
+/// Export failure modes for [`export_trail`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportError {
+    /// No trail file: nothing to export (not tampering).
+    Absent(PathBuf),
+    /// Chain failed verification: export refused (fail closed).
+    Tampered(String),
+    /// Trail unreadable.
+    Io(String),
+}
+
+/// Export the trail as canonical JSONL (one entry per line) for SIEM /
+/// compliance ingestion. The chain is verified first: any gap, reorder,
+/// edit, or malformed line refuses the export with [`ExportError::Tampered`]
+/// — partial or suspicious segments are never silently emitted.
+pub fn export_trail(path: &Path) -> Result<String, ExportError> {
+    match verify_file(path) {
+        VerifyOutcome::Absent { path } => Err(ExportError::Absent(path)),
+        VerifyOutcome::Tampered { reason, .. } => Err(ExportError::Tampered(reason)),
+        VerifyOutcome::Intact { .. } => {
+            let text = std::fs::read_to_string(path).map_err(|e| ExportError::Io(e.to_string()))?;
+            let mut out = String::new();
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Re-parse + re-serialize so output is canonical JSONL.
+                let entry: AuditEntry = serde_json::from_str(line).map_err(|e| {
+                    ExportError::Tampered(format!("entry changed during export: {e}"))
+                })?;
+                out.push_str(
+                    &serde_json::to_string(&entry)
+                        .map_err(|e| ExportError::Io(format!("serialize entry: {e}")))?,
+                );
+                out.push('\n');
+            }
+            Ok(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

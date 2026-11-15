@@ -257,7 +257,11 @@ Agents connect over the Model Context Protocol (JSON-RPC 2.0 stdio):
 
 ```bash
 runner mcp --transport=stdio
+# One-command client registration (cursor | claude | generic snippet):
+runner mcp install --target cursor
 ```
+
+Full agent setup, tool catalog, and stdio examples: [`docs/mcp.md`](docs/mcp.md).
 
 Lifecycle: `initialize` → `notifications/initialized` → `tools/list` →
 `tools/call`. MCP-compatible clients (Claude Code, Cursor, Antigravity,

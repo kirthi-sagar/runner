@@ -254,12 +254,18 @@ pub async fn run_coordinator(
     slice: runner_core::governor::cgroup::CgroupSlice,
 ) {
     let auto = dispatch.is_some();
+    let wakeup = state.read().await.wakeup();
     eprintln!(
-        "runner: coordinator polling every {:?} (auto_dispatch={auto})",
+        "runner: coordinator polling every {:?} (auto_dispatch={auto}, webhook wakeups armed)",
         poller.interval()
     );
     loop {
-        tokio::time::sleep(poller.interval()).await;
+        tokio::select! {
+            _ = tokio::time::sleep(poller.interval()) => {},
+            _ = wakeup.notified() => {
+                eprintln!("runner: webhook wakeup: polling immediately");
+            }
+        }
         let jobs = match poller.poll_once().await {
             Ok(jobs) => jobs,
             Err(e) => {
@@ -267,6 +273,7 @@ pub async fn run_coordinator(
                 continue;
             }
         };
+        state.write().await.set_queue_depth(jobs.len() as u32);
         for job in jobs {
             let (free, peers, drained) = {
                 let guard = state.read().await;
@@ -286,13 +293,20 @@ pub async fn run_coordinator(
                         let state = state.clone();
                         let slice = slice.clone();
                         let job = job.clone();
-                        state.write().await.in_flight_inc();
+                        let job_id = job.id.to_string();
+                        {
+                            let mut guard = state.write().await;
+                            guard.in_flight_inc();
+                            guard.job_started("github", &job_id, &job.name);
+                        }
                         tokio::spawn(async move {
                             let result = dispatch_local(&job, &ctx, Some(&slice)).await;
                             if let Err(e) = result {
                                 eprintln!("runner: local dispatch failed: {e}");
                             }
-                            state.write().await.in_flight_dec();
+                            let mut guard = state.write().await;
+                            guard.in_flight_dec();
+                            guard.job_finished(&job_id);
                         });
                     }
                 }

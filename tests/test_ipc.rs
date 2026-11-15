@@ -23,3 +23,34 @@ async fn ipc_ping_roundtrip() {
 
     task.abort();
 }
+
+#[tokio::test]
+async fn ipc_snapshot_and_poll_now() {
+    let dir = runner::test_support::TempDir::new("ipc-snap").unwrap();
+    let path = dir.path().join("runner.sock");
+    let state = new_shared_state();
+    {
+        let mut guard = state.write().await;
+        guard.job_started("github", "7", "ci / test");
+        guard.set_queue_depth(3);
+    }
+    let server = Arc::new(IpcServer::bind(&path, state.clone()).await.unwrap());
+    let task = tokio::spawn(async move { server.serve().await });
+
+    let res = ipc_call(&path, "snapshot").await.unwrap();
+    let snap = &res["result"];
+    assert_eq!(snap["jobs"][0]["id"], "7");
+    assert_eq!(snap["jobs"][0]["provider"], "github");
+    assert_eq!(snap["queue_depth"], 3);
+    assert!(snap.get("psi_warn").and_then(|v| v.as_f64()).unwrap() > 0.0);
+
+    // poll_now notifies the shared wakeup without error.
+    let notified = state.read().await.wakeup();
+    let res = ipc_call(&path, "poll_now").await.unwrap();
+    assert_eq!(res["result"]["notified"], true);
+    tokio::time::timeout(std::time::Duration::from_secs(1), notified.notified())
+        .await
+        .expect("wakeup must fire");
+
+    task.abort();
+}

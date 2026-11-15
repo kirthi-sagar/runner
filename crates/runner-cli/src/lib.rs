@@ -1,4 +1,6 @@
 //! Shared library surface of the `runner` binary: service management
-//! helpers (the CLI entrypoint itself lives in `main.rs`).
+//! helpers and the live terminal monitor (the CLI entrypoint itself
+//! lives in `main.rs`).
 
 pub mod service;
+pub mod top;

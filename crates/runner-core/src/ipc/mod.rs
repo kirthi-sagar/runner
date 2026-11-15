@@ -3,7 +3,9 @@
 //! Listens on [`SOCK_PATH`] (`/run/runner.sock`), falling back to
 //! `~/.runner/runner.sock` when unprivileged. Sockets are created with
 //! `0600` owner-only permissions. Requests are newline-delimited JSON-RPC:
-//! `ping` (liveness) and `status` (host telemetry).
+//! `ping` (liveness), `status` (host telemetry), `peers`, `join`,
+//! `snapshot` (daemon state for `runner top`), and `poll_now` (wake the
+//! coordinator for instant dispatch).
 
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -53,6 +55,26 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                 "cloud_nodes": guard.cloud_nodes(),
                 "drained_nodes": guard.drained_nodes(),
             } })
+        }
+        "snapshot" => {
+            let guard = state.read().await;
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "weight": guard.last_weight,
+                "slots": guard.last_slots,
+                "in_flight": guard.in_flight(),
+                "jobs": guard.in_flight_jobs(),
+                "queue_depth": guard.queue_depth(),
+                "wan_peers": guard.peers(),
+                "cloud_nodes": guard.cloud_nodes(),
+                "drained_nodes": guard.drained_nodes(),
+                "afk_boosted": guard.afk.boosted(),
+                "psi_warn": guard.psi_warn,
+                "psi_crit": guard.psi_crit,
+            } })
+        }
+        "poll_now" => {
+            state.read().await.wakeup().notify_one();
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "notified": true } })
         }
         "join" => {
             let record_value = value

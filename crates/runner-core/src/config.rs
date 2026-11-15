@@ -477,6 +477,8 @@ pub struct RunnerConfig {
     pub sandbox: SandboxConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 /// Resource-governor tuning: CPU PSI `some avg10` bands for the
@@ -548,6 +550,16 @@ pub struct SecurityConfig {
     pub air_gapped: bool,
 }
 
+/// Embedded webhook listener for instant dispatch.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// 127.0.0.1 port for the HMAC-verified webhook listener.
+    /// `None` (default) disables the embedded listener; the secret always
+    /// comes from `RUNNER_WEBHOOK_SECRET`, never from config files.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+}
+
 impl RunnerConfig {
     /// Default config file path.
     pub fn default_path() -> Option<PathBuf> {
@@ -599,6 +611,13 @@ impl RunnerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_listen_port_defaults_off() {
+        assert_eq!(RunnerConfig::default().server.listen_port, None);
+        let config: RunnerConfig = toml::from_str("[server]\nlisten_port = 9898\n").unwrap();
+        assert_eq!(config.server.listen_port, Some(9898));
+    }
 
     #[test]
     fn job_timeout_defaults_to_sixty_minutes() {

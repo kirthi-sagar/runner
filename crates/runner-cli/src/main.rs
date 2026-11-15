@@ -112,6 +112,24 @@ enum Commands {
         #[command(subcommand)]
         command: PolicyCommands,
     },
+    /// Live terminal monitor: PSI gauges, governor weight, jobs, fleet
+    Top {
+        /// Redraw cadence in milliseconds (clamped 100..60000)
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+        /// Print a single snapshot and exit (scripts/CI)
+        #[arg(long, default_value_t = false)]
+        once: bool,
+    },
+    /// Listen for CI webhooks and dispatch instantly (HMAC-verified)
+    Listen {
+        /// TCP port to bind
+        #[arg(long, default_value_t = 9898)]
+        port: u16,
+        /// HMAC webhook secret (or RUNNER_WEBHOOK_SECRET)
+        #[arg(long)]
+        secret: Option<String>,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -369,6 +387,72 @@ async fn cmd_mesh_list(format: &str, lan: bool) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// Embedded webhook listener for daemon mode: shares the coordinator's
+/// wake trigger. Missing secret fails closed (listener stays off).
+async fn spawn_embedded_listener(
+    config: &RunnerConfig,
+    state: runner_core::governor::supervisor::SharedState,
+) {
+    let Some(port) = config.server.listen_port else {
+        return;
+    };
+    let secret = std::env::var("RUNNER_WEBHOOK_SECRET").unwrap_or_default();
+    if secret.trim().is_empty() {
+        eprintln!("runner: [server] listen_port set but RUNNER_WEBHOOK_SECRET is empty; webhook listener off");
+        return;
+    }
+    let notify = state.read().await.wakeup();
+    tokio::spawn(async move {
+        if let Err(e) = runner_enterprise::webhook::serve(port, secret, notify).await {
+            eprintln!("runner: webhook listener exited: {e}");
+        }
+    });
+}
+
+async fn listen_shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = sigint.recv() => {},
+        _ = sigterm.recv() => {},
+    }
+}
+
+/// Standalone `runner listen`: verify webhooks here, wake the daemon over
+/// IPC. Runs until SIGINT/SIGTERM.
+async fn cmd_listen(port: u16, secret: Option<String>) -> Result<()> {
+    use tokio::sync::Notify;
+
+    let secret = secret
+        .or_else(|| std::env::var("RUNNER_WEBHOOK_SECRET").ok())
+        .unwrap_or_default();
+    if secret.trim().is_empty() {
+        anyhow::bail!("refusing to listen without a secret (--secret or RUNNER_WEBHOOK_SECRET)");
+    }
+    let notify = Arc::new(Notify::new());
+    let server = tokio::spawn(runner_enterprise::webhook::serve(
+        port,
+        secret.clone(),
+        notify.clone(),
+    ));
+    let sock_path = resolve_sock_path();
+    loop {
+        tokio::select! {
+            _ = notify.notified() => {
+                match ipc_call(&sock_path, "poll_now").await {
+                    Ok(_) => eprintln!("runner: daemon woken for instant dispatch"),
+                    Err(e) => eprintln!("runner: daemon unreachable over IPC ({e}); event dropped"),
+                }
+            }
+            _ = listen_shutdown() => break,
+        }
+    }
+    server.abort();
+    eprintln!("runner: listener stopped");
     Ok(())
 }
 
@@ -680,6 +764,7 @@ async fn main() -> Result<()> {
                 eprintln!("runner: pid file unavailable ({e})");
             }
             spawn_coordinator(&config, state.clone());
+            spawn_embedded_listener(&config, state.clone()).await;
             run_supervisor(state).await?;
             remove_pidfile(&pid_path);
         }
@@ -785,6 +870,12 @@ async fn main() -> Result<()> {
         Commands::Policy { command } => match command {
             PolicyCommands::Inspect => cmd_policy_inspect(&config),
         },
+        Commands::Top { interval_ms, once } => {
+            runner_cli::top::run(&resolve_sock_path(), interval_ms, once).await?;
+        }
+        Commands::Listen { port, secret } => {
+            cmd_listen(port, secret).await?;
+        }
         Commands::Exec {
             command,
             no_sandbox,

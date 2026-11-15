@@ -9,9 +9,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
+use serde::Serialize;
+use tokio::sync::{Notify, RwLock};
 
 use super::afk::AfkBoost;
 use super::cgroup::{weight_for_cpu_psi_with, CgroupSlice};
@@ -50,6 +51,25 @@ impl ThrottleOverride {
     }
 }
 
+/// One running job tracked for `runner top` and the IPC snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct InFlightJob {
+    pub id: String,
+    pub provider: String,
+    pub name: String,
+    pub started_unix_ms: u64,
+}
+
+/// Cap on tracked jobs; oldest entries roll off first.
+pub const MAX_TRACKED_JOBS: usize = 64;
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Mutable daemon state shared across governor, MCP, and IPC tasks.
 #[derive(Debug)]
 pub struct SupervisorState {
@@ -62,6 +82,9 @@ pub struct SupervisorState {
     donor_caps: Option<(u32, u64)>,
     next_reservation: u64,
     in_flight: u32,
+    jobs: Vec<InFlightJob>,
+    queue_depth: u32,
+    wakeup: Arc<Notify>,
     pub last_snapshot: PsiSnapshot,
     pub last_weight: Option<u32>,
     pub last_slots: u32,
@@ -82,6 +105,9 @@ impl SupervisorState {
             donor_caps: None,
             next_reservation: 1,
             in_flight: 0,
+            jobs: Vec::new(),
+            queue_depth: 0,
+            wakeup: Arc::new(Notify::new()),
             last_snapshot: PsiSnapshot::default(),
             last_weight: None,
             last_slots: 1,
@@ -204,6 +230,42 @@ impl SupervisorState {
 
     pub fn in_flight_dec(&mut self) {
         self.in_flight = self.in_flight.saturating_sub(1);
+    }
+
+    /// Record a dispatch; oldest entries roll off past [`MAX_TRACKED_JOBS`].
+    pub fn job_started(&mut self, provider: &str, id: &str, name: &str) {
+        self.jobs.retain(|j| j.id != id);
+        self.jobs.push(InFlightJob {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            name: name.to_string(),
+            started_unix_ms: now_unix_ms(),
+        });
+        while self.jobs.len() > MAX_TRACKED_JOBS {
+            self.jobs.remove(0);
+        }
+    }
+
+    /// Drop a finished job from the registry.
+    pub fn job_finished(&mut self, id: &str) {
+        self.jobs.retain(|j| j.id != id);
+    }
+
+    pub fn in_flight_jobs(&self) -> Vec<InFlightJob> {
+        self.jobs.clone()
+    }
+
+    pub fn set_queue_depth(&mut self, depth: u32) {
+        self.queue_depth = depth;
+    }
+
+    pub fn queue_depth(&self) -> u32 {
+        self.queue_depth
+    }
+
+    /// Instant-dispatch trigger shared with the webhook listener.
+    pub fn wakeup(&self) -> Arc<Notify> {
+        self.wakeup.clone()
     }
 }
 
@@ -349,6 +411,28 @@ mod tests {
         );
         assert_eq!(tick_weight(&state, &snapshot_with(30.0, 1.0, 1.0), now), 25);
         assert_eq!(tick_weight(&state, &snapshot_with(50.0, 1.0, 1.0), now), 1);
+    }
+
+    #[test]
+    fn job_registry_tracks_finishes_and_caps() {
+        let mut state = SupervisorState::new();
+        state.job_started("github", "1", "ci / a");
+        state.job_started("github", "2", "ci / b");
+        assert_eq!(state.in_flight_jobs().len(), 2);
+        // Re-recording the same id replaces instead of duplicating.
+        state.job_started("github", "1", "ci / a-retry");
+        assert_eq!(state.in_flight_jobs().len(), 2);
+        state.job_finished("1");
+        let jobs = state.in_flight_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "2");
+        // Overflow rolls the oldest off.
+        for i in 0..MAX_TRACKED_JOBS + 10 {
+            state.job_started("github", &format!("x{i}"), "flood");
+        }
+        assert_eq!(state.in_flight_jobs().len(), MAX_TRACKED_JOBS);
+        state.set_queue_depth(9);
+        assert_eq!(state.queue_depth(), 9);
     }
 
     #[test]

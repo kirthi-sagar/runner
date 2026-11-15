@@ -84,7 +84,7 @@ async fn http_health_fleet_register_heartbeat() {
         .await
         .unwrap();
     assert_eq!(health["status"], "healthy");
-    assert_eq!(health["version"], "0.3.0");
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
 
     let registered: serde_json::Value = http
         .post(format!("{base}/api/v1/runners/register"))

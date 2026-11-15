@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use runner_core::config::{
@@ -95,6 +95,21 @@ enum Commands {
         #[command(subcommand)]
         command: ServiceCommands,
     },
+    /// Store provider credentials in the local secrets file
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+    /// Verify the tamper-evident audit trail
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
+    /// Inspect fleet policy ceilings and gates
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -149,6 +164,32 @@ enum ServiceCommands {
     Start,
     /// Stop, disable, and delete the user unit
     Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommands {
+    /// Store the GitHub token (prompts when --token is omitted)
+    Github {
+        /// Token value (prefer piping; never pass via shared shell history on multi-user hosts)
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommands {
+    /// Cryptographically verify the SHA-256 chained audit trail
+    Verify {
+        /// Trail file (default ~/.config/runner/audit.jsonl)
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommands {
+    /// Show tenant ceilings, provider gates, and burst restrictions
+    Inspect,
 }
 
 /// Load the mesh signing authority, generating + persisting a secret once.
@@ -390,6 +431,85 @@ fn cmd_stop(force: bool) -> Result<()> {
     Ok(())
 }
 
+/// `runner auth github`: store the GitHub token in the 0600 secrets
+/// file (created/updated in place, never logged). The daemon picks it up
+/// on restart via env auto-load — no unit editing required.
+fn cmd_auth_github(token: Option<String>) -> Result<()> {
+    use runner_core::auth::{ProviderSlot, TokenStore};
+
+    let token = match token {
+        Some(value) => value,
+        None => {
+            eprint!("GitHub token: ");
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line
+        }
+    };
+    if token.trim().is_empty() {
+        anyhow::bail!("no token provided; aborting (nothing written)");
+    }
+    let store = TokenStore::default_store().context("no HOME for secrets file")?;
+    let path = store.set_token(ProviderSlot::Github, token.trim())?;
+    println!(
+        "github token stored in {} (0600); restart the daemon to apply",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `runner audit verify`: report chain integrity; exit 1 on tamper.
+fn cmd_audit_verify(file: Option<std::path::PathBuf>) -> Result<()> {
+    use runner_core::config::{effective_mode, ProfileMode};
+    use runner_enterprise::audit::{default_audit_path, verify_file};
+
+    match effective_mode() {
+        ProfileMode::Local => println!("mode: community (local) — enterprise extensions dormant"),
+        ProfileMode::Enterprise => println!("mode: enterprise"),
+    }
+    let path = match file {
+        Some(path) => path,
+        None => default_audit_path().context("no HOME for audit path")?,
+    };
+    let outcome = verify_file(&path);
+    println!("{}", outcome.report());
+    if outcome.ok() {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
+}
+
+/// `runner policy inspect`: show ceilings, gates, and air-gap status.
+fn cmd_policy_inspect(config: &RunnerConfig) {
+    use runner_core::config::{effective_mode, ProfileMode};
+    use runner_enterprise::policy::{describe, load_or_permissive, FleetPolicy};
+
+    match effective_mode() {
+        ProfileMode::Local => println!("mode: community (local) — enterprise extensions dormant"),
+        ProfileMode::Enterprise => println!("mode: enterprise"),
+    }
+    let (policy, note) = match runner_enterprise::policy::default_policy_path() {
+        Some(path) => load_or_permissive(&path),
+        None => (
+            FleetPolicy::permissive(),
+            "no HOME — permissive fleet defaults".to_string(),
+        ),
+    };
+    println!("{note}");
+    print!("{}", describe(&policy));
+    println!(
+        "air-gapped pool restriction: {}",
+        if config.security.air_gapped {
+            "ENFORCED (cloud bursting refused)"
+        } else {
+            "off"
+        }
+    );
+}
+
 /// `runner exec --driver microvm`: route through the Tier-1 engine.
 /// Kernel/rootfs come from the sandbox config; exits nonzero with a clean
 /// message when KVM, images, or the Firecracker binary are unavailable.
@@ -550,6 +670,15 @@ async fn main() -> Result<()> {
             ServiceCommands::Stop => runner_cli::service::stop()?,
             ServiceCommands::Start => runner_cli::service::start()?,
             ServiceCommands::Uninstall => runner_cli::service::uninstall()?,
+        },
+        Commands::Auth { command } => match command {
+            AuthCommands::Github { token } => cmd_auth_github(token)?,
+        },
+        Commands::Audit { command } => match command {
+            AuditCommands::Verify { file } => cmd_audit_verify(file)?,
+        },
+        Commands::Policy { command } => match command {
+            PolicyCommands::Inspect => cmd_policy_inspect(&config),
         },
         Commands::Exec {
             command,

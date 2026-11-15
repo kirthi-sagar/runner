@@ -372,6 +372,16 @@ pub fn default_profile_path() -> Option<PathBuf> {
     })
 }
 
+/// Effective open-core mode: the `runner.toml` mode when a valid profile
+/// exists, otherwise [`ProfileMode::Local`]. Never fails.
+pub fn effective_mode() -> ProfileMode {
+    default_profile_path()
+        .filter(|p| p.exists())
+        .and_then(|p| load_profile_from(&p).ok())
+        .map(|profile| profile.mode)
+        .unwrap_or_default()
+}
+
 /// Parse a profile file. Unknown `mode` values fail the parse (validated).
 pub fn load_profile_from(path: &std::path::Path) -> Result<RunnerProfile, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("read profile: {e}"))?;

@@ -118,6 +118,100 @@ impl AuditLog {
     }
 }
 
+/// Default audit trail (`~/.config/runner/audit.jsonl`).
+pub fn default_audit_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("runner")
+            .join("audit.jsonl")
+    })
+}
+
+/// Structured outcome of [`verify_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// No trail file exists yet — nothing to verify, not tampering.
+    Absent { path: PathBuf },
+    /// Chain recomputed cleanly over `entries` entries.
+    Intact { path: PathBuf, entries: usize },
+    /// Tamper detected: broken hash, gap, reorder, or unreadable entry.
+    Tampered { path: PathBuf, reason: String },
+}
+
+impl VerifyOutcome {
+    /// True unless tampering was detected (absent trails pass).
+    pub fn ok(&self) -> bool {
+        !matches!(self, Self::Tampered { .. })
+    }
+
+    /// Human-readable one-paragraph report for CLI output.
+    pub fn report(&self) -> String {
+        match self {
+            Self::Absent { path } => format!(
+                "no audit trail at {} yet — nothing to verify (run jobs to start the chain)",
+                path.display()
+            ),
+            Self::Intact { path, entries } => format!(
+                "audit trail intact: {entries} entries verified, SHA-256 chain clean ({})",
+                path.display()
+            ),
+            Self::Tampered { path, reason } => {
+                format!("AUDIT TAMPER DETECTED at {}: {reason}", path.display())
+            }
+        }
+    }
+}
+
+/// Verify the JSONL trail at `path`: replays entries in order, recomputes
+/// every link, and reports gaps, reorders, edits, or parse failures.
+pub fn verify_file(path: &Path) -> VerifyOutcome {
+    if !path.exists() {
+        return VerifyOutcome::Absent {
+            path: path.to_path_buf(),
+        };
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            return VerifyOutcome::Tampered {
+                path: path.to_path_buf(),
+                reason: format!("unreadable trail file: {e}"),
+            }
+        }
+    };
+    let mut entries = Vec::new();
+    for (line_no, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<AuditEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                return VerifyOutcome::Tampered {
+                    path: path.to_path_buf(),
+                    reason: format!("line {} is not a valid entry: {e}", line_no + 1),
+                }
+            }
+        }
+    }
+    let log = AuditLog {
+        path: path.to_path_buf(),
+        entries,
+    };
+    if log.verify() {
+        VerifyOutcome::Intact {
+            path: path.to_path_buf(),
+            entries: log.len(),
+        }
+    } else {
+        VerifyOutcome::Tampered {
+            path: path.to_path_buf(),
+            reason: "hash chain broken: gap, reorder, or edited entry".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

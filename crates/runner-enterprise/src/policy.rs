@@ -40,6 +40,104 @@ impl FleetPolicy {
     }
 }
 
+/// Default fleet policy file (`~/.config/runner/fleet-policy.toml`).
+pub fn default_policy_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        std::path::PathBuf::from(home)
+            .join(".config")
+            .join("runner")
+            .join("fleet-policy.toml")
+    })
+}
+
+/// Load a TOML fleet policy, falling back to [`FleetPolicy::permissive`]
+/// when the file is absent. Returns the policy plus a note describing
+/// which source was used (or why a present file was rejected).
+pub fn load_or_permissive(path: &std::path::Path) -> (FleetPolicy, String) {
+    if !path.exists() {
+        return (
+            FleetPolicy::permissive(),
+            format!(
+                "no policy file at {} — permissive fleet defaults",
+                path.display()
+            ),
+        );
+    }
+    match std::fs::read_to_string(path) {
+        Ok(text) => match toml::from_str::<FleetPolicy>(&text) {
+            Ok(policy) => (
+                policy,
+                format!("loaded fleet policy from {}", path.display()),
+            ),
+            Err(e) => (
+                FleetPolicy::permissive(),
+                format!(
+                    "rejecting {} ({e}) — permissive fleet defaults",
+                    path.display()
+                ),
+            ),
+        },
+        Err(e) => (
+            FleetPolicy::permissive(),
+            format!(
+                "unreadable {} ({e}) — permissive fleet defaults",
+                path.display()
+            ),
+        ),
+    }
+}
+
+/// Human-readable inspection of ceilings, provider allow-lists, and
+/// cloud-burst gates for the fleet and every tenant.
+pub fn describe(policy: &FleetPolicy) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "fleet defaults: {} cores, {}MB RAM\n",
+        ceiling(policy.default_max_cores),
+        ceiling_mb(policy.default_max_ram_mb)
+    ));
+    if policy.tenants.is_empty() {
+        out.push_str("tenants: none configured (fleet defaults apply to all)\n");
+    } else {
+        for tenant in &policy.tenants {
+            let providers = if tenant.providers.is_empty() {
+                "all".to_string()
+            } else {
+                tenant.providers.join(", ")
+            };
+            out.push_str(&format!(
+                "tenant '{}': {} cores, {}MB RAM, providers [{}], cloud burst: {}\n",
+                tenant.tenant,
+                ceiling(tenant.max_cores),
+                ceiling_mb(tenant.max_ram_mb),
+                providers,
+                if tenant.allow_cloud_burst {
+                    "allowed"
+                } else {
+                    "denied"
+                },
+            ));
+        }
+    }
+    out
+}
+
+fn ceiling(cores: f64) -> String {
+    if cores > 0.0 {
+        format!("{cores}")
+    } else {
+        "unlimited".to_string()
+    }
+}
+
+fn ceiling_mb(ram_mb: u64) -> String {
+    if ram_mb > 0 {
+        format!("{ram_mb}")
+    } else {
+        "unlimited".to_string()
+    }
+}
+
 /// A dispatch request awaiting a policy decision.
 #[derive(Debug, Clone)]
 pub struct JobRequest {

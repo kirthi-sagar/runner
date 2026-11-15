@@ -1370,14 +1370,40 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum",
+ "base64 0.22.1",
+ "reqwest",
+ "runner-cli",
+ "runner-core",
+ "runner-enterprise",
+ "runner-providers",
+ "runner-sandbox",
+ "runner-telemetry",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "runner-cli"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "runner-core",
+ "runner-enterprise",
+ "runner-providers",
+ "runner-sandbox",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "runner-core"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "boringtun",
- "clap",
- "flate2",
  "hmac",
- "jsonwebtoken",
- "libc",
  "mdns-sd",
  "nix 0.29.0",
  "rand 0.8.8",
@@ -1385,10 +1411,65 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tar",
  "tokio",
  "toml",
- "tower",
+]
+
+[[package]]
+name = "runner-enterprise"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "reqwest",
+ "runner-core",
+ "runner-telemetry",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "runner-providers"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "reqwest",
+ "runner-core",
+ "runner-sandbox",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "runner-sandbox"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "libc",
+ "nix 0.29.0",
+ "rand 0.8.8",
+ "reqwest",
+ "runner-core",
+ "serde_json",
+ "tar",
+ "tokio",
+]
+
+[[package]]
+name = "runner-telemetry"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

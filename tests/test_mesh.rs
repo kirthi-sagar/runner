@@ -1,9 +1,11 @@
 //! Mesh tests: invitation token mint/verify and WireGuard config gen.
 
 use runner::mesh::invite::{
-    InviteAuthority, InviteCaps, InviteRole, InviteToken, parse_size_mb, parse_ttl_secs,
+    parse_size_mb, parse_ttl_secs, InviteAuthority, InviteCaps, InviteRole, InviteToken,
 };
-use runner::mesh::peer::{DEFAULT_KEEPALIVE_SECS, apply_donor_caps, generate_keypair, render_config};
+use runner::mesh::peer::{
+    apply_donor_caps, generate_keypair, render_config, DEFAULT_KEEPALIVE_SECS,
+};
 
 fn authority() -> InviteAuthority {
     InviteAuthority::new(vec![42u8; 32]).unwrap()
@@ -40,7 +42,10 @@ fn invite_generation_and_parsing() {
 fn invite_rejects_tampering_and_expiry() {
     let token = InviteToken {
         role: InviteRole::Worker,
-        caps: InviteCaps { max_cores: 2, max_ram_mb: 4096 },
+        caps: InviteCaps {
+            max_cores: 2,
+            max_ram_mb: 4096,
+        },
         ttl_secs: 3600,
         name: "bob".to_string(),
     };

@@ -1,0 +1,146 @@
+//! Tamper-evident audit trail: every entry embeds the SHA-256 hash of
+//! its predecessor, so any insertion, deletion, or edit breaks the chain
+//! and is detected by [`AuditLog::verify`]. Entries persist as JSONL.
+
+use std::path::{Path, PathBuf};
+
+use runner_telemetry::{LogEvent, LogLevel};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// One chained audit entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub seq: u64,
+    pub prev_hash: String,
+    pub event: LogEvent,
+    pub hash: String,
+}
+
+fn entry_hash(seq: u64, prev_hash: &str, event_json: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(seq.to_be_bytes());
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(event_json.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+/// Append-only audit log backed by a JSONL file.
+#[derive(Debug)]
+pub struct AuditLog {
+    path: PathBuf,
+    entries: Vec<AuditEntry>,
+}
+
+impl AuditLog {
+    /// Open (creating parent dirs); replays and verifies any existing chain.
+    pub fn open(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("audit dir: {e}"))?;
+        }
+        let mut log = Self {
+            path: path.to_path_buf(),
+            entries: Vec::new(),
+        };
+        if path.exists() {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("audit read: {e}"))?;
+            for (line_no, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let entry: AuditEntry = serde_json::from_str(line)
+                    .map_err(|e| format!("audit line {}: {e}", line_no + 1))?;
+                log.entries.push(entry);
+            }
+            if !log.verify() {
+                return Err("audit chain verification failed on open".to_string());
+            }
+        }
+        Ok(log)
+    }
+
+    /// Append an event, chaining it to its predecessor.
+    pub fn append(&mut self, level: LogLevel, source: &str, message: &str) -> &AuditEntry {
+        let seq = self.entries.len() as u64;
+        let prev_hash = self
+            .entries
+            .last()
+            .map(|e| e.hash.clone())
+            .unwrap_or_else(|| "genesis".to_string());
+        let event = LogEvent::now(level, source, message);
+        let hash = entry_hash(seq, &prev_hash, &event.to_json());
+        self.entries.push(AuditEntry {
+            seq,
+            prev_hash,
+            event,
+            hash,
+        });
+        let entry = self.entries.last().expect("just pushed");
+        if let Ok(json) = serde_json::to_string(entry) {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
+                let _ = writeln!(file, "{json}");
+            }
+        }
+        self.entries.last().expect("just pushed")
+    }
+
+    /// Recompute the full chain; false on any gap, reorder, or edit.
+    pub fn verify(&self) -> bool {
+        let mut prev = "genesis".to_string();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if entry.seq != index as u64 || entry.prev_hash != prev {
+                return false;
+            }
+            if entry.hash != entry_hash(entry.seq, &entry.prev_hash, &entry.event.to_json()) {
+                return false;
+            }
+            prev = entry.hash.clone();
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_verify_and_replay_round_trip() {
+        let dir = runner_core::test_support::TempDir::new("audit").unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let mut log = AuditLog::open(&path).unwrap();
+        assert!(log.is_empty());
+        log.append(LogLevel::Info, "fleet", "runner-1 registered");
+        log.append(LogLevel::Warn, "governor", "throttled to 25");
+        assert_eq!(log.len(), 2);
+        assert!(log.verify());
+
+        // Tampering with any entry breaks the chain.
+        let mut tampered = AuditLog::open(&path).unwrap();
+        tampered.entries[0].event.message = "forged".to_string();
+        assert!(!tampered.verify());
+
+        // Reloading the untouched file verifies cleanly.
+        let reloaded = AuditLog::open(&path).unwrap();
+        assert_eq!(reloaded.len(), 2);
+        assert!(reloaded.verify());
+    }
+}

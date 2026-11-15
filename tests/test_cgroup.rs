@@ -1,6 +1,6 @@
 //! cgroup weight transitions (100 / 25 / 1 ladder, never freeze).
 
-use runner::governor::cgroup::{CgroupSlice, weight_for_cpu_psi};
+use runner::governor::cgroup::{weight_for_cpu_psi, CgroupSlice};
 use std::fs;
 
 #[test]

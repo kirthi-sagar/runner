@@ -1,10 +1,10 @@
 //! GitLab adapter tests: protocol payloads, trace ranges, and
-//! `CiProvider` routing (no network; pure constructors + parsing).
+//! `ProviderAdapter` routing (no network; pure constructors + parsing).
 
 use runner::providers::gitlab::{
-    GitlabClient, GitlabJob, GitlabProvider, GitlabSystemInfo, build_request_body, content_range,
+    build_request_body, content_range, GitlabClient, GitlabJob, GitlabProvider, GitlabSystemInfo,
 };
-use runner::providers::{CiProvider, ProviderRegistry};
+use runner::providers::{ProviderAdapter, ProviderRegistry};
 
 fn info() -> GitlabSystemInfo {
     GitlabSystemInfo {
@@ -18,7 +18,11 @@ fn info() -> GitlabSystemInfo {
 
 #[test]
 fn request_payload_carries_token_tags_and_info() {
-    let body = build_request_body("RUNNER-TOKEN", &info(), &["zero-freeze".to_string(), "linux".to_string()]);
+    let body = build_request_body(
+        "RUNNER-TOKEN",
+        &info(),
+        &["zero-freeze".to_string(), "linux".to_string()],
+    );
     assert_eq!(body["token"], "RUNNER-TOKEN");
     assert_eq!(body["tags"].as_array().unwrap().len(), 2);
     assert_eq!(body["info"]["executor"], "custom");
@@ -42,7 +46,10 @@ fn job_response_deserializes_script_and_variables() {
     });
     let job = GitlabJob::from_response(&body).unwrap();
     assert_eq!(job.id, 123);
-    assert_eq!(job.script, vec!["cargo build", "cargo test", "cargo clippy"]);
+    assert_eq!(
+        job.script,
+        vec!["cargo build", "cargo test", "cargo clippy"]
+    );
     assert_eq!(job.variables.len(), 2);
     assert_eq!(job.repo_url.as_deref(), Some("https://gitlab.com/a/b.git"));
 }
@@ -71,14 +78,20 @@ async fn gitlab_provider_routes_through_trait() {
 
     let registry = ProviderRegistry::new();
     registry.register(Box::new(provider)).await;
-    assert_eq!(registry.active_providers().await, vec!["gitlab".to_string()]);
+    assert_eq!(
+        registry.active_providers().await,
+        vec!["gitlab".to_string()]
+    );
     assert!(registry.get_provider("gitlab").await.unwrap().enabled);
 }
 
 #[tokio::test]
 async fn default_registry_includes_gitlab_placeholder() {
     let registry = ProviderRegistry::default_registry().await;
-    let info = registry.get_provider("gitlab").await.expect("gitlab registered");
+    let info = registry
+        .get_provider("gitlab")
+        .await
+        .expect("gitlab registered");
     assert!(!info.enabled);
     // Only the local provider is active out of the box.
     assert_eq!(registry.active_providers().await, vec!["local".to_string()]);

@@ -2,24 +2,31 @@
 //! and graceful KVM-absent behavior (no hardware required).
 
 use runner::sandbox::microvm::{
-    FirecrackerClient, MicroVmConfig, MicroVmSupervisor, action_payload, boot_source_payload,
-    drive_payload, probe_kvm, vsock_payload, wait_for_socket,
+    action_payload, boot_source_payload, drive_payload, probe_kvm, vsock_payload, wait_for_socket,
+    FirecrackerClient, MicroVmConfig, MicroVmSupervisor,
 };
 use std::path::Path;
 use std::time::Duration;
 
 /// Minimal mock Firecracker API: accepts PUTs, records paths, answers 204.
-async fn serve_mock(path: std::path::PathBuf, seen: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+async fn serve_mock(
+    path: std::path::PathBuf,
+    seen: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let _ = std::fs::remove_file(&path);
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else { break };
+        let Ok((mut stream, _)) = listener.accept().await else {
+            break;
+        };
         let seen = seen.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
             // Read request head (single read is enough for small PUTs).
-            let Ok(n) = stream.read(&mut buf).await else { return };
+            let Ok(n) = stream.read(&mut buf).await else {
+                return;
+            };
             let head = String::from_utf8_lossy(&buf[..n]).into_owned();
             // Drain any body bytes already buffered is unnecessary for the mock.
             if let Some(request_line) = head.lines().next() {
@@ -29,7 +36,9 @@ async fn serve_mock(path: std::path::PathBuf, seen: std::sync::Arc<tokio::sync::
                 }
             }
             let _ = stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await;
         });
     }
@@ -44,7 +53,10 @@ fn payload_structures_match_api() {
     assert_eq!(drive["is_read_only"], false);
     let vsock = vsock_payload(7, Path::new("/tmp/v.sock"));
     assert_eq!(vsock["guest_cid"], 7);
-    assert_eq!(action_payload("SendCtrlAltDel")["action_type"], "SendCtrlAltDel");
+    assert_eq!(
+        action_payload("SendCtrlAltDel")["action_type"],
+        "SendCtrlAltDel"
+    );
 }
 
 #[tokio::test]
@@ -53,10 +65,15 @@ async fn client_handshake_and_instance_start_over_mock_uds() {
     let sock = dir.path().join("fc.sock");
     let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let server = tokio::spawn(serve_mock(sock.clone(), seen.clone()));
-    wait_for_socket(&sock, Duration::from_secs(5)).await.unwrap();
+    wait_for_socket(&sock, Duration::from_secs(5))
+        .await
+        .unwrap();
 
     let client = FirecrackerClient::new(sock.clone());
-    client.set_boot_source(Path::new("/k"), "console=ttyS0").await.unwrap();
+    client
+        .set_boot_source(Path::new("/k"), "console=ttyS0")
+        .await
+        .unwrap();
     client.set_rootfs(Path::new("/r")).await.unwrap();
     client.set_vsock(3, Path::new("/v")).await.unwrap();
     client.start_instance().await.unwrap();
@@ -82,7 +99,10 @@ async fn supervisor_reports_missing_kvm_without_panic() {
         dir.path().join("v.sock"),
     );
     let mut supervisor = MicroVmSupervisor::new(config);
-    let err = supervisor.launch(Path::new("/nonexistent/firecracker")).await.unwrap_err();
+    let err = supervisor
+        .launch(Path::new("/nonexistent/firecracker"))
+        .await
+        .unwrap_err();
     assert!(err.contains("/dev/kvm"), "{err}");
 }
 
@@ -98,7 +118,9 @@ async fn missing_binary_reports_clean_error() {
         dir.path().join("v.sock"),
     );
     let mut supervisor = MicroVmSupervisor::new(config);
-    let result = supervisor.launch(Path::new("/nonexistent-firecracker-binary-xyz")).await;
+    let result = supervisor
+        .launch(Path::new("/nonexistent-firecracker-binary-xyz"))
+        .await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(

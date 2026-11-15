@@ -52,5 +52,7 @@ async fn timeout_kills_and_errors() {
 
 #[tokio::test]
 async fn empty_command_is_rejected() {
-    assert!(execute_local_sandboxed(&[], true, Duration::from_secs(5)).await.is_err());
+    assert!(execute_local_sandboxed(&[], true, Duration::from_secs(5))
+        .await
+        .is_err());
 }

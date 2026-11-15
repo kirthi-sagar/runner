@@ -1,7 +1,7 @@
 //! PSI threshold parsing (spec section 3.3 governor table).
 
 use runner::governor::psi::{
-    PressureLevel, cpu_level, io_level, mem_level, parse_psi_file, read_snapshot_from,
+    cpu_level, io_level, mem_level, parse_psi_file, read_snapshot_from, PressureLevel,
 };
 
 #[test]

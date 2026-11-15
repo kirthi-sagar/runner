@@ -3,7 +3,7 @@
 
 use runner::control_plane::auth::{OidcConfig, OidcManager, SessionStore};
 use runner::control_plane::fleet::{FleetRegistry, HeartbeatPayload, RunnerRegistration};
-use runner::control_plane::server::{AppState, serve_on};
+use runner::control_plane::server::{serve_on, AppState};
 use std::time::Duration;
 
 fn registration(id: &str) -> RunnerRegistration {
@@ -54,7 +54,11 @@ fn oidc_login_url_has_state_nonce_and_scope() {
 async fn spawn_app(oidc: Option<OidcManager>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let state = AppState::new(FleetRegistry::new(), SessionStore::new(Duration::from_secs(60)), oidc);
+    let state = AppState::new(
+        FleetRegistry::new(),
+        SessionStore::new(Duration::from_secs(60)),
+        oidc,
+    );
     tokio::spawn(async move { serve_on(listener, state).await });
     // Wait for readiness.
     for _ in 0..50 {
@@ -71,8 +75,14 @@ async fn http_health_fleet_register_heartbeat() {
     let base = spawn_app(None).await;
     let http = reqwest::Client::new();
 
-    let health: serde_json::Value =
-        http.get(format!("{base}/health")).send().await.unwrap().json().await.unwrap();
+    let health: serde_json::Value = http
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(health["status"], "healthy");
     assert_eq!(health["version"], "0.3.0");
 
@@ -103,8 +113,14 @@ async fn http_health_fleet_register_heartbeat() {
         .unwrap();
     assert_eq!(heartbeat.status(), 200);
 
-    let fleet: serde_json::Value =
-        http.get(format!("{base}/api/v1/fleet")).send().await.unwrap().json().await.unwrap();
+    let fleet: serde_json::Value = http
+        .get(format!("{base}/api/v1/fleet"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(fleet["runners"].as_array().unwrap().len(), 1);
 
     let ghost = http
@@ -128,6 +144,10 @@ async fn auth_routes_without_oidc() {
     let http = reqwest::Client::new();
     let login = http.get(format!("{base}/auth/login")).send().await.unwrap();
     assert_eq!(login.status(), 503);
-    let callback = http.get(format!("{base}/auth/callback")).send().await.unwrap();
+    let callback = http
+        .get(format!("{base}/auth/callback"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(callback.status(), 400);
 }

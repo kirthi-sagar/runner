@@ -93,7 +93,7 @@ elif [ -x ./target/debug/runner ]; then
     BIN_SRC="./target/debug/runner"
 elif command -v cargo >/dev/null 2>&1; then
     log "no prebuilt binary; running cargo build --release"
-    if [ "$DRY_RUN" -eq 0 ]; then cargo build --release; fi
+    if [ "$DRY_RUN" -eq 0 ]; then cargo build --release -p runner-cli; fi
     BIN_SRC="./target/release/runner"
 else
     log "error: no binary at ./target/release/runner and cargo not found"

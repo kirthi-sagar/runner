@@ -41,18 +41,26 @@ fn watchdog_fires_provider_termination_at_five_minutes() {
     let mut controller = AutoscaleController::new(
         "droplet-1",
         start,
-        RecordingTerminator { calls: calls.clone() },
+        RecordingTerminator {
+            calls: calls.clone(),
+        },
     );
     // Empty queue inside the grace period: keep.
     assert_eq!(
-        controller.poll(start + Duration::from_secs(299), 0).unwrap(),
+        controller
+            .poll(start + Duration::from_secs(299), 0)
+            .unwrap(),
         ScaleAction::Keep
     );
     assert!(calls.borrow().is_empty());
     // Empty queue at 5 minutes: provider termination fires exactly once.
     assert_eq!(
-        controller.poll(start + Duration::from_secs(300), 0).unwrap(),
-        ScaleAction::Terminate { instance_id: "droplet-1".to_string() }
+        controller
+            .poll(start + Duration::from_secs(300), 0)
+            .unwrap(),
+        ScaleAction::Terminate {
+            instance_id: "droplet-1".to_string()
+        }
     );
     assert_eq!(*calls.borrow(), vec!["droplet-1".to_string()]);
 }

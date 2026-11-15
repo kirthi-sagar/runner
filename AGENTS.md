@@ -66,11 +66,11 @@ runner/
 
 ### Check & Test
 ```bash
-# Run full unit and integration test suite
-cargo test
+# Run full unit and integration test suite (all workspace crates)
+cargo test --workspace
 
 # Check code formatting and linter
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ### Inspect Host Telemetry

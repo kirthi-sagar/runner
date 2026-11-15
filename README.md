@@ -155,7 +155,7 @@ Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.cont
 
 ```bash
 # 1. Build (or let the installer build for you)
-cargo build --release
+cargo build --release -p runner-cli
 
 # 2. Install (per-user: ~/.local/bin + systemd user service)
 ./install.sh
@@ -309,7 +309,7 @@ machines with `runner mesh list --lan`. Revoke by draining:
 
 `runner` is a single, unified zero-freeze mesh across every CI source.
 One governor, one sandbox, one fleet — four providers behind the common
-`CiProvider` trait (`poll → claim → execute → complete`):
+`ProviderAdapter` trait (`poll → claim → execute → complete`):
 
 1. **GitHub Actions**: Official wrapped worker with ephemeral JIT tokens.
    Workflows target `runs-on: [self-hosted, runner]`; the coordinator
@@ -339,7 +339,7 @@ Three production capabilities for regulated and large-scale fleets:
 
 ### Native eBPF Egress Filtering
 
-`src/sandbox/ebpf.rs` generates socket-filter bytecode in pure Rust — no
+`crates/runner-sandbox/src/ebpf.rs` generates socket-filter bytecode in pure Rust — no
 external `nftables` CLI execution. The program drops RFC 1918, `169.254/16`
 metadata, and IPv6 ULA destinations, allows only UDP 53 (DNS) and TCP 443
 (HTTPS), and default-drops everything else. `probe_ebpf()` detects
@@ -347,7 +347,7 @@ unprivileged attach support at runtime without panicking.
 
 ### Firecracker MicroVM Execution (Tier-1)
 
-`src/sandbox/microvm.rs` drives Firecracker's REST socket API: boot source,
+`crates/runner-sandbox/src/microvm.rs` drives Firecracker's REST socket API: boot source,
 rootfs, vsock, `InstanceStart`, and graceful `SendCtrlAltDel` shutdown.
 `MicroVmSupervisor` polls socket readiness with timeout and cleans up on
 exit. `probe_kvm()` gates Tier-1 on `/dev/kvm` availability — hosts
@@ -366,3 +366,62 @@ without KVM degrade gracefully to Tier-2 namespaces, never crashing.
 
 Stale runners past the heartbeat TTL are evicted automatically. Enable SSO
 with `--oidc-issuer`, `--client-id`, and `--client-secret`.
+
+---
+
+## 12. Open-Core Architecture (Cargo Workspace Monorepo)
+
+`runner` serves two audiences from one repository at
+`https://github.com/kirthi-sagar/runner` — no repo split, no feature
+gating by binary. A Cargo workspace keeps every layer loosely coupled:
+
+| Crate | Role | Edition focus |
+|---|---|---|
+| `crates/runner-core` | Execution engine: config, resource governor, federated mesh, IPC, MCP, status | Both |
+| `crates/runner-sandbox` | Dual-tier isolation: process namespaces / Firecracker microVMs | Both |
+| `crates/runner-providers` | Universal `ProviderAdapter` (GitHub, GitLab, Bitbucket, local) | Both |
+| `crates/runner-telemetry` | Ring-buffer capture + structured JSON logs | Both |
+| `crates/runner-enterprise` | Control plane, audit trail, fleet policy, SSO hooks | Enterprise |
+| `crates/runner-cli` | Unified `runner` binary entrypoint | Both |
+
+The root `runner` crate is a thin facade re-exporting the stable
+`runner::*` API, so existing agents, tests, and scripts keep working
+unchanged. Core crates never depend on enterprise code.
+
+### Community Edition — indie developers & AI agents
+
+Free, unlimited self-hosted CI on local and spare hardware. Zero-friction
+profile (`~/.config/runner/runner.toml`):
+
+```toml
+mode = "local"
+
+[governor]
+max_cpu_percent = 70
+```
+
+`mode = "local"` selects the lightweight process sandbox; the governor
+keeps interactive apps smooth while jobs run.
+
+### Enterprise Edition — platform & security teams
+
+Sovereign, air-gapped, zero-trust execution mesh with hardware-isolated
+sandboxes and multi-provider unification:
+
+```toml
+mode = "enterprise"
+
+[sandbox]
+driver = "microvm"
+kernel_path = "/srv/microvm/vmlinux"
+rootfs_path = "/srv/microvm/rootfs.ext4"
+
+[security]
+air_gapped = true
+```
+
+`mode = "enterprise"` defaults to the microVM tier; `air_gapped = true`
+refuses cloud bursting at the pool; the audit trail (`runner::audit`),
+fleet policy (`runner::policy`), and SSO hooks (`runner::sso`) govern
+the fleet. `runner.toml` layers over `config.toml` (profile wins);
+a malformed profile warns and never blocks startup.

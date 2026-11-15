@@ -1,9 +1,7 @@
 //! eBPF program tests: instruction encoding, range filtering,
 //! port whitelist, and unprivileged attach probe.
 
-use runner::sandbox::ebpf::{
-    EgressFilterProgram, alu64_imm, jmp_imm, ld_abs, op, probe_ebpf,
-};
+use runner::sandbox::ebpf::{alu64_imm, jmp_imm, ld_abs, op, probe_ebpf, EgressFilterProgram};
 
 #[test]
 fn instruction_encodings_match_isa() {
@@ -18,8 +16,12 @@ fn program_filters_ipv4_ranges() {
     let insns = EgressFilterProgram::new().to_instructions();
     let imms: Vec<i32> = insns.iter().map(|i| i.imm).collect();
     // Masked network constants for 10/8, 172.16/12, 192.168/16, 169.254/16.
-    for net in [0x0a00_0000i32, 0xac10_0000u32 as i32, 0xc0a8_0000u32 as i32, 0xa9fe_0000u32 as i32]
-    {
+    for net in [
+        0x0a00_0000i32,
+        0xac10_0000u32 as i32,
+        0xc0a8_0000u32 as i32,
+        0xa9fe_0000u32 as i32,
+    ] {
         assert!(imms.contains(&net), "missing net {net:#x}");
     }
     // Destination word loads at IPv4 offset 16.
@@ -34,7 +36,9 @@ fn program_filters_ipv4_ranges() {
 fn program_filters_ipv6_ula() {
     let insns = EgressFilterProgram::new().to_instructions();
     let has_ula = insns.iter().any(|i| i.code == op::LD_ABS_B && i.imm == 24)
-        && insns.iter().any(|i| i.code == op::ALU64_IMM_AND && i.imm == 0xfe);
+        && insns
+            .iter()
+            .any(|i| i.code == op::ALU64_IMM_AND && i.imm == 0xfe);
     assert!(has_ula);
 }
 
@@ -43,7 +47,9 @@ fn port_whitelist_covers_dns_and_https() {
     let insns = EgressFilterProgram::new().to_instructions();
     for port in [53i32, 443i32] {
         assert!(
-            insns.iter().any(|i| i.code == op::JMP_IMM_JEQ && i.imm == port),
+            insns
+                .iter()
+                .any(|i| i.code == op::JMP_IMM_JEQ && i.imm == port),
             "missing port {port}"
         );
     }

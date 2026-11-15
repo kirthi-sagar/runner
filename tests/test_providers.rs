@@ -1,6 +1,6 @@
 //! Provider registry tests: registration, routing, multi-provider poll.
 
-use runner::providers::{CiProvider, JobPayload, ProviderJob, ProviderRegistry};
+use runner::providers::{JobPayload, ProviderAdapter, ProviderJob, ProviderRegistry};
 use std::time::Duration;
 
 struct ScriptedProvider {
@@ -10,7 +10,7 @@ struct ScriptedProvider {
 }
 
 #[async_trait::async_trait]
-impl CiProvider for ScriptedProvider {
+impl ProviderAdapter for ScriptedProvider {
     fn name(&self) -> &'static str {
         self.name
     }
@@ -51,13 +51,24 @@ fn job(id: &str, provider: &str) -> ProviderJob {
 async fn registry_routes_registration_and_lookup() {
     let registry = ProviderRegistry::new();
     registry
-        .register(Box::new(ScriptedProvider { name: "github", enabled: true, jobs: vec![job("1", "github")] }))
+        .register(Box::new(ScriptedProvider {
+            name: "github",
+            enabled: true,
+            jobs: vec![job("1", "github")],
+        }))
         .await;
     registry
-        .register(Box::new(ScriptedProvider { name: "local", enabled: true, jobs: vec![] }))
+        .register(Box::new(ScriptedProvider {
+            name: "local",
+            enabled: true,
+            jobs: vec![],
+        }))
         .await;
 
-    assert_eq!(registry.active_providers().await, vec!["github".to_string(), "local".to_string()]);
+    assert_eq!(
+        registry.active_providers().await,
+        vec!["github".to_string(), "local".to_string()]
+    );
     assert!(registry.get_provider("github").await.unwrap().enabled);
     assert!(registry.get_provider("nosuch").await.is_none());
 }
@@ -89,7 +100,7 @@ async fn poll_all_merges_enabled_providers_only() {
 async fn failing_provider_does_not_stall_poll() {
     struct Failing;
     #[async_trait::async_trait]
-    impl CiProvider for Failing {
+    impl ProviderAdapter for Failing {
         fn name(&self) -> &'static str {
             "broken"
         }
@@ -110,7 +121,11 @@ async fn failing_provider_does_not_stall_poll() {
     let registry = ProviderRegistry::new();
     registry.register(Box::new(Failing)).await;
     registry
-        .register(Box::new(ScriptedProvider { name: "local", enabled: true, jobs: vec![job("3", "local")] }))
+        .register(Box::new(ScriptedProvider {
+            name: "local",
+            enabled: true,
+            jobs: vec![job("3", "local")],
+        }))
         .await;
     let jobs = registry.poll_all().await;
     assert_eq!(jobs.len(), 1);

@@ -4,10 +4,13 @@
 use runner::config::RunnerConfig;
 use runner::governor::supervisor::new_shared_state;
 use runner::mcp::server::McpServer;
-use runner::mcp::tools::{ALL_TOOLS, ToolContext};
+use runner::mcp::tools::{ToolContext, ALL_TOOLS};
 
 fn server() -> McpServer {
-    McpServer::new(ToolContext::new(new_shared_state(), RunnerConfig::default()))
+    McpServer::new(ToolContext::new(
+        new_shared_state(),
+        RunnerConfig::default(),
+    ))
 }
 
 fn call(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -82,11 +85,21 @@ async fn tools_call_reserve_throttle_drain_cycle() {
 
     // Drain + release.
     for (tool, args) in [
-        ("drain_node", serde_json::json!({ "node_id": "n1", "reason": "t" })),
-        ("release_host_resources", serde_json::json!({ "reservation_id": id })),
+        (
+            "drain_node",
+            serde_json::json!({ "node_id": "n1", "reason": "t" }),
+        ),
+        (
+            "release_host_resources",
+            serde_json::json!({ "reservation_id": id }),
+        ),
     ] {
         let res = server
-            .handle_value(call(5, "tools/call", serde_json::json!({ "name": tool, "arguments": args })))
+            .handle_value(call(
+                5,
+                "tools/call",
+                serde_json::json!({ "name": tool, "arguments": args }),
+            ))
             .await
             .expect("response");
         assert!(res.get("error").is_none(), "{res}");

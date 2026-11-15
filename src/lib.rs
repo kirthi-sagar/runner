@@ -1,5 +1,14 @@
-//! `runner`: host supervisor, federated mesh coordinator, and sandbox
-//! hypervisor for GitHub Actions runners.
+//! `runner` open-core facade: stable `runner::*` API over the workspace.
+//!
+//! The implementation lives in focused crates; this crate only re-exports
+//! so existing binaries, tests, and agents keep working unchanged:
+//!
+//! * [`runner_core`] — engine: config, governor, mesh, IPC, MCP, status.
+//! * [`runner_sandbox`] — dual-tier isolation (process namespaces / microVM).
+//! * [`runner_providers`] — universal CI adapters (GitHub/GitLab/Bitbucket/local).
+//! * [`runner_telemetry`] — ring-buffer capture and structured JSON logs.
+//! * [`runner_enterprise`] — governance: control plane, audit, fleet policy, SSO.
+//! * [`runner_cli`] — unified binary entrypoint (`service` helpers).
 //!
 //! Binding design authority: `README.md` and
 //! `AI_AGENT_RUNNER_SPECIFICATION.md` in the repository root.
@@ -10,51 +19,9 @@
 //! * Wrap the official `actions/runner` worker via single-use JIT configs.
 //! * Never mount `/home/*` into job sandboxes; block RFC 1918 egress.
 
-pub mod config;
-pub mod control_plane;
-pub mod github;
-pub mod governor;
-pub mod ipc;
-pub mod mcp;
-pub mod mesh;
-pub mod pidfile;
-pub mod providers;
-pub mod sandbox;
-pub mod service;
-pub mod status;
-
-/// Std-only unique temp dir guard for tests (no external crates).
-#[doc(hidden)]
-pub mod test_support {
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    pub struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        pub fn new(tag: &str) -> std::io::Result<Self> {
-            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!(
-                "runner-test-{}-{}-{tag}",
-                std::process::id(),
-                id
-            ));
-            std::fs::create_dir_all(&path)?;
-            Ok(Self { path })
-        }
-
-        pub fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-}
+pub use runner_cli::service;
+pub use runner_core::{config, governor, ipc, mcp, mesh, pidfile, status, test_support};
+pub use runner_enterprise::{audit, control_plane, policy, sso};
+pub use runner_providers::{github, providers};
+pub use runner_sandbox as sandbox;
+pub use runner_telemetry as telemetry;

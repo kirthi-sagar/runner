@@ -2,7 +2,7 @@
 //! parsing for mesh jobs.
 
 use runner::github::client::GithubClient;
-use runner::github::jit::{JitRequest, JitResponse, decode_jit_config};
+use runner::github::jit::{decode_jit_config, JitRequest, JitResponse};
 use runner::github::webhooks::parse_queued_jobs;
 use runner::sandbox::worker::WorkerLaunch;
 
@@ -14,7 +14,10 @@ fn jit_response_parses_and_blob_decodes() {
     });
     let res: JitResponse = serde_json::from_value(body).unwrap();
     assert_eq!(res.runner.id, 77);
-    assert_eq!(decode_jit_config(&res.encoded_jit_config).unwrap(), b"hello-world");
+    assert_eq!(
+        decode_jit_config(&res.encoded_jit_config).unwrap(),
+        b"hello-world"
+    );
     assert!(decode_jit_config("").is_err());
     assert!(decode_jit_config("!!!not-base64!!!").is_err());
 }

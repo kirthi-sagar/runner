@@ -1,0 +1,18 @@
+[package]
+name = "runner-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable isolation: process namespaces (community) and microVMs (enterprise)"
+
+[dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+nix.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+rand.workspace = true
+tar.workspace = true
+flate2.workspace = true
+runner-core.workspace = true

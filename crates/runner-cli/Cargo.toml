@@ -1,0 +1,20 @@
+[package]
+name = "runner-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified runner binary entrypoint and service management"
+
+[[bin]]
+name = "runner"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+runner-core.workspace = true
+runner-sandbox.workspace = true
+runner-providers.workspace = true
+runner-enterprise.workspace = true

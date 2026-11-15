@@ -1,10 +1,8 @@
 //! Sandbox tests: `/home/*` rejection, RFC 1918 classification, and
 //! tmpfs workspace lifecycle (create → scrub → remove).
 
-use runner::sandbox::mounts::{Workspace, sanitize_job_id, validate_no_home_mount};
-use runner::sandbox::network::{
-    is_blocked_egress, is_rfc1918, nftables_sandbox_ruleset,
-};
+use runner::sandbox::mounts::{sanitize_job_id, validate_no_home_mount, Workspace};
+use runner::sandbox::network::{is_blocked_egress, is_rfc1918, nftables_sandbox_ruleset};
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
@@ -40,23 +38,40 @@ fn rfc1918_and_special_ranges_are_blocked() {
         let addr = IpAddr::from_str(ip).unwrap();
         assert!(is_blocked_egress(addr), "{ip}");
     }
-    for ip in ["1.1.1.1", "8.8.8.8", "140.82.112.4", "172.32.0.1", "192.167.1.1"] {
+    for ip in [
+        "1.1.1.1",
+        "8.8.8.8",
+        "140.82.112.4",
+        "172.32.0.1",
+        "192.167.1.1",
+    ] {
         let addr = IpAddr::from_str(ip).unwrap();
-        assert!(!is_rfc1918(match addr {
-            IpAddr::V4(v4) => v4,
-            IpAddr::V6(_) => unreachable!(),
-        }), "{ip}");
+        assert!(
+            !is_rfc1918(match addr {
+                IpAddr::V4(v4) => v4,
+                IpAddr::V6(_) => unreachable!(),
+            }),
+            "{ip}"
+        );
         assert!(!is_blocked_egress(addr), "{ip}");
     }
     // IPv6 ULA blocked, global unicast allowed.
     assert!(is_blocked_egress(IpAddr::from_str("fd12:3456::1").unwrap()));
-    assert!(!is_blocked_egress(IpAddr::from_str("2606:4700:4700::1111").unwrap()));
+    assert!(!is_blocked_egress(
+        IpAddr::from_str("2606:4700:4700::1111").unwrap()
+    ));
 }
 
 #[test]
 fn sandbox_ruleset_drops_private_allows_dns_https() {
     let rules = nftables_sandbox_ruleset();
-    for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fd00::/8"] {
+    for cidr in [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "fd00::/8",
+    ] {
         assert!(rules.contains(cidr), "{cidr}");
     }
     assert!(rules.contains("udp dport 53 accept"));
@@ -95,7 +110,9 @@ fn hostile_job_ids_stay_inside_root() {
 async fn live_worker_cache_download() {
     use runner::sandbox::worker::ensure_cached_in;
     let dir = runner::test_support::TempDir::new("live-worker").unwrap();
-    let pkg = ensure_cached_in(dir.path(), "2.338.2", "x64").await.unwrap();
+    let pkg = ensure_cached_in(dir.path(), "2.338.2", "x64")
+        .await
+        .unwrap();
     assert!(pkg.join("run.sh").exists());
     assert!(pkg.join("bin").join("Runner.Worker").exists());
 }
@@ -107,7 +124,7 @@ async fn live_worker_cache_download() {
 #[test]
 #[ignore]
 fn live_sandbox_or_fallback_spawn() {
-    use runner::sandbox::mounts::{SandboxSpec, probe_userns, sandbox_pre_exec};
+    use runner::sandbox::mounts::{probe_userns, sandbox_pre_exec, SandboxSpec};
     if probe_userns() {
         let dir = runner::test_support::TempDir::new("live-sandbox").unwrap();
         let ws = dir.path().join("ws");
@@ -121,6 +138,9 @@ fn live_sandbox_or_fallback_spawn() {
         assert!(cmd.status().unwrap().success());
     } else {
         eprintln!("userns mounts blocked on this host; verifying fallback spawn");
-        assert!(std::process::Command::new("true").status().unwrap().success());
+        assert!(std::process::Command::new("true")
+            .status()
+            .unwrap()
+            .success());
     }
 }

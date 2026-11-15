@@ -1,8 +1,8 @@
 //! Slot calculations across CPU configs (spec section 3.6 matrix).
 
 use runner::governor::topology::{
-    JOB_MIN_CORES, JOB_MIN_MEM_MB, SlotInputs, calculate_slots, default_reserved_cores,
-    default_reserved_mem_mb,
+    calculate_slots, default_reserved_cores, default_reserved_mem_mb, SlotInputs, JOB_MIN_CORES,
+    JOB_MIN_MEM_MB,
 };
 
 #[test]

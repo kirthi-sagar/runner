@@ -1,7 +1,7 @@
 //! IPC socket tests: bind, ping round-trip, and status telemetry.
 
 use runner::governor::supervisor::new_shared_state;
-use runner::ipc::{IpcServer, ipc_call};
+use runner::ipc::{ipc_call, IpcServer};
 use std::sync::Arc;
 
 #[tokio::test]

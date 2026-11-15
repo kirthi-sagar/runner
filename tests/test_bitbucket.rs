@@ -1,11 +1,11 @@
 //! Bitbucket adapter tests: OAuth payloads, step extraction, and
-//! `CiProvider` routing (no network; pure constructors + parsing).
+//! `ProviderAdapter` routing (no network; pure constructors + parsing).
 
 use runner::providers::bitbucket::{
-    BitbucketProvider, BitbucketStepStatus, BitbucketTokenResponse, normalize_script,
-    parse_step_response, steps_url, token_needs_refresh,
+    normalize_script, parse_step_response, steps_url, token_needs_refresh, BitbucketProvider,
+    BitbucketStepStatus, BitbucketTokenResponse,
 };
-use runner::providers::{CiProvider, ProviderRegistry};
+use runner::providers::{ProviderAdapter, ProviderRegistry};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -20,7 +20,10 @@ fn oauth_response_deserializes_with_expiry() {
     let received = Instant::now();
     let expires_at = token.expires_at(received);
     assert!(!token_needs_refresh(expires_at, received));
-    assert!(token_needs_refresh(expires_at, received + Duration::from_secs(7200)));
+    assert!(token_needs_refresh(
+        expires_at,
+        received + Duration::from_secs(7200)
+    ));
 }
 
 #[test]
@@ -68,19 +71,32 @@ fn step_status_and_queue_urls() {
 
 #[tokio::test]
 async fn bitbucket_provider_routes_through_trait() {
-    let provider = BitbucketProvider::new("id", "secret", "acme", "web", "runner-1", vec!["runner".to_string()]);
+    let provider = BitbucketProvider::new(
+        "id",
+        "secret",
+        "acme",
+        "web",
+        "runner-1",
+        vec!["runner".to_string()],
+    );
     assert_eq!(provider.name(), "bitbucket");
     assert!(provider.is_enabled());
 
     let registry = ProviderRegistry::new();
     registry.register(Box::new(provider)).await;
-    assert_eq!(registry.active_providers().await, vec!["bitbucket".to_string()]);
+    assert_eq!(
+        registry.active_providers().await,
+        vec!["bitbucket".to_string()]
+    );
     assert!(registry.get_provider("bitbucket").await.unwrap().enabled);
 }
 
 #[tokio::test]
 async fn default_registry_includes_bitbucket_placeholder() {
     let registry = ProviderRegistry::default_registry().await;
-    let info = registry.get_provider("bitbucket").await.expect("bitbucket registered");
+    let info = registry
+        .get_provider("bitbucket")
+        .await
+        .expect("bitbucket registered");
     assert!(!info.enabled);
 }

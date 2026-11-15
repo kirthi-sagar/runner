@@ -153,7 +153,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.3.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.3.1 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -182,6 +182,44 @@ runner status --format=json
 
 Root installs system-wide instead: `sudo ./install.sh` (binary to `/usr/local/bin`,
 config to `/etc/runner`, unit to `/etc/systemd/system`).
+
+### Watch the zero-freeze governor live
+
+```bash
+runner top
+```
+
+```text
+runner top v0.3.1  (q quit, live cadence)
+CPU  [####--------------------]  15.6% some avg10
+MEM  [#-----------------------]   4.2% some avg10
+IO   [##----------------------]   7.2% full avg10
+governor weight 100 (normal) | slots 1
+jobs: 0 in-flight, 0 queued
+fleet: 4 local cores | 0 WAN peers | 0 cloud nodes | 0 drained
+```
+
+Kernel PSI gauges drive the cgroups v2 weight ladder (100 normal → 25
+warning → 1 critical trickle — active tests are never frozen), alongside
+live slots, in-flight jobs with provider tags, and the fleet split.
+`runner top --once` emits one snapshot for scripts and CI.
+
+### Sub-second dispatch with webhooks
+
+```bash
+runner listen --port 9898 --secret "$RUNNER_WEBHOOK_SECRET"
+```
+
+HMAC-verified (`X-Hub-Signature-256`) GitHub `workflow_job.queued` and
+GitLab build events wake the coordinator instantly instead of waiting
+for the next poll cycle. Or embed the listener in the daemon:
+
+```toml
+[server]
+listen_port = 9898
+```
+
+with the secret in `RUNNER_WEBHOOK_SECRET` (never in config files).
 
 ---
 

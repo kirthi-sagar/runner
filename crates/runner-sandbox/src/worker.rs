@@ -175,6 +175,25 @@ fn attach_to_slice(slice: &runner_core::governor::cgroup::CgroupSlice, pid: u32)
 }
 
 /// Spawn the worker, attach it to the cgroup slice, and supervise it to
+/// Spawn with `ETXTBSY` tolerance: under parallel load the kernel may
+/// report the just-written worker script busy (errno 26). Back off 10ms
+/// and retry up to 5 times; every other error returns immediately so
+/// genuine spawn failures stay loud and fast.
+async fn spawn_with_busy_retry(cmd: &mut TokioCommand) -> io::Result<tokio::process::Child> {
+    const RETRIES: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy && attempt < RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// completion. Kills the child on timeout. Never freezes: a stuck worker
 /// is killed, never suspended mid-test.
 pub async fn run_supervised(
@@ -198,7 +217,7 @@ pub async fn run_supervised(
             cmd.pre_exec(move || crate::mounts::sandbox_pre_exec(&spec));
         }
     }
-    let mut child = cmd.spawn()?;
+    let mut child = spawn_with_busy_retry(&mut cmd).await?;
     if let (Some(pid), Some(slice)) = (child.id(), slice) {
         attach_to_slice(slice, pid);
     }
@@ -221,6 +240,26 @@ pub async fn run_supervised(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write a test script and force it to stable storage before launch,
+    /// closing the ETXTBSY race on the writer side.
+    fn write_script(path: &Path, contents: &str) {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_retry_ignores_other_errors_fast() {
+        // Nonexistent binary: NotFound must propagate immediately with no
+        // retry backoff (well under the 5x10ms busy budget).
+        let start = std::time::Instant::now();
+        let mut cmd = TokioCommand::new("/no/such/binary-xyz");
+        let err = spawn_with_busy_retry(&mut cmd).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
 
     #[test]
     fn jit_launch_argv_has_no_config_step() {
@@ -255,7 +294,7 @@ mod tests {
         let dir = runner_core::test_support::TempDir::new("worker").unwrap();
         let pkg = dir.path().join("pkg");
         std::fs::create_dir_all(&pkg).unwrap();
-        std::fs::write(pkg.join("run.sh"), "#!/bin/sh\nexit ${FAKE_EXIT:-0}\n").unwrap();
+        write_script(&pkg.join("run.sh"), "#!/bin/sh\nexit ${FAKE_EXIT:-0}\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -280,7 +319,7 @@ mod tests {
         let dir = runner_core::test_support::TempDir::new("worker-timeout").unwrap();
         let pkg = dir.path().join("pkg");
         std::fs::create_dir_all(&pkg).unwrap();
-        std::fs::write(pkg.join("run.sh"), "#!/bin/sh\nsleep 30\n").unwrap();
+        write_script(&pkg.join("run.sh"), "#!/bin/sh\nsleep 30\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

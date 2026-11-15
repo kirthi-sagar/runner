@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "runner-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "runner-enterprise"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "runner-providers"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "runner-sandbox"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1469,7 +1469,7 @@ dependencies = [
 
 [[package]]
 name = "runner-telemetry"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",

@@ -38,6 +38,8 @@ jobs:
   dogfood-verify:
     name: Dogfooding Runner (self-hosted zero-freeze)
     runs-on: [self-hosted, runner]
+    # Fork guard: external PRs run on cloud runners only, never on self-hosted iron.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     continue-on-error: true
     steps:
       - name: Checkout repository

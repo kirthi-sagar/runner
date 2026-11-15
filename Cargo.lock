@@ -1388,6 +1388,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "runner-core",
  "runner-enterprise",
  "runner-providers",
@@ -1422,6 +1423,7 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "hmac",
  "jsonwebtoken",
  "rand 0.8.8",
  "reqwest",

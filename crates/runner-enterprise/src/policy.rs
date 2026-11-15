@@ -92,7 +92,7 @@ pub fn load_or_permissive(path: &std::path::Path) -> (FleetPolicy, String) {
 pub fn describe(policy: &FleetPolicy) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "fleet defaults: {} cores, {}MB RAM\n",
+        "fleet defaults: {} cores, {} MB RAM\n",
         ceiling(policy.default_max_cores),
         ceiling_mb(policy.default_max_ram_mb)
     ));
@@ -106,7 +106,7 @@ pub fn describe(policy: &FleetPolicy) -> String {
                 tenant.providers.join(", ")
             };
             out.push_str(&format!(
-                "tenant '{}': {} cores, {}MB RAM, providers [{}], cloud burst: {}\n",
+                "tenant '{}': {} cores, {} MB RAM, providers [{}], cloud burst: {}\n",
                 tenant.tenant,
                 ceiling(tenant.max_cores),
                 ceiling_mb(tenant.max_ram_mb),

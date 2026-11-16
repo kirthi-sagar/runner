@@ -1,0 +1,2 @@
+import Link from "next/link"
+export default function NotFound(){return <section className="content-page"><div className="content-wrap"><div className="access-box"><span className="content-pill">404 · NOT FOUND</span><h2 style={{marginTop:18}}>That page isn’t here</h2><p>The link may be out of date, or the page may not be part of this project yet.</p><Link className="button" href="/">Back to home</Link></div></div></section>}

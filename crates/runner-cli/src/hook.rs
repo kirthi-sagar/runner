@@ -36,12 +36,17 @@ pub fn detect_command(dir: &Path) -> Option<String> {
 /// binary from `PATH`, runs the check under `runner exec` (cgroup
 /// governance, zero-freeze), and propagates the exit code so a
 /// failing check blocks the commit.
+///
+/// `--no-sandbox` is deliberate: a pre-commit check runs the
+/// developer's own tree in place (repo cwd), which a mount namespace
+/// would hide; governance still applies. Trusted local code needs
+/// freeze protection, not untrusted-code isolation.
 pub fn render_hook(command: &str) -> String {
     format!(
         "#!/bin/sh\n{HOOK_MARKER}\n# Wraps pre-commit checks in `runner exec` (zero-freeze).\n\
          set -e\nRUNNER_BIN=\"$(command -v runner)\"\n\
          if [ -z \"$RUNNER_BIN\" ]; then\n  echo \"runner not found in PATH; skipping governed pre-commit\" >&2\n  exit 0\nfi\n\
-         exec \"$RUNNER_BIN\" exec -- {command}\n"
+         exec \"$RUNNER_BIN\" exec --no-sandbox -- {command}\n"
     )
 }
 
@@ -143,7 +148,7 @@ mod tests {
         let script = render_hook("cargo test --workspace");
         assert!(script.starts_with("#!/bin/sh"));
         assert!(script.contains(HOOK_MARKER));
-        assert!(script.contains("exec \"$RUNNER_BIN\" exec -- cargo test --workspace"));
+        assert!(script.contains("exec \"$RUNNER_BIN\" exec --no-sandbox -- cargo test --workspace"));
     }
 
     #[test]

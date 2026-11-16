@@ -90,6 +90,9 @@ pub async fn execute_local_sandboxed(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    // Sandboxed runs chdir into the scratch workspace via pre_exec;
+    // governed-direct runs inherit the caller's cwd so repo-relative
+    // commands (`cargo test`, pre-commit hooks) resolve correctly.
     if sandboxed {
         let spec = workspace.sandbox_spec().map_err(|e| anyhow::anyhow!(e))?;
         // SAFETY: pre_exec runs after fork in the child only; the closure
@@ -97,8 +100,6 @@ pub async fn execute_local_sandboxed(
         unsafe {
             cmd.pre_exec(move || runner_sandbox::mounts::sandbox_pre_exec(&spec));
         }
-    } else {
-        cmd.current_dir(workspace.path());
     }
 
     let slice = CgroupSlice::system_default();

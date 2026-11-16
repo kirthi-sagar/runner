@@ -56,3 +56,28 @@ async fn empty_command_is_rejected() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn direct_mode_inherits_caller_cwd() {
+    // Governed-direct runs must resolve relative paths against the
+    // invoking directory (repo checks, hooks) — not scratch space.
+    // `no_sandbox = true` pins the direct path on every host.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let marker = format!(
+        "cwd-probe-{}-{}.txt",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    let code = execute_local_sandboxed(
+        &cmd(&["sh", "-c", &format!("pwd > {marker}")]),
+        true,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    let expected = std::env::current_dir().unwrap();
+    let observed = std::fs::read_to_string(expected.join(&marker)).unwrap();
+    std::fs::remove_file(expected.join(&marker)).unwrap();
+    assert_eq!(observed.trim(), expected.to_string_lossy());
+}

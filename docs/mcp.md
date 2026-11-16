@@ -28,7 +28,7 @@ client after installing.
 ## What agents can do
 
 The server speaks newline-delimited JSON-RPC on stdio
-(`initialize`, `tools/list`, `tools/call`). Seven tools are exposed:
+(`initialize`, `tools/list`, `tools/call`). Eleven tools are exposed:
 
 | Tool | Purpose |
 |---|---|
@@ -39,6 +39,10 @@ The server speaks newline-delimited JSON-RPC on stdio
 | `throttle_runner` | Force weights down (`warning`/`critical`) for a duration — never freezes |
 | `request_cloud_capacity` | Burst to cloud within the pre-approved spend cap |
 | `drain_node` | Stop dispatching new jobs to a node |
+| `diagnose_system` | Host diagnostics (kernel, cgroups, KVM, eBPF, daemon, egress) as JSON |
+| `test_provider` | Verify CI provider credentials and connectivity |
+| `exec_command` | Run a command under zero-freeze governance; capture output |
+| `manage_cloud_capacity` | List, terminate, or purge daemon cloud burst workers |
 
 Example — check status, then throttle a noisy neighbor during a demo:
 

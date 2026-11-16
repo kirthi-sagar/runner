@@ -153,7 +153,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.3.2 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.4.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -190,10 +190,10 @@ runner top
 ```
 
 ```text
-runner top v0.3.2  (q quit, live cadence)
-CPU  [####--------------------]  15.6% some avg10
-MEM  [#-----------------------]   4.2% some avg10
-IO   [##----------------------]   7.2% full avg10
+runner top v0.4.0  (q quit, live cadence)
+CPU  [##----------------------]   7.4% some avg10
+MEM  [#-----------------------]   2.4% some avg10
+IO   [#-----------------------]   6.2% full avg10
 governor weight 100 (normal) | slots 1
 jobs: 0 in-flight, 0 queued
 fleet: 4 local cores | 0 WAN peers | 0 cloud nodes | 0 drained
@@ -281,6 +281,53 @@ under `runner exec --no-sandbox` (cgroup governance, repo cwd) so
 commits never freeze the workstation; a failing check blocks the
 commit. Existing hooks are backed up to `pre-commit.bak` and
 restored by `runner hook uninstall`.
+
+### Web control plane dashboard
+
+```bash
+runner server --listen 0.0.0.0:8080
+# then open http://localhost:8080/dashboard
+```
+
+```bash
+curl -s localhost:8080/health | python3 -m json.tool
+```
+
+```json
+{"status": "healthy", "version": "0.4.0", "governor": "normal",
+ "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
+```
+
+Single-file embedded dashboard (zero external assets): host PSI
+gauges, KPI cards, live fleet table, and a cloud-node badge,
+auto-refreshing every 2.5 seconds from `/health` and `/api/v1/fleet`.
+
+### AI-agent native MCP server
+
+```bash
+runner mcp --transport=stdio
+```
+
+11 tools over JSON-RPC 2.0 stdio: the 7 resource/fleet admin tools
+plus `diagnose_system`, `test_provider`, `exec_command`, and
+`manage_cloud_capacity`. One-command client registration with
+`runner mcp install --target cursor|claude|generic` (see §8).
+
+### Cloud bursting lifecycle
+
+```bash
+runner cloud list
+runner cloud terminate <instance-id>
+runner cloud purge
+```
+
+```text
+cloud nodes: 0 (spend cap $0.00/mo, live spend untracked)
+```
+
+Ephemeral workers burst within the `max_monthly_spend` cap and a
+5-minute idle watchdog terminates them automatically (scale-to-zero);
+the CLI manages the same daemon-tracked nodes on demand.
 
 ---
 

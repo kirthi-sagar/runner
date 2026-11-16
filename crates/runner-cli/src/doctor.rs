@@ -261,8 +261,72 @@ fn check_audit() -> Check {
     }
 }
 
-/// Gather every check; `enterprise` adds policy + audit continuity.
-pub async fn run_all(enterprise: bool) -> Vec<Check> {
+/// Per-probe TCP connect timeout: the egress check must stay fast
+/// even when the network silently drops packets (no RST).
+const EGRESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One egress expectation: `target` should be reachable iff `allow`.
+struct EgressProbe {
+    name: &'static str,
+    target: std::net::SocketAddr,
+    allow: bool,
+}
+
+/// Egress compliance probes. Report-only by design: cloud CI runners
+/// legitimately reach instance metadata, and offline hosts cannot
+/// reach public HTTPS — so unexpected outcomes are `Warn`, never
+/// `Fail`, and can never flip [`overall_ok`].
+fn egress_probes() -> Vec<EgressProbe> {
+    use std::net::{IpAddr, Ipv4Addr};
+    vec![
+        EgressProbe {
+            name: "egress:metadata",
+            target: std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)), 80),
+            allow: false,
+        },
+        EgressProbe {
+            name: "egress:rfc1918",
+            target: std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 1)), 443),
+            allow: false,
+        },
+        EgressProbe {
+            name: "egress:https",
+            target: std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443),
+            allow: true,
+        },
+    ]
+}
+
+/// Map a probe outcome to a [`Check`]: matches expectation → `Pass`,
+/// anything else → `Warn` (report-only; see [`egress_probes`]).
+fn egress_verdict(probe: &EgressProbe, reachable: bool) -> Check {
+    let expected = if probe.allow { "allowed" } else { "blocked" };
+    let observed = if reachable { "reachable" } else { "blocked" };
+    let detail = format!("{}: expected {expected}, observed {observed}", probe.target);
+    if reachable == probe.allow {
+        Check::pass(probe.name, detail)
+    } else {
+        Check::warn(probe.name, detail)
+    }
+}
+
+/// Attempt a TCP connect with a short timeout. `false` covers refused,
+/// timed-out, and administratively filtered targets alike.
+fn tcp_reachable(target: std::net::SocketAddr) -> bool {
+    std::net::TcpStream::connect_timeout(&target, EGRESS_PROBE_TIMEOUT).is_ok()
+}
+
+/// Run the egress compliance probes (blocking; each is timeout-bounded).
+fn check_egress() -> Vec<Check> {
+    egress_probes()
+        .iter()
+        .map(|probe| egress_verdict(probe, tcp_reachable(probe.target)))
+        .collect()
+}
+
+/// Gather every check; `enterprise` adds policy + audit continuity,
+/// `egress` adds the report-only network compliance probes.
+pub async fn run_all(enterprise: bool, egress: bool) -> Vec<Check> {
     let mut checks = vec![
         check_kernel(),
         check_cgroup(),
@@ -275,6 +339,9 @@ pub async fn run_all(enterprise: bool) -> Vec<Check> {
     if enterprise {
         checks.push(check_policy());
         checks.push(check_audit());
+    }
+    if egress {
+        checks.extend(check_egress());
     }
     checks
 }
@@ -363,5 +430,43 @@ mod tests {
         assert!(mcp_entry_present(&path));
         std::fs::write(&path, "{invalid").unwrap();
         assert!(!mcp_entry_present(&path));
+    }
+
+    #[test]
+    fn egress_verdicts_match_expectation_and_never_fail() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let blocked = EgressProbe {
+            name: "egress:test-block",
+            target: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            allow: false,
+        };
+        assert_eq!(egress_verdict(&blocked, false).status, Status::Pass);
+        // Unexpectedly reachable is a warning, never a failure.
+        assert_eq!(egress_verdict(&blocked, true).status, Status::Warn);
+        let allowed = EgressProbe {
+            name: "egress:test-allow",
+            target: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2),
+            allow: true,
+        };
+        assert_eq!(egress_verdict(&allowed, true).status, Status::Pass);
+        assert_eq!(egress_verdict(&allowed, false).status, Status::Warn);
+    }
+
+    #[test]
+    fn tcp_prober_observes_reachable_and_refused() {
+        use std::str::FromStr;
+        // Positive control: a bound localhost listener reads reachable.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(tcp_reachable(addr));
+        drop(listener);
+        // The closed port now refuses (fast, no timeout burn).
+        assert!(!tcp_reachable(addr));
+        // Documentation prefix is unroutable; must report unreachable,
+        // not hang past the timeout (generous upper bound for CI).
+        let dark = std::net::SocketAddr::from_str("192.0.2.1:443").unwrap();
+        let start = std::time::Instant::now();
+        assert!(!tcp_reachable(dark));
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 }

@@ -30,6 +30,7 @@ use runner_providers::github::webhooks::{run_coordinator, DispatchContext, JitSc
 #[derive(Debug, Parser)]
 #[command(
     name = "runner",
+    version,
     about = "Zero-freeze GitHub Actions runner supervisor"
 )]
 struct Cli {
@@ -135,6 +136,9 @@ enum Commands {
         /// Also validate enterprise policy loading and audit continuity
         #[arg(long, default_value_t = false)]
         enterprise: bool,
+        /// Also probe egress compliance (metadata/LAN blocked, HTTPS allowed)
+        #[arg(long, default_value_t = false)]
+        egress: bool,
         /// Output format: text or json
         #[arg(long, default_value = "text")]
         format: String,
@@ -143,6 +147,11 @@ enum Commands {
     Provider {
         #[command(subcommand)]
         command: ProviderCommands,
+    },
+    /// Manage the git pre-commit hook (zero-freeze via runner exec)
+    Hook {
+        #[command(subcommand)]
+        command: HookCommands,
     },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
@@ -217,6 +226,18 @@ enum ProviderCommands {
         /// Provider name: github|gitlab|bitbucket|local
         provider: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommands {
+    /// Install a pre-commit hook routing checks through runner exec
+    Install {
+        /// Check command to run (auto-detected when omitted)
+        #[arg(long)]
+        cmd: Option<String>,
+    },
+    /// Remove the runner-managed hook, restoring any backup
+    Uninstall,
 }
 
 #[derive(Debug, Subcommand)]
@@ -718,10 +739,10 @@ fn cmd_mcp_install(target: &str) -> Result<()> {
 }
 
 /// `runner doctor`: print the readiness report; exit 1 on any failure.
-async fn cmd_doctor(enterprise: bool, format: &str) -> Result<()> {
+async fn cmd_doctor(enterprise: bool, egress: bool, format: &str) -> Result<()> {
     use runner_cli::doctor::{overall_ok, render_json, render_text, run_all};
 
-    let checks = run_all(enterprise).await;
+    let checks = run_all(enterprise, egress).await;
     match format.trim().to_ascii_lowercase().as_str() {
         "text" => print!("{}", render_text(&checks)),
         "json" => println!("{}", render_json(&checks)),
@@ -746,6 +767,37 @@ async fn cmd_provider_test(provider: &str, config: &RunnerConfig) -> Result<()> 
     } else {
         std::process::exit(1);
     }
+}
+
+/// `runner hook install`: write the managed pre-commit hook.
+fn cmd_hook_install(cmd: Option<&str>) -> Result<()> {
+    use runner_cli::hook::{detect_command, install};
+
+    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+    let command = match cmd {
+        Some(explicit) => explicit.to_string(),
+        None => detect_command(&cwd).ok_or_else(|| {
+            anyhow::anyhow!("no check command detected; pass --cmd \"<COMMAND>\"")
+        })?,
+    };
+    let path = install(&cwd, &command).map_err(|e| anyhow::anyhow!(e))?;
+    println!(
+        "hook installed: {} (runs `{command}` via runner exec)",
+        path.display()
+    );
+    Ok(())
+}
+
+/// `runner hook uninstall`: remove the managed hook, restore backup.
+fn cmd_hook_uninstall() -> Result<()> {
+    use runner_cli::hook::uninstall;
+
+    let cwd = std::env::current_dir().context("cannot resolve working directory")?;
+    match uninstall(&cwd).map_err(|e| anyhow::anyhow!(e))? {
+        Some(restored) => println!("hook removed; restored {}", restored.display()),
+        None => println!("hook removed"),
+    }
+    Ok(())
 }
 
 /// `runner exec --driver microvm`: route through the Tier-1 engine.
@@ -930,12 +982,24 @@ async fn main() -> Result<()> {
         Commands::Listen { port, secret } => {
             cmd_listen(port, secret).await?;
         }
-        Commands::Doctor { enterprise, format } => {
-            cmd_doctor(enterprise, &format).await?;
+        Commands::Doctor {
+            enterprise,
+            egress,
+            format,
+        } => {
+            cmd_doctor(enterprise, egress, &format).await?;
         }
         Commands::Provider { command } => match command {
             ProviderCommands::Test { provider } => {
                 cmd_provider_test(&provider, &config).await?;
+            }
+        },
+        Commands::Hook { command } => match command {
+            HookCommands::Install { cmd } => {
+                cmd_hook_install(cmd.as_deref())?;
+            }
+            HookCommands::Uninstall => {
+                cmd_hook_uninstall()?;
             }
         },
         Commands::Exec {
@@ -970,4 +1034,25 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn root_version_flags_print_runner_version() {
+        for flag in ["--version", "-V"] {
+            let err = Cli::command()
+                .try_get_matches_from(["runner", flag])
+                .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            let rendered = err.render().to_string();
+            assert!(
+                rendered.contains(&format!("runner {}", env!("CARGO_PKG_VERSION"))),
+                "unexpected version output: {rendered}"
+            );
+        }
+    }
 }

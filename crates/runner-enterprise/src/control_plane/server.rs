@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
+use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 
 use super::auth::{OidcManager, SessionStore};
@@ -30,7 +30,34 @@ impl AppState {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "healthy", "version": env!("CARGO_PKG_VERSION") }))
+    // PSI is best-effort: containers without /proc/pressure still
+    // report healthy with null gauges.
+    let snapshot = runner_core::governor::psi::read_snapshot().ok();
+    let psi = snapshot.map(|s| {
+        serde_json::json!({
+            "cpu": s.cpu.some.avg10,
+            "memory": s.memory.some.avg10,
+            "io": s.io.full.avg10,
+        })
+    });
+    let governor = snapshot.map(|s| match s.cpu_pressure() {
+        runner_core::governor::psi::PressureLevel::Normal => "normal",
+        runner_core::governor::psi::PressureLevel::Warning => "warning",
+        runner_core::governor::psi::PressureLevel::Critical => "critical",
+    });
+    Json(serde_json::json!({
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION"),
+        "psi": psi,
+        "governor": governor,
+    }))
+}
+
+/// Embedded fleet dashboard (single file, zero external assets).
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+async fn dashboard() -> impl IntoResponse {
+    Html(DASHBOARD_HTML)
 }
 
 async fn fleet_inventory(State(state): State<AppState>) -> impl IntoResponse {
@@ -163,6 +190,8 @@ async fn auth_callback(
 /// Build the router (pure constructor; integration-tested over TCP).
 pub fn router(state: AppState) -> axum::Router {
     axum::Router::new()
+        .route("/", get(dashboard))
+        .route("/dashboard", get(dashboard))
         .route("/health", get(health))
         .route("/api/v1/fleet", get(fleet_inventory))
         .route("/api/v1/runners/register", post(register_runner))

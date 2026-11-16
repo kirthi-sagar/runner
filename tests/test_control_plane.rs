@@ -85,6 +85,16 @@ async fn http_health_fleet_register_heartbeat() {
         .unwrap();
     assert_eq!(health["status"], "healthy");
     assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    // PSI enrichment: live numbers on Linux, nulls where unreadable.
+    assert!(health.get("psi").is_some());
+    if health["psi"].is_object() {
+        for key in ["cpu", "memory", "io"] {
+            assert!(health["psi"][key].is_number(), "{key}");
+        }
+        assert!(health["governor"].is_string());
+    } else {
+        assert!(health["psi"].is_null());
+    }
 
     let registered: serde_json::Value = http
         .post(format!("{base}/api/v1/runners/register"))
@@ -150,4 +160,26 @@ async fn auth_routes_without_oidc() {
         .await
         .unwrap();
     assert_eq!(callback.status(), 400);
+}
+
+#[tokio::test]
+async fn dashboard_routes_serve_embedded_html() {
+    let base = spawn_app(None).await;
+    let http = reqwest::Client::new();
+    for path in ["/", "/dashboard"] {
+        let res = http.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        let body = res.text().await.unwrap();
+        assert!(
+            body.contains("<title>runner fleet dashboard</title>"),
+            "{path}"
+        );
+        // Zero external assets: no CDN, fonts, or script URLs.
+        assert!(!body.contains("https://"), "{path}");
+        assert!(!body.contains("http://"), "{path}");
+    }
 }

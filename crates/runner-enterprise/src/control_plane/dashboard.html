@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runner fleet dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--panel); }
+  header .logo { font-size: 20px; font-weight: 700; }
+  .badge { font-size: 12px; padding: 2px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); }
+  .badge.ok { color: var(--green); border-color: var(--green); }
+  .badge.bad { color: var(--red); border-color: var(--red); }
+  header .spacer { flex: 1; }
+  header a.sso { color: var(--accent); text-decoration: none; font-size: 13px; }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px; }
+  .card .label { font-size: 12px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+  section { margin-top: 20px; }
+  section h2 { font-size: 15px; margin: 0 0 10px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em; }
+  .gauge { margin: 8px 0; }
+  .gauge .row { display: flex; justify-content: space-between;
+    font-size: 13px; margin-bottom: 4px; }
+  .bar { height: 10px; border-radius: 999px; background: #21262d; }
+  .bar > div { height: 100%; border-radius: 999px; background: var(--green);
+    transition: width 0.5s; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px;
+    border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  .empty { color: var(--muted); padding: 16px; text-align: center; }
+  #conn { display: none; background: var(--red); color: #fff; text-align: center;
+    padding: 6px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="conn">reconnecting to control plane…</div>
+<header>
+  <span class="logo">runner</span>
+  <span class="badge" id="version">…</span>
+  <span class="badge" id="health">…</span>
+  <span class="spacer"></span>
+  <a class="sso" href="/auth/login">Sign in via SSO</a>
+</header>
+<main>
+  <div class="kpis">
+    <div class="card"><div class="label">Fleet nodes</div><div class="value" id="k-nodes">–</div></div>
+    <div class="card"><div class="label">Capacity slots</div><div class="value" id="k-slots">–</div></div>
+    <div class="card"><div class="label">In-flight jobs</div><div class="value" id="k-jobs">–</div></div>
+    <div class="card"><div class="label">Host load state</div><div class="value" id="k-gov">–</div></div>
+  </div>
+  <section>
+    <h2>Control-plane host PSI</h2>
+    <div class="card">
+      <div class="gauge"><div class="row"><span>CPU pressure</span><span id="g-cpu-t">–</span></div>
+        <div class="bar"><div id="g-cpu"></div></div></div>
+      <div class="gauge"><div class="row"><span>Memory pressure</span><span id="g-mem-t">–</span></div>
+        <div class="bar"><div id="g-mem"></div></div></div>
+      <div class="gauge"><div class="row"><span>IO pressure</span><span id="g-io-t">–</span></div>
+        <div class="bar"><div id="g-io"></div></div></div>
+    </div>
+  </section>
+  <section>
+    <h2>Active fleet nodes</h2>
+    <div class="card"><table>
+      <thead><tr><th>Node ID</th><th>Hostname</th><th>Providers</th>
+        <th>Capacity</th><th>Jobs</th><th>PSI</th><th>Last heartbeat</th></tr></thead>
+      <tbody id="fleet"><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
+    </table></div>
+  </section>
+</main>
+<script>
+"use strict";
+function color(v) {
+  if (v == null) return "var(--border)";
+  if (v < 10) return "var(--green)";
+  if (v < 25) return "var(--yellow)";
+  return "var(--red)";
+}
+function gauge(id, v) {
+  var bar = document.getElementById(id), txt = document.getElementById(id + "-t");
+  if (v == null || isNaN(v)) { bar.style.width = "0%"; bar.style.background = "var(--border)"; txt.textContent = "n/a"; return; }
+  bar.style.width = Math.min(100, v) + "%"; bar.style.background = color(v);
+  txt.textContent = v.toFixed(1) + "%";
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+async function refresh() {
+  try {
+    var res = await Promise.all([fetch("/health"), fetch("/api/v1/fleet")]);
+    var health = await res[0].json(), fleet = await res[1].json();
+    document.getElementById("conn").style.display = "none";
+    document.getElementById("version").textContent = "v" + health.version;
+    var h = document.getElementById("health");
+    h.textContent = health.status;
+    h.className = "badge " + (health.status === "healthy" ? "ok" : "bad");
+    var psi = health.psi || {};
+    gauge("g-cpu", psi.cpu); gauge("g-mem", psi.memory); gauge("g-io", psi.io);
+    document.getElementById("k-gov").textContent = health.governor || "–";
+    var runners = fleet.runners || [];
+    document.getElementById("k-nodes").textContent = runners.length;
+    document.getElementById("k-slots").textContent =
+      runners.reduce(function (a, r) { return a + (r.registration.capacity || 0); }, 0);
+    document.getElementById("k-jobs").textContent =
+      runners.reduce(function (a, r) { return a + (r.active_jobs || 0); }, 0);
+    var tb = document.getElementById("fleet");
+    if (!runners.length) {
+      tb.innerHTML = '<tr><td colspan="7" class="empty">no runners registered</td></tr>';
+      return;
+    }
+    tb.innerHTML = runners.map(function (r) {
+      var g = r.registration || {};
+      return "<tr><td>" + esc(g.runner_id || "–") + "</td><td>" + esc(g.hostname || "–") +
+        "</td><td>" + esc((g.supported_providers || []).join(", ")) + "</td><td>" +
+        esc(g.capacity == null ? "–" : g.capacity) + "</td><td>" +
+        esc(r.active_jobs == null ? "–" : r.active_jobs) + "</td><td>" +
+        esc(r.psi_pressure == null ? "–" : Number(r.psi_pressure).toFixed(1) + "%") +
+        "</td><td>" + esc(r.last_heartbeat_secs_ago == null ? "–" : r.last_heartbeat_secs_ago + "s ago") +
+        "</td></tr>";
+    }).join("");
+  } catch (e) {
+    document.getElementById("conn").style.display = "block";
+  }
+}
+refresh();
+setInterval(refresh, 2500);
+</script>
+</body>
+</html>

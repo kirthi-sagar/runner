@@ -153,7 +153,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.3.1 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.3.2 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -190,7 +190,7 @@ runner top
 ```
 
 ```text
-runner top v0.3.1  (q quit, live cadence)
+runner top v0.3.2  (q quit, live cadence)
 CPU  [####--------------------]  15.6% some avg10
 MEM  [#-----------------------]   4.2% some avg10
 IO   [##----------------------]   7.2% full avg10
@@ -220,6 +220,67 @@ listen_port = 9898
 ```
 
 with the secret in `RUNNER_WEBHOOK_SECRET` (never in config files).
+
+### Diagnose host readiness
+
+```bash
+runner doctor --egress
+```
+
+```text
+runner doctor
+[✓] kernel     6.6.147-09648-g97ef00d8a343 with PSI (cpu/memory/io)
+[✓] cgroupsv2  controllers: cpuset cpu io memory hugetlb pids
+[!] userns     user namespaces unavailable; jobs run governed-direct (Tier-2 degraded)
+[✓] kvm        /dev/kvm ready (Tier-1 microVM)
+[✓] ebpf       unprivileged socket-filter attach works
+[✓] daemon     IPC alive at /home/linux/.runner/runner.sock (0600)
+[!] mcp        no agent registration found; run `runner mcp install --target cursor|claude`
+[✓] egress:metadata 169.254.169.254:80: expected blocked, observed blocked
+[✓] egress:rfc1918 10.255.255.1:443: expected blocked, observed blocked
+[✓] egress:https 1.1.1.1:443: expected allowed, observed reachable
+result: healthy
+```
+
+Fail-capable checks (kernel, PSI, cgroups) gate readiness; KVM, eBPF,
+daemon, and MCP degrade to warnings. `--egress` adds report-only
+network compliance probes; `--enterprise` adds fleet policy and audit
+continuity; `--format json` emits the machine-readable report.
+
+### Validate provider credentials
+
+```bash
+runner provider test github
+```
+
+```text
+provider github: OK
+  token: present (env)
+  authenticated as: kirthi-sagar
+  JIT runner admin: yes (classic scopes)
+```
+
+Probes credentials, API reachability, identity, and JIT issuance
+rights for `github`, `gitlab`, `bitbucket`, or `local`. Tokens are
+never printed; exit code is nonzero on failure for scripting.
+
+### Zero-freeze pre-commit hooks
+
+```bash
+runner hook install
+```
+
+```text
+hook installed: /tmp/hook-doc/.git/hooks/pre-commit (runs `cargo test` via runner exec)
+```
+
+Auto-detects `cargo test` (`Cargo.toml`), `npm test`
+(`package.json`), or `pytest` (`pytest.ini`/`pyproject.toml`) — or
+pass `--cmd "<COMMAND>"` explicitly. The generated hook runs checks
+under `runner exec --no-sandbox` (cgroup governance, repo cwd) so
+commits never freeze the workstation; a failing check blocks the
+commit. Existing hooks are backed up to `pre-commit.bak` and
+restored by `runner hook uninstall`.
 
 ---
 

@@ -1387,6 +1387,7 @@ name = "runner-cli"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "libc",
  "runner-core",
@@ -1402,6 +1403,7 @@ name = "runner-core"
 version = "0.3.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "boringtun",
  "hmac",

@@ -1,4 +1,4 @@
-//! MCP protocol tests: `tools/list` exposes all 7 admin tools and
+//! MCP protocol tests: `tools/list` exposes all 10 admin tools and
 //! `tools/call` executes them over JSON-RPC 2.0.
 
 use runner::config::RunnerConfig;
@@ -18,7 +18,7 @@ fn call(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn tools_list_returns_all_seven_tools() {
+async fn tools_list_returns_all_ten_tools() {
     let server = server();
     let res = server
         .handle_value(call(1, "tools/list", serde_json::json!({})))

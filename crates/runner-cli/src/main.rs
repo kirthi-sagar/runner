@@ -905,7 +905,8 @@ async fn main() -> Result<()> {
             }
             let state = new_shared_state();
             state.write().await.seed_from_config(&config);
-            let server = McpServer::new(ToolContext::new(state, config));
+            let agent = Arc::new(runner_cli::agent::CliAgentTools::new(config.clone()));
+            let server = McpServer::new(ToolContext::new(state, config).with_agent(agent));
             server.serve_stdio().await?;
         }
         Commands::Server {

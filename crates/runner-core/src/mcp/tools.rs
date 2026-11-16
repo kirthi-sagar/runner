@@ -1,10 +1,13 @@
 //! MCP tool definitions + executors for the AI-agent admin tier.
 //!
-//! Seven tools per the Phase 2 contract: `get_ci_status`,
+//! Seven tools per the Phase 2 contract (`get_ci_status`,
 //! `get_fleet_topology`, `reserve_host_resources`,
 //! `release_host_resources`, `throttle_runner`, `request_cloud_capacity`,
-//! `drain_node`.
+//! `drain_node`) plus three Phase 8 agent-native tools (`diagnose_system`,
+//! `test_provider`, `exec_command`) dispatched through [`AgentTools`].
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -21,9 +24,12 @@ pub const TOOL_RELEASE_HOST_RESOURCES: &str = "release_host_resources";
 pub const TOOL_THROTTLE_RUNNER: &str = "throttle_runner";
 pub const TOOL_REQUEST_CLOUD_CAPACITY: &str = "request_cloud_capacity";
 pub const TOOL_DRAIN_NODE: &str = "drain_node";
+pub const TOOL_DIAGNOSE_SYSTEM: &str = "diagnose_system";
+pub const TOOL_TEST_PROVIDER: &str = "test_provider";
+pub const TOOL_EXEC_COMMAND: &str = "exec_command";
 
 /// All tool names, in contract order.
-pub const ALL_TOOLS: [&str; 7] = [
+pub const ALL_TOOLS: [&str; 10] = [
     TOOL_GET_CI_STATUS,
     TOOL_GET_FLEET_TOPOLOGY,
     TOOL_RESERVE_HOST_RESOURCES,
@@ -31,6 +37,9 @@ pub const ALL_TOOLS: [&str; 7] = [
     TOOL_THROTTLE_RUNNER,
     TOOL_REQUEST_CLOUD_CAPACITY,
     TOOL_DRAIN_NODE,
+    TOOL_DIAGNOSE_SYSTEM,
+    TOOL_TEST_PROVIDER,
+    TOOL_EXEC_COMMAND,
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,12 +78,92 @@ pub struct DrainNodeArgs {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DiagnoseSystemArgs {
+    #[serde(default)]
+    pub egress: Option<bool>,
+    #[serde(default)]
+    pub enterprise: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestProviderArgs {
+    pub provider: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecCommandArgs {
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+}
+
+/// Agent-native capabilities, implemented outside `runner-core`.
+///
+/// The provider, sandbox, and CLI crates all depend on this one, so
+/// core cannot call their doctor/provider/exec implementations
+/// directly. The production impl lives in `runner-cli` (`agent.rs`)
+/// and delegates to those existing modules; [`ToolContext::new`]
+/// installs [`StubAgentTools`] until the host wires the real one via
+/// [`ToolContext::with_agent`].
+#[async_trait::async_trait]
+pub trait AgentTools: Send + Sync + std::fmt::Debug {
+    /// Run system diagnostics; mirrors `runner doctor` output as JSON.
+    async fn diagnose(
+        &self,
+        egress: bool,
+        enterprise: bool,
+    ) -> Result<serde_json::Value, ToolError>;
+    /// Check one provider's credentials and connectivity (`provider`
+    /// is pre-validated to a known name). Never exposes secrets.
+    async fn test_provider(&self, provider: &str) -> Result<serde_json::Value, ToolError>;
+    /// Run a command under cgroup governance with captured output.
+    /// `timeout_secs` is guaranteed `>= 1`; `command` is non-empty.
+    async fn exec(
+        &self,
+        command: Vec<String>,
+        timeout_secs: u64,
+        env: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, ToolError>;
+}
+
+/// Placeholder impl used until the host wires the real agent tools.
+#[derive(Debug, Default)]
+pub struct StubAgentTools;
+
+#[async_trait::async_trait]
+impl AgentTools for StubAgentTools {
+    async fn diagnose(
+        &self,
+        _egress: bool,
+        _enterprise: bool,
+    ) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::internal("agent tools not configured"))
+    }
+
+    async fn test_provider(&self, _provider: &str) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::internal("agent tools not configured"))
+    }
+
+    async fn exec(
+        &self,
+        _command: Vec<String>,
+        _timeout_secs: u64,
+        _env: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::internal("agent tools not configured"))
+    }
+}
+
 /// Execution context: shared daemon state + Super Admin policy + cloud.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub state: SharedState,
     pub config: RunnerConfig,
     pub cloud: CloudPool,
+    pub agent: Arc<dyn AgentTools>,
 }
 
 impl ToolContext {
@@ -84,7 +173,14 @@ impl ToolContext {
             state,
             config,
             cloud,
+            agent: Arc::new(StubAgentTools),
         }
+    }
+
+    /// Attach the production agent-tools implementation.
+    pub fn with_agent(mut self, agent: Arc<dyn AgentTools>) -> Self {
+        self.agent = agent;
+        self
     }
 }
 
@@ -155,6 +251,41 @@ pub async fn execute_tool(
         TOOL_DRAIN_NODE => {
             let args: DrainNodeArgs = parse_args(args)?;
             drain_node(&args, ctx).await
+        }
+        TOOL_DIAGNOSE_SYSTEM => {
+            // All flags optional: omitted arguments mean all-defaults.
+            let args: DiagnoseSystemArgs = match args {
+                None => DiagnoseSystemArgs::default(),
+                Some(_) => parse_args(args)?,
+            };
+            ctx.agent
+                .diagnose(
+                    args.egress.unwrap_or(false),
+                    args.enterprise.unwrap_or(false),
+                )
+                .await
+        }
+        TOOL_TEST_PROVIDER => {
+            let args: TestProviderArgs = parse_args(args)?;
+            let name = args.provider.trim().to_ascii_lowercase();
+            match name.as_str() {
+                "github" | "gitlab" | "bitbucket" | "local" => ctx.agent.test_provider(&name).await,
+                other => Err(ToolError::invalid_params(format!(
+                    "unknown provider: '{other}' (want github|gitlab|bitbucket|local)"
+                ))),
+            }
+        }
+        TOOL_EXEC_COMMAND => {
+            let args: ExecCommandArgs = parse_args(args)?;
+            if args.command.is_empty() || args.command.iter().any(|c| c.trim().is_empty()) {
+                return Err(ToolError::invalid_params("command must not be empty"));
+            }
+            let timeout_secs = args.timeout_secs.unwrap_or(60);
+            if timeout_secs == 0 {
+                return Err(ToolError::invalid_params("timeout_secs must be >= 1"));
+            }
+            let env: Vec<(String, String)> = args.env.unwrap_or_default().into_iter().collect();
+            ctx.agent.exec(args.command, timeout_secs, env).await
         }
         _ => Err(ToolError {
             code: -32601,
@@ -395,6 +526,30 @@ pub fn tool_schema(name: &str) -> serde_json::Value {
             }),
             vec!["node_id", "reason"],
         ),
+        TOOL_DIAGNOSE_SYSTEM => (
+            serde_json::json!({
+                "egress": { "type": "boolean" },
+                "enterprise": { "type": "boolean" },
+            }),
+            vec![],
+        ),
+        TOOL_TEST_PROVIDER => (
+            serde_json::json!({
+                "provider": {
+                    "type": "string",
+                    "enum": ["github", "gitlab", "bitbucket", "local"],
+                },
+            }),
+            vec!["provider"],
+        ),
+        TOOL_EXEC_COMMAND => (
+            serde_json::json!({
+                "command": { "type": "array", "items": { "type": "string" } },
+                "timeout_secs": { "type": "integer" },
+                "env": { "type": "object" },
+            }),
+            vec!["command"],
+        ),
         _ => (serde_json::json!({}), vec![]),
     };
     serde_json::json!({ "type": "object", "properties": props, "required": required })
@@ -410,6 +565,9 @@ pub fn tool_description(name: &str) -> &'static str {
         TOOL_THROTTLE_RUNNER => "Force runner weights down for a duration (never freezes).",
         TOOL_REQUEST_CLOUD_CAPACITY => "Request cloud burst within the pre-approved budget.",
         TOOL_DRAIN_NODE => "Stop dispatching new jobs to a node.",
+        TOOL_DIAGNOSE_SYSTEM => "Host diagnostics: kernel, cgroups, KVM, eBPF, daemon, egress.",
+        TOOL_TEST_PROVIDER => "Verify CI provider credentials and connectivity.",
+        TOOL_EXEC_COMMAND => "Run a command under zero-freeze governance; capture output.",
         _ => "Unknown tool.",
     }
 }
@@ -457,5 +615,146 @@ mod tests {
     async fn unknown_tool_is_method_error() {
         let err = execute_tool("nope", None, &ctx()).await.unwrap_err();
         assert_eq!(err.code, -32601);
+    }
+
+    #[test]
+    fn all_ten_tools_have_schemas_and_descriptions() {
+        assert_eq!(ALL_TOOLS.len(), 10);
+        for name in ALL_TOOLS {
+            let schema = tool_schema(name);
+            assert_eq!(schema["type"], "object", "{name}");
+            assert!(schema["properties"].is_object(), "{name}");
+            assert!(schema["required"].is_array(), "{name}");
+            assert_ne!(tool_description(name), "Unknown tool.", "{name}");
+        }
+        assert_eq!(tool_schema(TOOL_TEST_PROVIDER)["required"][0], "provider");
+        assert_eq!(tool_schema(TOOL_EXEC_COMMAND)["required"][0], "command");
+        assert!(tool_schema(TOOL_DIAGNOSE_SYSTEM)["required"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// One recorded `exec` call: command, timeout, env.
+    type ExecCall = (Vec<String>, u64, Vec<(String, String)>);
+
+    /// Scripted agent impl: records calls, replays canned outputs.
+    #[derive(Debug, Default)]
+    struct ScriptAgent {
+        diagnoses: std::sync::Mutex<Vec<(bool, bool)>>,
+        providers: std::sync::Mutex<Vec<String>>,
+        execs: std::sync::Mutex<Vec<ExecCall>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTools for ScriptAgent {
+        async fn diagnose(
+            &self,
+            egress: bool,
+            enterprise: bool,
+        ) -> Result<serde_json::Value, ToolError> {
+            self.diagnoses.lock().unwrap().push((egress, enterprise));
+            Ok(serde_json::json!({ "ok": true, "checks": [] }))
+        }
+
+        async fn test_provider(&self, provider: &str) -> Result<serde_json::Value, ToolError> {
+            self.providers.lock().unwrap().push(provider.to_string());
+            Ok(serde_json::json!({ "provider": provider, "ok": true, "lines": [] }))
+        }
+
+        async fn exec(
+            &self,
+            command: Vec<String>,
+            timeout_secs: u64,
+            env: Vec<(String, String)>,
+        ) -> Result<serde_json::Value, ToolError> {
+            self.execs
+                .lock()
+                .unwrap()
+                .push((command, timeout_secs, env));
+            Ok(serde_json::json!({
+                "code": 0, "stdout": "hi\n", "stderr": "",
+                "elapsed_secs": 0.01, "timeout": false,
+            }))
+        }
+    }
+
+    fn agent_ctx() -> (ToolContext, Arc<ScriptAgent>) {
+        let agent = Arc::new(ScriptAgent::default());
+        let ctx = ctx().with_agent(agent.clone());
+        (ctx, agent)
+    }
+
+    #[tokio::test]
+    async fn diagnose_delegates_flags_and_returns_json() {
+        let (ctx, agent) = agent_ctx();
+        let args = serde_json::json!({ "egress": true });
+        let out = execute_tool(TOOL_DIAGNOSE_SYSTEM, Some(&args), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["ok"], true);
+        assert!(out["checks"].is_array());
+        assert_eq!(*agent.diagnoses.lock().unwrap(), vec![(true, false)]);
+    }
+
+    #[tokio::test]
+    async fn provider_names_normalize_and_unknown_rejects() {
+        let (ctx, agent) = agent_ctx();
+        let args = serde_json::json!({ "provider": "GitHub" });
+        let out = execute_tool(TOOL_TEST_PROVIDER, Some(&args), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["provider"], "github");
+        assert_eq!(*agent.providers.lock().unwrap(), vec!["github"]);
+
+        let args = serde_json::json!({ "provider": "jenkins" });
+        let err = execute_tool(TOOL_TEST_PROVIDER, Some(&args), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("jenkins"));
+        // Rejected before delegation: no second call recorded.
+        assert_eq!(agent.providers.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exec_validates_and_delegates_with_defaults() {
+        let (ctx, agent) = agent_ctx();
+        let args = serde_json::json!({
+            "command": ["echo", "hi"], "env": { "A": "b" },
+        });
+        let out = execute_tool(TOOL_EXEC_COMMAND, Some(&args), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["code"], 0);
+        assert_eq!(out["stdout"], "hi\n");
+        assert_eq!(out["timeout"], false);
+        {
+            let calls = agent.execs.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, vec!["echo", "hi"]);
+            assert_eq!(calls[0].1, 60);
+            assert_eq!(calls[0].2, vec![("A".to_string(), "b".to_string())]);
+        }
+
+        for bad in [
+            serde_json::json!({ "command": [] }),
+            serde_json::json!({ "command": ["echo", ""] }),
+            serde_json::json!({ "command": ["echo"], "timeout_secs": 0 }),
+        ] {
+            let err = execute_tool(TOOL_EXEC_COMMAND, Some(&bad), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, -32602, "{bad}");
+        }
+        assert_eq!(agent.execs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unwired_context_reports_not_configured() {
+        let err = execute_tool(TOOL_DIAGNOSE_SYSTEM, None, &ctx())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32603);
     }
 }

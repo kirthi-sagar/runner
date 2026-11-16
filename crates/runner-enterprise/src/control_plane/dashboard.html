@@ -54,6 +54,7 @@
   <span class="logo">runner</span>
   <span class="badge" id="version">…</span>
   <span class="badge" id="health">…</span>
+  <span class="badge" id="cloud">cloud …</span>
   <span class="spacer"></span>
   <a class="sso" href="/auth/login">Sign in via SSO</a>
 </header>
@@ -112,6 +113,8 @@ async function refresh() {
     var h = document.getElementById("health");
     h.textContent = health.status;
     h.className = "badge " + (health.status === "healthy" ? "ok" : "bad");
+    document.getElementById("cloud").textContent =
+      "cloud " + (health.cloud_nodes_active == null ? "n/a" : health.cloud_nodes_active);
     var psi = health.psi || {};
     gauge("g-cpu", psi.cpu); gauge("g-mem", psi.memory); gauge("g-io", psi.io);
     document.getElementById("k-gov").textContent = health.governor || "–";

@@ -76,6 +76,83 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
             state.read().await.wakeup().notify_one();
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "notified": true } })
         }
+        "cloud_list" => {
+            let guard = state.read().await;
+            let pool = guard.cloud_pool();
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "nodes": guard.cloud_nodes(),
+                "providers": {
+                    "digitalocean": pool.as_ref().is_some_and(|p| p.has_provider("digitalocean")),
+                    "render": pool.as_ref().is_some_and(|p| p.has_provider("render")),
+                },
+                "max_monthly_spend_usd": guard.cloud_spend_cap(),
+                "spend_tracked": false,
+            } })
+        }
+        "cloud_terminate" => {
+            let instance_id = value
+                .get("params")
+                .and_then(|p| p.get("instance_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if instance_id.is_empty() {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "instance_id must not be empty" } });
+            }
+            let (node, pool) = {
+                let guard = state.read().await;
+                (
+                    guard
+                        .cloud_nodes()
+                        .into_iter()
+                        .find(|n| n.id == instance_id),
+                    guard.cloud_pool(),
+                )
+            };
+            match (node, pool) {
+                (None, _) => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": format!("unknown instance: {instance_id}") } }),
+                (_, None) => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": "cloud bursting not configured" } }),
+                (Some(node), Some(pool)) => match pool.terminate(&node).await {
+                    Ok(cleanup) => {
+                        state.write().await.remove_cloud_node(&instance_id);
+                        serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                            "result": { "terminated": instance_id, "cleanup": cleanup } })
+                    }
+                    Err(e) => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32603, "message": format!("terminate failed: {e}") } }),
+                },
+            }
+        }
+        "cloud_purge" => {
+            let (nodes, pool) = {
+                let guard = state.read().await;
+                (guard.cloud_nodes(), guard.cloud_pool())
+            };
+            if nodes.is_empty() {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "result": { "purged": Vec::<String>::new(), "failed": Vec::<String>::new() } });
+            }
+            let Some(pool) = pool else {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": "cloud bursting not configured" } });
+            };
+            let mut purged = Vec::new();
+            let mut failed = Vec::new();
+            for node in &nodes {
+                match pool.terminate(node).await {
+                    Ok(_) => {
+                        state.write().await.remove_cloud_node(&node.id);
+                        purged.push(node.id.clone());
+                    }
+                    Err(e) => failed.push(format!("{}: {e}", node.id)),
+                }
+            }
+            serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                "result": { "purged": purged, "failed": failed } })
+        }
         "join" => {
             let record_value = value
                 .get("params")
@@ -210,5 +287,87 @@ mod tests {
         let server = IpcServer::bind(&path, new_shared_state()).await.unwrap();
         let mode = std::fs::metadata(server.path()).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    fn cloud_req(method: &str, params: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    async fn seeded_state() -> crate::governor::supervisor::SharedState {
+        let state = new_shared_state();
+        {
+            let mut guard = state.write().await;
+            guard.add_cloud_node(crate::mesh::cloud::CloudNode {
+                id: "i-1".to_string(),
+                provider: "digitalocean".to_string(),
+                status: "active".to_string(),
+                launched_at: 0,
+            });
+            guard.set_cloud_pool(crate::mesh::cloud::CloudPool::default(), 25.0);
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn cloud_list_reports_nodes_providers_and_cap() {
+        let state = seeded_state().await;
+        let res = handle_ipc_request(cloud_req("cloud_list", serde_json::json!({})), &state).await;
+        let result = &res["result"];
+        assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(result["nodes"][0]["id"], "i-1");
+        assert_eq!(result["providers"]["digitalocean"], false);
+        assert_eq!(result["max_monthly_spend_usd"], 25.0);
+        assert_eq!(result["spend_tracked"], false);
+    }
+
+    #[tokio::test]
+    async fn cloud_terminate_rejects_unknown_and_missing_id() {
+        let state = seeded_state().await;
+        let res = handle_ipc_request(
+            cloud_req(
+                "cloud_terminate",
+                serde_json::json!({ "instance_id": "nope" }),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(res["error"]["code"], -32602);
+        let res =
+            handle_ipc_request(cloud_req("cloud_terminate", serde_json::json!({})), &state).await;
+        assert_eq!(res["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn cloud_mutations_require_a_pool() {
+        let bare = new_shared_state();
+        bare.write()
+            .await
+            .add_cloud_node(crate::mesh::cloud::CloudNode {
+                id: "i-1".to_string(),
+                provider: "digitalocean".to_string(),
+                status: "active".to_string(),
+                launched_at: 0,
+            });
+        let res = handle_ipc_request(
+            cloud_req(
+                "cloud_terminate",
+                serde_json::json!({ "instance_id": "i-1" }),
+            ),
+            &bare,
+        )
+        .await;
+        assert_eq!(res["error"]["code"], -32603);
+        let res = handle_ipc_request(cloud_req("cloud_purge", serde_json::json!({})), &bare).await;
+        assert_eq!(res["error"]["code"], -32603);
+    }
+
+    #[tokio::test]
+    async fn cloud_purge_empty_succeeds_without_pool() {
+        let res = handle_ipc_request(
+            cloud_req("cloud_purge", serde_json::json!({})),
+            &new_shared_state(),
+        )
+        .await;
+        assert!(res["result"]["purged"].as_array().unwrap().is_empty());
     }
 }

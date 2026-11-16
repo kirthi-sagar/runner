@@ -12,6 +12,37 @@ pub struct CloudNode {
     pub id: String,
     pub provider: String,
     pub status: String,
+    /// Launch time as Unix epoch seconds (0 = unknown, pre-upgrade node).
+    #[serde(default)]
+    pub launched_at: u64,
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+impl CloudNode {
+    /// Seconds since launch (saturating; 0 when unknown).
+    pub fn uptime_secs(&self, now_secs: u64) -> u64 {
+        now_secs.saturating_sub(self.launched_at)
+    }
+}
+
+/// Compact human duration: `45s`, `3m`, `2h12m`, `4d`.
+pub fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    if secs < 3_600 {
+        return format!("{}m", secs / 60);
+    }
+    if secs < 86_400 {
+        return format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60);
+    }
+    format!("{}d", secs / 86_400)
 }
 
 /// Provider clients built from Super Admin config. A missing token means
@@ -74,6 +105,7 @@ impl CloudPool {
                     id: id.to_string(),
                     provider: provider.to_string(),
                     status: "provisioning".to_string(),
+                    launched_at: now_epoch_secs(),
                 })
             }
             "render" => {
@@ -88,6 +120,7 @@ impl CloudPool {
                     id,
                     provider: provider.to_string(),
                     status: "provisioning".to_string(),
+                    launched_at: now_epoch_secs(),
                 })
             }
             _ => Err(format!("unknown provider: {provider}")),
@@ -137,5 +170,27 @@ mod tests {
         let open = CloudPool::from_config(&crate::config::RunnerConfig::default());
         let err = open.provision("digitalocean", "ci-1").await.unwrap_err();
         assert!(err.contains("not configured"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn uptime_formats_compactly_and_saturates() {
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(125), "2m");
+        assert_eq!(format_uptime(7_500), "2h05m");
+        assert_eq!(format_uptime(200_000), "2d");
+        let node = CloudNode {
+            id: "i".to_string(),
+            provider: "render".to_string(),
+            status: "active".to_string(),
+            launched_at: 1_000,
+        };
+        assert_eq!(node.uptime_secs(1_100), 100);
+        assert_eq!(node.uptime_secs(999), 0);
+        // Old payloads without the field still parse (launched_at = 0).
+        let legacy: CloudNode = serde_json::from_value(serde_json::json!({
+            "id": "i", "provider": "render", "status": "active",
+        }))
+        .unwrap();
+        assert_eq!(legacy.launched_at, 0);
     }
 }

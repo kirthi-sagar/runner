@@ -1,11 +1,13 @@
 //! Production [`AgentTools`](runner_core::mcp::tools::AgentTools)
-//! implementation: delegates the three Phase 8 MCP tools to the
-//! existing `doctor`, `provider`, and local-execution modules so CLI
-//! and MCP output can never drift apart.
+//! implementation: delegates the Phase 8 MCP tools to the existing
+//! `doctor`, `provider`, and local-execution modules (plus Phase 10
+//! cloud management over daemon IPC) so CLI and MCP output can never
+//! drift apart.
 
 use std::time::{Duration, Instant};
 
 use runner_core::config::RunnerConfig;
+use runner_core::ipc::{ipc_call_with, resolve_sock_path};
 use runner_core::mcp::tools::{AgentTools, ToolError};
 
 use crate::doctor::{render_json, run_all};
@@ -86,5 +88,56 @@ impl AgentTools for CliAgentTools {
                 }
             }
         }
+    }
+
+    async fn manage_cloud(
+        &self,
+        action: &str,
+        instance_id: Option<&str>,
+    ) -> Result<serde_json::Value, ToolError> {
+        // The MCP server's local state never tracks cloud nodes; the
+        // daemon owns them, so every action goes over daemon IPC —
+        // the same methods `runner cloud` uses.
+        let (method, params) = match action {
+            "list" => ("cloud_list", None),
+            "purge" => ("cloud_purge", None),
+            "terminate" => (
+                "cloud_terminate",
+                Some(serde_json::json!({ "instance_id": instance_id.unwrap_or("") })),
+            ),
+            other => {
+                return Err(ToolError::invalid_params(format!(
+                    "unknown action: '{other}'"
+                )))
+            }
+        };
+        let sock = resolve_sock_path();
+        let res = ipc_call_with(&sock, method, params).await.map_err(|_| {
+            ToolError::internal(format!("daemon not reachable at {}", sock.display()))
+        })?;
+        if let Some(err) = res.get("error") {
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown daemon error");
+            return Err(ToolError::internal(format!("daemon error: {message}")));
+        }
+        let result = res["result"].clone();
+        if action == "list" {
+            let nodes = result["nodes"].as_array().cloned().unwrap_or_default();
+            let providers = ["digitalocean", "render"]
+                .into_iter()
+                .filter(|p| result["providers"][p].as_bool().unwrap_or(false))
+                .collect::<Vec<_>>();
+            return Ok(serde_json::json!({
+                "action": action,
+                "active_nodes": nodes.len(),
+                "nodes": nodes,
+                "providers": providers,
+                "max_monthly_spend_usd": result["max_monthly_spend_usd"],
+                "spend_tracked": false,
+            }));
+        }
+        Ok(result)
     }
 }

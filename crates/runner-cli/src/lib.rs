@@ -3,6 +3,7 @@
 //! lives in `main.rs`).
 
 pub mod agent;
+pub mod cloud;
 pub mod doctor;
 pub mod hook;
 pub mod provider;

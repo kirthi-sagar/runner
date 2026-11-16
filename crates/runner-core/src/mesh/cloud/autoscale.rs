@@ -75,6 +75,12 @@ impl<T: Terminator> AutoscaleController<T> {
         }
     }
 
+    /// Reset the idle clock (webhook wakeup: activity is imminent even
+    /// though the queue has not been re-polled yet).
+    pub fn mark_active(&mut self, now: Instant) {
+        self.tracker.mark_active(now);
+    }
+
     /// Poll once: any queued depth resets the idle clock; an empty queue
     /// for 5 consecutive minutes triggers provider termination.
     pub fn poll(&mut self, now: Instant, queue_depth: u32) -> Result<ScaleAction, String> {

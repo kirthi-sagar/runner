@@ -19,7 +19,7 @@ use super::cgroup::{weight_for_cpu_psi_with, CgroupSlice};
 use super::psi::{PressureLevel, PsiPoller, PsiSnapshot};
 use super::topology::detect_slots;
 use crate::config::{PeerRecord, RunnerConfig};
-use crate::mesh::cloud::CloudNode;
+use crate::mesh::cloud::{CloudNode, CloudPool};
 use crate::mesh::peer::apply_donor_caps;
 
 /// Host headroom reservation for agent local work.
@@ -79,6 +79,8 @@ pub struct SupervisorState {
     drained: HashMap<String, String>,
     peers: HashMap<String, PeerRecord>,
     cloud_nodes: Vec<CloudNode>,
+    cloud_pool: Option<CloudPool>,
+    cloud_spend_cap: f64,
     donor_caps: Option<(u32, u64)>,
     next_reservation: u64,
     in_flight: u32,
@@ -102,6 +104,8 @@ impl SupervisorState {
             drained: HashMap::new(),
             peers: HashMap::new(),
             cloud_nodes: Vec::new(),
+            cloud_pool: None,
+            cloud_spend_cap: 0.0,
             donor_caps: None,
             next_reservation: 1,
             in_flight: 0,
@@ -211,6 +215,22 @@ impl SupervisorState {
 
     pub fn cloud_nodes(&self) -> Vec<CloudNode> {
         self.cloud_nodes.clone()
+    }
+
+    /// Attach the provider pool (once, at daemon startup) so IPC-driven
+    /// termination can reach the cloud APIs. The pool holds API clients,
+    /// never serialized into status output.
+    pub fn set_cloud_pool(&mut self, pool: CloudPool, spend_cap: f64) {
+        self.cloud_pool = Some(pool);
+        self.cloud_spend_cap = spend_cap;
+    }
+
+    pub fn cloud_pool(&self) -> Option<CloudPool> {
+        self.cloud_pool.clone()
+    }
+
+    pub fn cloud_spend_cap(&self) -> f64 {
+        self.cloud_spend_cap
     }
 
     /// Clamp slots to donor caps when this host serves foreign jobs.

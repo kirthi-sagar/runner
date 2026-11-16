@@ -4,7 +4,8 @@
 //! `get_fleet_topology`, `reserve_host_resources`,
 //! `release_host_resources`, `throttle_runner`, `request_cloud_capacity`,
 //! `drain_node`) plus three Phase 8 agent-native tools (`diagnose_system`,
-//! `test_provider`, `exec_command`) dispatched through [`AgentTools`].
+//! `test_provider`, `exec_command`) and Phase 10 `manage_cloud_capacity`,
+//! dispatched through [`AgentTools`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,9 +28,10 @@ pub const TOOL_DRAIN_NODE: &str = "drain_node";
 pub const TOOL_DIAGNOSE_SYSTEM: &str = "diagnose_system";
 pub const TOOL_TEST_PROVIDER: &str = "test_provider";
 pub const TOOL_EXEC_COMMAND: &str = "exec_command";
+pub const TOOL_MANAGE_CLOUD_CAPACITY: &str = "manage_cloud_capacity";
 
 /// All tool names, in contract order.
-pub const ALL_TOOLS: [&str; 10] = [
+pub const ALL_TOOLS: [&str; 11] = [
     TOOL_GET_CI_STATUS,
     TOOL_GET_FLEET_TOPOLOGY,
     TOOL_RESERVE_HOST_RESOURCES,
@@ -40,6 +42,7 @@ pub const ALL_TOOLS: [&str; 10] = [
     TOOL_DIAGNOSE_SYSTEM,
     TOOL_TEST_PROVIDER,
     TOOL_EXEC_COMMAND,
+    TOOL_MANAGE_CLOUD_CAPACITY,
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,6 +103,14 @@ pub struct ExecCommandArgs {
     pub env: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManageCloudCapacityArgs {
+    /// `"list"`, `"terminate"`, or `"purge"`.
+    pub action: String,
+    #[serde(default)]
+    pub instance_id: Option<String>,
+}
+
 /// Agent-native capabilities, implemented outside `runner-core`.
 ///
 /// The provider, sandbox, and CLI crates all depend on this one, so
@@ -127,6 +138,14 @@ pub trait AgentTools: Send + Sync + std::fmt::Debug {
         timeout_secs: u64,
         env: Vec<(String, String)>,
     ) -> Result<serde_json::Value, ToolError>;
+    /// Manage daemon cloud workers (`action` pre-validated; `terminate`
+    /// always carries an id). Goes through daemon IPC: the MCP server's
+    /// local state never tracks cloud nodes.
+    async fn manage_cloud(
+        &self,
+        action: &str,
+        instance_id: Option<&str>,
+    ) -> Result<serde_json::Value, ToolError>;
 }
 
 /// Placeholder impl used until the host wires the real agent tools.
@@ -152,6 +171,14 @@ impl AgentTools for StubAgentTools {
         _command: Vec<String>,
         _timeout_secs: u64,
         _env: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::internal("agent tools not configured"))
+    }
+
+    async fn manage_cloud(
+        &self,
+        _action: &str,
+        _instance_id: Option<&str>,
     ) -> Result<serde_json::Value, ToolError> {
         Err(ToolError::internal("agent tools not configured"))
     }
@@ -286,6 +313,22 @@ pub async fn execute_tool(
             }
             let env: Vec<(String, String)> = args.env.unwrap_or_default().into_iter().collect();
             ctx.agent.exec(args.command, timeout_secs, env).await
+        }
+        TOOL_MANAGE_CLOUD_CAPACITY => {
+            let args: ManageCloudCapacityArgs = parse_args(args)?;
+            let action = args.action.trim().to_ascii_lowercase();
+            match action.as_str() {
+                "list" | "purge" => ctx.agent.manage_cloud(&action, None).await,
+                "terminate" => match args.instance_id.as_deref().map(str::trim) {
+                    Some(id) if !id.is_empty() => ctx.agent.manage_cloud(&action, Some(id)).await,
+                    _ => Err(ToolError::invalid_params(
+                        "terminate requires a non-empty instance_id",
+                    )),
+                },
+                other => Err(ToolError::invalid_params(format!(
+                    "unknown action: '{other}' (want list|terminate|purge)"
+                ))),
+            }
         }
         _ => Err(ToolError {
             code: -32601,
@@ -550,6 +593,13 @@ pub fn tool_schema(name: &str) -> serde_json::Value {
             }),
             vec!["command"],
         ),
+        TOOL_MANAGE_CLOUD_CAPACITY => (
+            serde_json::json!({
+                "action": { "type": "string", "enum": ["list", "terminate", "purge"] },
+                "instance_id": { "type": "string" },
+            }),
+            vec!["action"],
+        ),
         _ => (serde_json::json!({}), vec![]),
     };
     serde_json::json!({ "type": "object", "properties": props, "required": required })
@@ -568,6 +618,7 @@ pub fn tool_description(name: &str) -> &'static str {
         TOOL_DIAGNOSE_SYSTEM => "Host diagnostics: kernel, cgroups, KVM, eBPF, daemon, egress.",
         TOOL_TEST_PROVIDER => "Verify CI provider credentials and connectivity.",
         TOOL_EXEC_COMMAND => "Run a command under zero-freeze governance; capture output.",
+        TOOL_MANAGE_CLOUD_CAPACITY => "List, terminate, or purge daemon cloud burst workers.",
         _ => "Unknown tool.",
     }
 }
@@ -618,8 +669,8 @@ mod tests {
     }
 
     #[test]
-    fn all_ten_tools_have_schemas_and_descriptions() {
-        assert_eq!(ALL_TOOLS.len(), 10);
+    fn all_eleven_tools_have_schemas_and_descriptions() {
+        assert_eq!(ALL_TOOLS.len(), 11);
         for name in ALL_TOOLS {
             let schema = tool_schema(name);
             assert_eq!(schema["type"], "object", "{name}");
@@ -644,6 +695,7 @@ mod tests {
         diagnoses: std::sync::Mutex<Vec<(bool, bool)>>,
         providers: std::sync::Mutex<Vec<String>>,
         execs: std::sync::Mutex<Vec<ExecCall>>,
+        clouds: std::sync::Mutex<Vec<(String, Option<String>)>>,
     }
 
     #[async_trait::async_trait]
@@ -676,6 +728,18 @@ mod tests {
                 "code": 0, "stdout": "hi\n", "stderr": "",
                 "elapsed_secs": 0.01, "timeout": false,
             }))
+        }
+
+        async fn manage_cloud(
+            &self,
+            action: &str,
+            instance_id: Option<&str>,
+        ) -> Result<serde_json::Value, ToolError> {
+            self.clouds
+                .lock()
+                .unwrap()
+                .push((action.to_string(), instance_id.map(str::to_string)));
+            Ok(serde_json::json!({ "action": action, "active_nodes": 0 }))
         }
     }
 
@@ -756,5 +820,46 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, -32603);
+    }
+
+    #[tokio::test]
+    async fn manage_cloud_validates_action_and_id() {
+        let (ctx, agent) = agent_ctx();
+        let out = execute_tool(
+            TOOL_MANAGE_CLOUD_CAPACITY,
+            Some(&serde_json::json!({ "action": "List" })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["action"], "list");
+        let out = execute_tool(
+            TOOL_MANAGE_CLOUD_CAPACITY,
+            Some(&serde_json::json!({ "action": "terminate", "instance_id": "i-1" })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["action"], "terminate");
+        assert_eq!(
+            *agent.clouds.lock().unwrap(),
+            vec![
+                ("list".to_string(), None),
+                ("terminate".to_string(), Some("i-1".to_string())),
+            ]
+        );
+
+        for bad in [
+            serde_json::json!({ "action": "explode" }),
+            serde_json::json!({ "action": "terminate" }),
+            serde_json::json!({ "action": "terminate", "instance_id": "  " }),
+            serde_json::json!({}),
+        ] {
+            let err = execute_tool(TOOL_MANAGE_CLOUD_CAPACITY, Some(&bad), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, -32602, "{bad}");
+        }
+        assert_eq!(agent.clouds.lock().unwrap().len(), 2);
     }
 }

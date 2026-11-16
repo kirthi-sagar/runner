@@ -95,6 +95,10 @@ async fn http_health_fleet_register_heartbeat() {
     } else {
         assert!(health["psi"].is_null());
     }
+    // Cloud count: a live number when the test host runs a daemon,
+    // null otherwise (test must pass in both environments).
+    assert!(health.get("cloud_nodes_active").is_some());
+    assert!(health["cloud_nodes_active"].is_u64() || health["cloud_nodes_active"].is_null());
 
     let registered: serde_json::Value = http
         .post(format!("{base}/api/v1/runners/register"))
@@ -181,5 +185,8 @@ async fn dashboard_routes_serve_embedded_html() {
         // Zero external assets: no CDN, fonts, or script URLs.
         assert!(!body.contains("https://"), "{path}");
         assert!(!body.contains("http://"), "{path}");
+        // Cloud badge mount point + live binding.
+        assert!(body.contains("id=\"cloud\""), "{path}");
+        assert!(body.contains("cloud_nodes_active"), "{path}");
     }
 }

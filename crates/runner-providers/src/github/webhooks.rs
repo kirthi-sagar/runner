@@ -5,7 +5,8 @@
 //! trusted peer → cloud burst), then mints a single-use JIT config and
 //! launches the sandboxed worker for local dispatches.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -246,6 +247,79 @@ pub async fn dispatch_local(
 /// Coordinator poll loop: poll queued jobs, route each one, and execute
 /// local/cloud dispatches when `dispatch` is `Some` (auto-dispatch).
 /// Runs until the process shuts down.
+/// Sync termination hook for the scale-to-zero watchdog: a deliberate
+/// no-op. Production teardown is async (`CloudPool::terminate`), so the
+/// coordinator acts on [`ScaleAction::Terminate`](runner_core::mesh::cloud::autoscale::ScaleAction)
+/// instead of this hook.
+#[derive(Debug, Default)]
+pub struct DeferredTerminator;
+
+impl runner_core::mesh::cloud::autoscale::Terminator for DeferredTerminator {
+    fn terminate(&mut self, _instance_id: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Per-node idle controllers, keyed by cloud instance id.
+pub type WatchdogMap =
+    HashMap<String, runner_core::mesh::cloud::autoscale::AutoscaleController<DeferredTerminator>>;
+
+/// Sync controllers with tracked nodes and poll once (pure decision
+/// step; termination itself happens in [`run_watchdog_cycle`]).
+pub fn poll_watchdogs(
+    controllers: &mut WatchdogMap,
+    nodes: &[runner_core::mesh::cloud::CloudNode],
+    now: Instant,
+    queue_depth: u32,
+) -> Vec<runner_core::mesh::cloud::autoscale::ScaleAction> {
+    use runner_core::mesh::cloud::autoscale::AutoscaleController;
+    for node in nodes {
+        controllers
+            .entry(node.id.clone())
+            .or_insert_with(|| AutoscaleController::new(node.id.clone(), now, DeferredTerminator));
+    }
+    controllers.retain(|id, _| nodes.iter().any(|n| &n.id == id));
+    let mut actions = Vec::new();
+    for controller in controllers.values_mut() {
+        match controller.poll(now, queue_depth) {
+            Ok(action) => actions.push(action),
+            Err(e) => eprintln!("runner: watchdog poll failed: {e}"),
+        }
+    }
+    actions
+}
+
+/// One scale-to-zero cycle: terminate nodes the watchdog flags and
+/// drop them from state. Provider failures keep the node (and its
+/// expired clock) so the next cycle retries.
+pub async fn run_watchdog_cycle(
+    pool: &runner_core::mesh::cloud::CloudPool,
+    state: &runner_core::governor::supervisor::SharedState,
+    controllers: &mut WatchdogMap,
+    now: Instant,
+    queue_depth: u32,
+) {
+    use runner_core::mesh::cloud::autoscale::ScaleAction;
+    let nodes = state.read().await.cloud_nodes();
+    for action in poll_watchdogs(controllers, &nodes, now, queue_depth) {
+        if let ScaleAction::Terminate { instance_id } = action {
+            let Some(node) = nodes.iter().find(|n| n.id == instance_id) else {
+                continue;
+            };
+            match pool.terminate(node).await {
+                Ok(_) => {
+                    eprintln!("runner: scale-to-zero terminated idle cloud node {instance_id}");
+                    state.write().await.remove_cloud_node(&instance_id);
+                    controllers.remove(&instance_id);
+                }
+                Err(e) => {
+                    eprintln!("runner: cloud terminate {instance_id} failed ({e}); retrying");
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_coordinator(
     poller: QueuePoller,
     dispatch: Option<DispatchContext>,
@@ -259,11 +333,18 @@ pub async fn run_coordinator(
         "runner: coordinator polling every {:?} (auto_dispatch={auto}, webhook wakeups armed)",
         poller.interval()
     );
+    let mut watchdogs: WatchdogMap = HashMap::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(poller.interval()) => {},
             _ = wakeup.notified() => {
                 eprintln!("runner: webhook wakeup: polling immediately");
+                // Activity is imminent: reset every idle clock even
+                // before the queue is re-polled.
+                let now = Instant::now();
+                for controller in watchdogs.values_mut() {
+                    controller.mark_active(now);
+                }
             }
         }
         let jobs = match poller.poll_once().await {
@@ -345,12 +426,125 @@ pub async fn run_coordinator(
                 }
             }
         }
+        // Scale-to-zero: reap cloud workers idle for 5+ minutes.
+        if let Some(pool) = cloud.as_ref() {
+            let depth = state.read().await.queue_depth();
+            run_watchdog_cycle(pool, &state, &mut watchdogs, Instant::now(), depth).await;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use runner_core::governor::supervisor::new_shared_state;
+    use runner_core::mesh::cloud::autoscale::ScaleAction;
+    use runner_core::mesh::cloud::{CloudNode, CloudPool};
+
+    fn node(id: &str) -> CloudNode {
+        CloudNode {
+            id: id.to_string(),
+            provider: "digitalocean".to_string(),
+            status: "active".to_string(),
+            launched_at: 0,
+        }
+    }
+
+    #[test]
+    fn watchdog_flags_idle_node_at_five_minutes() {
+        let start = Instant::now();
+        let mut controllers: WatchdogMap = HashMap::new();
+        let nodes = vec![node("i-1")];
+        let actions = poll_watchdogs(&mut controllers, &nodes, start, 0);
+        assert_eq!(actions, vec![ScaleAction::Keep]);
+        let actions = poll_watchdogs(
+            &mut controllers,
+            &nodes,
+            start + Duration::from_secs(299),
+            0,
+        );
+        assert_eq!(actions, vec![ScaleAction::Keep]);
+        let actions = poll_watchdogs(
+            &mut controllers,
+            &nodes,
+            start + Duration::from_secs(300),
+            0,
+        );
+        assert_eq!(
+            actions,
+            vec![ScaleAction::Terminate {
+                instance_id: "i-1".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn watchdog_resets_on_queue_depth_and_wakeup() {
+        let start = Instant::now();
+        let mut controllers: WatchdogMap = HashMap::new();
+        let nodes = vec![node("i-1")];
+        poll_watchdogs(&mut controllers, &nodes, start, 0);
+        // Queued work resets the clock: 299 more seconds still keeps.
+        poll_watchdogs(
+            &mut controllers,
+            &nodes,
+            start + Duration::from_secs(299),
+            2,
+        );
+        let actions = poll_watchdogs(
+            &mut controllers,
+            &nodes,
+            start + Duration::from_secs(598),
+            0,
+        );
+        assert_eq!(actions, vec![ScaleAction::Keep]);
+        // Webhook wakeup (mark_active) resets without a queue poll.
+        controllers
+            .get_mut("i-1")
+            .unwrap()
+            .mark_active(start + Duration::from_secs(598));
+        let actions = poll_watchdogs(
+            &mut controllers,
+            &nodes,
+            start + Duration::from_secs(897),
+            0,
+        );
+        assert_eq!(actions, vec![ScaleAction::Keep]);
+    }
+
+    #[test]
+    fn watchdog_map_tracks_node_membership() {
+        let start = Instant::now();
+        let mut controllers: WatchdogMap = HashMap::new();
+        poll_watchdogs(&mut controllers, &[node("a"), node("b")], start, 0);
+        assert_eq!(controllers.len(), 2);
+        // Removed nodes lose their controllers; survivors keep clocks.
+        poll_watchdogs(&mut controllers, &[node("b")], start, 0);
+        assert!(controllers.contains_key("b"));
+        assert!(!controllers.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn watchdog_cycle_keeps_node_when_provider_fails() {
+        // Pool without tokens: terminate errors, node stays for retry.
+        let pool = CloudPool::from_config(&runner_core::config::RunnerConfig::default());
+        let state = new_shared_state();
+        state.write().await.add_cloud_node(node("i-9"));
+        let mut controllers: WatchdogMap = HashMap::new();
+        let start = Instant::now();
+        run_watchdog_cycle(&pool, &state, &mut controllers, start, 0).await;
+        run_watchdog_cycle(
+            &pool,
+            &state,
+            &mut controllers,
+            start + Duration::from_secs(300),
+            0,
+        )
+        .await;
+        assert_eq!(state.read().await.cloud_nodes().len(), 1);
+        assert!(controllers.contains_key("i-9"));
+    }
 
     #[test]
     fn queued_requests_capacity() {

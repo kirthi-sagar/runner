@@ -153,6 +153,11 @@ enum Commands {
         #[command(subcommand)]
         command: HookCommands,
     },
+    /// Manage ephemeral cloud burst workers via the daemon
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommands,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -238,6 +243,23 @@ enum HookCommands {
     },
     /// Remove the runner-managed hook, restoring any backup
     Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+enum CloudCommands {
+    /// List active cloud nodes with uptime and spend cap
+    List {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Terminate one cloud node by instance id
+    Terminate {
+        /// Instance id to destroy
+        instance_id: String,
+    },
+    /// Terminate all tracked cloud nodes immediately
+    Purge,
 }
 
 #[derive(Debug, Subcommand)]
@@ -540,6 +562,13 @@ fn spawn_coordinator(config: &RunnerConfig, state: runner_core::governor::superv
         eprintln!("runner: unprivileged userns blocked; dispatches run unsandboxed");
     }
     let cloud = (config.cloud.max_monthly_spend > 0.0).then(|| CloudPool::from_config(config));
+    // Attach the pool to shared state so IPC-driven termination
+    // (`cloud_terminate`/`cloud_purge`) can reach the provider APIs.
+    if let Some(pool) = cloud.clone() {
+        state
+            .blocking_write()
+            .set_cloud_pool(pool, config.cloud.max_monthly_spend);
+    }
     tokio::spawn(run_coordinator(
         poller,
         dispatch,
@@ -788,6 +817,69 @@ fn cmd_hook_install(cmd: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Current Unix epoch seconds (cloud uptime math).
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Call one daemon method, mapping transport + RPC errors to anyhow.
+async fn daemon_call(method: &str, params: Option<serde_json::Value>) -> Result<serde_json::Value> {
+    let sock = resolve_sock_path();
+    let res = ipc_call_with(&sock, method, params)
+        .await
+        .map_err(|_| anyhow::anyhow!("daemon not reachable at {}", sock.display()))?;
+    if let Some(message) = runner_cli::cloud::daemon_error(&res) {
+        anyhow::bail!("daemon error: {message}");
+    }
+    Ok(res["result"].clone())
+}
+
+/// `runner cloud list`: active burst workers with uptime + spend cap.
+async fn cmd_cloud_list(format: &str) -> Result<()> {
+    use runner_cli::cloud::{parse_list, render_list_json, render_list_text};
+
+    let result = daemon_call("cloud_list", None).await?;
+    let (nodes, cap) = parse_list(&result, now_epoch_secs());
+    match format.trim().to_ascii_lowercase().as_str() {
+        "text" => print!("{}", render_list_text(&nodes, cap)),
+        "json" => println!("{}", render_list_json(&nodes, cap)),
+        other => anyhow::bail!("unsupported cloud list format {other:?}: want text|json"),
+    }
+    Ok(())
+}
+
+/// `runner cloud terminate`: destroy one worker by instance id.
+async fn cmd_cloud_terminate(instance_id: &str) -> Result<()> {
+    let result = daemon_call(
+        "cloud_terminate",
+        Some(serde_json::json!({ "instance_id": instance_id })),
+    )
+    .await?;
+    println!(
+        "terminated {}",
+        result["terminated"].as_str().unwrap_or(instance_id)
+    );
+    Ok(())
+}
+
+/// `runner cloud purge`: destroy every tracked worker immediately.
+async fn cmd_cloud_purge() -> Result<()> {
+    let result = daemon_call("cloud_purge", None).await?;
+    let purged = result["purged"].as_array().cloned().unwrap_or_default();
+    let failed = result["failed"].as_array().cloned().unwrap_or_default();
+    println!("purged {} node(s)", purged.len());
+    for failure in &failed {
+        eprintln!("failed: {failure}");
+    }
+    if !failed.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 /// `runner hook uninstall`: remove the managed hook, restore backup.
 fn cmd_hook_uninstall() -> Result<()> {
     use runner_cli::hook::uninstall;
@@ -1001,6 +1093,17 @@ async fn main() -> Result<()> {
             }
             HookCommands::Uninstall => {
                 cmd_hook_uninstall()?;
+            }
+        },
+        Commands::Cloud { command } => match command {
+            CloudCommands::List { format } => {
+                cmd_cloud_list(&format).await?;
+            }
+            CloudCommands::Terminate { instance_id } => {
+                cmd_cloud_terminate(&instance_id).await?;
+            }
+            CloudCommands::Purge => {
+                cmd_cloud_purge().await?;
             }
         },
         Commands::Exec {

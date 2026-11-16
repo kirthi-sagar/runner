@@ -45,12 +45,29 @@ async fn health() -> impl IntoResponse {
         runner_core::governor::psi::PressureLevel::Warning => "warning",
         runner_core::governor::psi::PressureLevel::Critical => "critical",
     });
+    // Cloud count is best-effort: the daemon owns cloud nodes, and this
+    // server may run on a host without one (null badge, still healthy).
+    let cloud_nodes_active = cloud_node_count().await;
     Json(serde_json::json!({
         "status": "healthy",
         "version": env!("CARGO_PKG_VERSION"),
         "psi": psi,
         "governor": governor,
+        "cloud_nodes_active": cloud_nodes_active,
     }))
+}
+
+/// Count daemon-tracked cloud nodes over the local IPC socket.
+async fn cloud_node_count() -> Option<usize> {
+    let sock = runner_core::ipc::resolve_sock_path();
+    let res = runner_core::ipc::ipc_call(&sock, "cloud_list").await.ok()?;
+    if res.get("error").is_some() {
+        return None;
+    }
+    res.get("result")
+        .and_then(|r| r.get("nodes"))
+        .and_then(|n| n.as_array())
+        .map(|nodes| nodes.len())
 }
 
 /// Embedded fleet dashboard (single file, zero external assets).

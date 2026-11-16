@@ -98,3 +98,6 @@ body{font-size:16px;line-height:1.65}
 @media(max-width:1000px){.hero-grid{gap:42px}.capability-card{padding-inline:20px}}
 @media(max-width:760px){.site-header{height:70px}.hero{padding-top:68px;padding-bottom:40px}.hero-grid{grid-template-columns:1fr;gap:40px}.hero h1{font-size:clamp(46px,10vw,66px)}.visual-wrap{min-height:380px}.status-banner{margin:0 18px}.capabilities-section{padding-top:76px;padding-bottom:76px}.capability-grid{grid-template-columns:1fr 1fr}.capability-card,.capability-card:first-child{padding:22px 18px}.capability-card:nth-child(2){border-right:0}.flow-inner{padding-top:70px;padding-bottom:70px}.final-cta{padding-top:68px;padding-bottom:68px}.site-footer{padding:34px 20px 20px}}
 @media(max-width:420px){.hero h1{font-size:44px}.hero-actions{flex-direction:column}.visual-wrap{padding:15px}.machine-card{padding:18px}.capability-grid{grid-template-columns:1fr}.capability-card,.capability-card:first-child,.capability-card:nth-child(2){padding:22px 0;border-right:0}.button{width:100%}.nav-actions .button{width:auto}}
+.hero-grid{grid-template-columns:minmax(0,1fr);min-height:0}
+.hero-copy{max-width:920px}
+.hero-lede{max-width:720px}

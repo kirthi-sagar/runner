@@ -99,6 +99,9 @@ async fn http_health_fleet_register_heartbeat() {
     // null otherwise (test must pass in both environments).
     assert!(health.get("cloud_nodes_active").is_some());
     assert!(health["cloud_nodes_active"].is_u64() || health["cloud_nodes_active"].is_null());
+    // Same duality for ledgered spend.
+    assert!(health.get("cloud_spend_usd").is_some());
+    assert!(health["cloud_spend_usd"].is_number() || health["cloud_spend_usd"].is_null());
 
     let registered: serde_json::Value = http
         .post(format!("{base}/api/v1/runners/register"))

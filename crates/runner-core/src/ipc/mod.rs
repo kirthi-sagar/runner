@@ -79,6 +79,8 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
         "cloud_list" => {
             let guard = state.read().await;
             let pool = guard.cloud_pool();
+            let tracked = pool.as_ref().is_some_and(|p| p.spend_tracked());
+            let spend_usd = pool.as_ref().map(|p| p.month_spend()).unwrap_or(0.0);
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
                 "nodes": guard.cloud_nodes(),
                 "providers": {
@@ -86,7 +88,8 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                     "render": pool.as_ref().is_some_and(|p| p.has_provider("render")),
                 },
                 "max_monthly_spend_usd": guard.cloud_spend_cap(),
-                "spend_tracked": false,
+                "spend_usd": spend_usd,
+                "spend_tracked": tracked,
             } })
         }
         "cloud_terminate" => {
@@ -317,6 +320,8 @@ mod tests {
         assert_eq!(result["nodes"][0]["id"], "i-1");
         assert_eq!(result["providers"]["digitalocean"], false);
         assert_eq!(result["max_monthly_spend_usd"], 25.0);
+        // Seeded pool carries no ledger: untracked, zero spend.
+        assert_eq!(result["spend_usd"], 0.0);
         assert_eq!(result["spend_tracked"], false);
     }
 

@@ -53,10 +53,20 @@ fn port_whitelist_covers_dns_and_https() {
             "missing port {port}"
         );
     }
-    // dport half-word loads at IPv4 offset 22 and IPv6 offset 42.
-    for off in [22i32, 42i32] {
-        assert!(insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == off));
-    }
+    // IPv4 ports load indirectly (IHL-derived offset in R1 + 2);
+    // IPv6 ports keep the fixed offset-42 absolute load.
+    assert_eq!(
+        insns
+            .iter()
+            .filter(|i| i.code == op::LD_IND_H && i.src_reg == 1 && i.imm == 2)
+            .count(),
+        2
+    );
+    assert!(insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == 42));
+    assert!(
+        !insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == 22),
+        "fixed 20-byte v4 assumption must be gone"
+    );
 }
 
 #[test]

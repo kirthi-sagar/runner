@@ -10,9 +10,10 @@
 //! * Default-drops everything else.
 //!
 //! Multi-byte absolute loads yield big-endian (network-order) values, so
-//! port constants compare directly against 53/443. The program assumes a
-//! fixed 20-byte IPv4 header and no IPv6 extension headers (documented
-//! fast path; full header-chain walking is the hardening follow-up).
+//! port constants compare directly against 53/443. IPv4 transport offsets
+//! derive dynamically from the IHL nibble (RFC 791), so IP options never
+//! shift port matching. IPv6 keeps a fixed 40-byte header assumption;
+//! extension-header walking is the remaining hardening follow-up.
 
 /// eBPF opcode classes and ALU/JMP operation codes (linux/bpf.h).
 pub mod op {
@@ -23,7 +24,15 @@ pub mod op {
     pub const LD_ABS_W: u8 = 0x20;
     pub const LD_ABS_H: u8 = 0x28;
     pub const LD_ABS_B: u8 = 0x30;
+    /// `LD_IND` (load from packet at `src_reg + imm`; `BPF_LD|BPF_IND`
+    /// per `linux/bpf_common.h`). The index register holds the computed
+    /// transport-header offset.
+    pub const LD_IND_W: u8 = 0x40;
+    pub const LD_IND_H: u8 = 0x48;
+    pub const LD_IND_B: u8 = 0x50;
     pub const MOV64_IMM: u8 = 0xb7;
+    /// `MOV64_REG` (dst = src; `BPF_ALU64|BPF_MOV|BPF_X`, `linux/bpf.h`).
+    pub const MOV64_REG: u8 = 0xbf;
     pub const EXIT: u8 = 0x95;
 }
 
@@ -79,6 +88,28 @@ pub fn ld_abs(size_opcode: u8, offset: u32) -> BpfInstruction {
         src_reg: 0,
         off: 0,
         imm: offset as i32,
+    }
+}
+
+/// Indirect packet load into R0 from `packet[src + offset]`.
+pub fn ld_ind(size_opcode: u8, src: u8, offset: u32) -> BpfInstruction {
+    BpfInstruction {
+        code: size_opcode,
+        dst_reg: 0,
+        src_reg: src,
+        off: 0,
+        imm: offset as i32,
+    }
+}
+
+/// 64-bit register move (dst = src).
+pub fn mov64_reg(dst: u8, src: u8) -> BpfInstruction {
+    BpfInstruction {
+        code: op::MOV64_REG,
+        dst_reg: dst,
+        src_reg: src,
+        off: 0,
+        imm: 0,
     }
 }
 
@@ -213,8 +244,8 @@ impl EgressFilterProgram {
         asm.jump(0x10, 0, 6, "tcp_v4");
         asm.jump(0x10, 0, 17, "udp_v4");
         asm.jump(0x00, 0, 0, "drop");
-        self.emit_port_check(&mut asm, "tcp_v4", 6, 22);
-        self.emit_port_check(&mut asm, "udp_v4", 17, 22);
+        self.emit_port_check_v4(&mut asm, "tcp_v4", 6);
+        self.emit_port_check_v4(&mut asm, "udp_v4", 17);
 
         // IPv6: ULA check on first dst byte, then ports at offset 42.
         asm.label("ipv6");
@@ -247,6 +278,31 @@ impl EgressFilterProgram {
             .find(|(p, _)| *p == proto)
             .map(|(_, port)| *port as i32);
         asm.emit(ld_abs(op::LD_ABS_H, dport_off));
+        match port {
+            Some(port) => asm.jump(0x10, 0, port, "allow"),
+            None => asm.jump(0x00, 0, 0, "drop"),
+        }
+        asm.jump(0x00, 0, 0, "drop");
+    }
+
+    /// IPv4 port check with dynamic IHL walking (RFC 791): R1 ends up
+    /// holding the transport-header offset `(IHL & 0x0F) * 4`, and the
+    /// destination port loads indirectly from R1 + 2 — correct even
+    /// when IP options are present. Headers shorter than 20 bytes
+    /// (IHL < 5) are malformed and drop.
+    fn emit_port_check_v4(&self, asm: &mut Assembler, label: &str, proto: u8) {
+        asm.label(label);
+        let port = self
+            .allowed_ports
+            .iter()
+            .find(|(p, _)| *p == proto)
+            .map(|(_, port)| *port as i32);
+        asm.emit(ld_abs(op::LD_ABS_B, 0));
+        asm.emit(alu64_imm(0x50, 0, 0x0f)); // AND64_IMM: IHL nibble
+        asm.emit(alu64_imm(0x60, 0, 2)); // LSH64_IMM: * 4
+        asm.emit(mov64_reg(1, 0)); // R1 = header length
+        asm.jump(0xa0, 1, 20, "drop"); // JLT_IMM: malformed if < 20
+        asm.emit(ld_ind(op::LD_IND_H, 1, 2));
         match port {
             Some(port) => asm.jump(0x10, 0, port, "allow"),
             None => asm.jump(0x00, 0, 0, "drop"),
@@ -327,5 +383,111 @@ mod tests {
     #[test]
     fn probe_returns_bool_without_panic() {
         let _ = probe_ebpf();
+    }
+
+    #[test]
+    fn ipv4_ports_use_dynamic_ihl_indirect_loads() {
+        let insns = EgressFilterProgram::new().to_instructions();
+        // Both v4 paths walk IHL: AND nibble, *4, stash in R1, bound it.
+        let ands = insns
+            .iter()
+            .filter(|i| i.code == 0x57 && i.imm == 0x0f)
+            .count();
+        assert_eq!(ands, 2, "one IHL mask per v4 proto path");
+        assert_eq!(
+            insns
+                .iter()
+                .filter(|i| i.code == op::MOV64_REG && i.dst_reg == 1 && i.src_reg == 0)
+                .count(),
+            2
+        );
+        // Indirect half-word loads from R1 + 2 (dst port).
+        let inds: Vec<_> = insns.iter().filter(|i| i.code == op::LD_IND_H).collect();
+        assert_eq!(inds.len(), 2);
+        assert!(inds.iter().all(|i| i.src_reg == 1 && i.imm == 2));
+        // Malformed headers (IHL < 5, i.e. length < 20) drop.
+        assert_eq!(
+            insns
+                .iter()
+                .filter(|i| i.code == 0xa5 && i.dst_reg == 1 && i.imm == 20)
+                .count(),
+            2
+        );
+        // No fixed-offset v4 port load remains; v6 keeps offset 42.
+        assert!(!insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == 22));
+        assert!(insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == 42));
+    }
+
+    /// Test-only semantic mirror of the v4 program path: version, range
+    /// drops, proto dispatch, IHL-derived port fetch. The bytecode test
+    /// above pins the emitted instructions; this pins their meaning.
+    fn v4_verdict(packet: &[u8], udp_allowed: bool, tcp_allowed: bool) -> bool {
+        if packet.len() < 20 || packet[0] >> 4 != 4 {
+            return false;
+        }
+        let ihl = ((packet[0] & 0x0f) as usize) * 4;
+        if ihl < 20 || packet.len() < ihl + 4 {
+            return false;
+        }
+        let dst = u32::from_be_bytes([packet[16], packet[17], packet[18], packet[19]]);
+        for (net, mask) in [
+            (0x0a00_0000u32, 0xff00_0000u32),
+            (0xac10_0000, 0xfff0_0000),
+            (0xc0a8_0000, 0xffff_0000),
+            (0xa9fe_0000, 0xffff_0000),
+        ] {
+            if dst & mask == net {
+                return false;
+            }
+        }
+        let dport = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+        match packet[9] {
+            17 => udp_allowed && dport == 53,
+            6 => tcp_allowed && dport == 443,
+            _ => false,
+        }
+    }
+
+    /// Minimal IPv4/TCP header with tunable IHL, proto, dst, dport.
+    fn v4_packet(ihl_words: u8, proto: u8, dst: [u8; 4], dport: u16) -> Vec<u8> {
+        let hlen = ihl_words as usize * 4;
+        let mut pkt = vec![0u8; hlen + 4];
+        pkt[0] = 0x40 | (ihl_words & 0x0f);
+        pkt[9] = proto;
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[hlen + 2..hlen + 4].copy_from_slice(&dport.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn v4_model_matches_options_and_malformed_packets() {
+        let public = [1, 1, 1, 1];
+        // Plain 20-byte header, TCP 443: allow.
+        assert!(v4_verdict(&v4_packet(5, 6, public, 443), true, true));
+        // Wrong port: drop.
+        assert!(!v4_verdict(&v4_packet(5, 6, public, 80), true, true));
+        // IP options (IHL 6 and 7): port found at the shifted offset.
+        assert!(v4_verdict(&v4_packet(6, 6, public, 443), true, true));
+        assert!(v4_verdict(&v4_packet(7, 17, public, 53), true, true));
+        // A fixed-offset-22 reader would misread the options case: the
+        // word at 22 is options zero-fill here, not the port.
+        let with_opts = v4_packet(7, 6, public, 443);
+        assert_ne!(u16::from_be_bytes([with_opts[22], with_opts[23]]), 443);
+        // Malformed IHL < 5: drop.
+        assert!(!v4_verdict(&v4_packet(4, 6, public, 443), true, true));
+        // Blocked ranges drop regardless of ports.
+        assert!(!v4_verdict(
+            &v4_packet(5, 6, [10, 0, 0, 1], 443),
+            true,
+            true
+        ));
+        assert!(!v4_verdict(
+            &v4_packet(6, 17, [169, 254, 169, 254], 53),
+            true,
+            true
+        ));
+        // Unknown proto and truncated packets drop.
+        assert!(!v4_verdict(&v4_packet(5, 1, public, 443), true, true));
+        assert!(!v4_verdict(&[0x45u8; 10], true, true));
     }
 }

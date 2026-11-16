@@ -842,10 +842,10 @@ async fn cmd_cloud_list(format: &str) -> Result<()> {
     use runner_cli::cloud::{parse_list, render_list_json, render_list_text};
 
     let result = daemon_call("cloud_list", None).await?;
-    let (nodes, cap) = parse_list(&result, now_epoch_secs());
+    let list = parse_list(&result, now_epoch_secs());
     match format.trim().to_ascii_lowercase().as_str() {
-        "text" => print!("{}", render_list_text(&nodes, cap)),
-        "json" => println!("{}", render_list_json(&nodes, cap)),
+        "text" => print!("{}", render_list_text(&list)),
+        "json" => println!("{}", render_list_json(&list)),
         other => anyhow::bail!("unsupported cloud list format {other:?}: want text|json"),
     }
     Ok(())

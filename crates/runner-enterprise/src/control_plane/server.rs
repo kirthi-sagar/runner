@@ -45,29 +45,38 @@ async fn health() -> impl IntoResponse {
         runner_core::governor::psi::PressureLevel::Warning => "warning",
         runner_core::governor::psi::PressureLevel::Critical => "critical",
     });
-    // Cloud count is best-effort: the daemon owns cloud nodes, and this
-    // server may run on a host without one (null badge, still healthy).
-    let cloud_nodes_active = cloud_node_count().await;
+    // Cloud stats are best-effort: the daemon owns cloud nodes, and
+    // this server may run on a host without one (nulls, still healthy).
+    let (cloud_nodes_active, cloud_spend_usd) = cloud_stats().await;
     Json(serde_json::json!({
         "status": "healthy",
         "version": env!("CARGO_PKG_VERSION"),
         "psi": psi,
         "governor": governor,
         "cloud_nodes_active": cloud_nodes_active,
+        "cloud_spend_usd": cloud_spend_usd,
     }))
 }
 
-/// Count daemon-tracked cloud nodes over the local IPC socket.
-async fn cloud_node_count() -> Option<usize> {
+/// Daemon cloud stats over the local IPC socket: active node count +
+/// ledgered month spend (both `None` when unreachable).
+async fn cloud_stats() -> (Option<usize>, Option<f64>) {
     let sock = runner_core::ipc::resolve_sock_path();
-    let res = runner_core::ipc::ipc_call(&sock, "cloud_list").await.ok()?;
+    let Ok(res) = runner_core::ipc::ipc_call(&sock, "cloud_list").await else {
+        return (None, None);
+    };
     if res.get("error").is_some() {
-        return None;
+        return (None, None);
     }
-    res.get("result")
-        .and_then(|r| r.get("nodes"))
+    let Some(result) = res.get("result") else {
+        return (None, None);
+    };
+    let count = result
+        .get("nodes")
         .and_then(|n| n.as_array())
-        .map(|nodes| nodes.len())
+        .map(|nodes| nodes.len());
+    let spend = result.get("spend_usd").and_then(|s| s.as_f64());
+    (count, spend)
 }
 
 /// Embedded fleet dashboard (single file, zero external assets).

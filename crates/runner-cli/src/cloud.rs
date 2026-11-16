@@ -24,26 +24,43 @@ impl ListedNode {
     }
 }
 
+/// Parsed `cloud_list` result: nodes, month spend, cap, tracking flag.
+pub struct CloudList {
+    pub nodes: Vec<ListedNode>,
+    pub spend_usd: f64,
+    pub cap_usd: f64,
+    pub tracked: bool,
+}
+
 /// Parse the `result` object of a `cloud_list` IPC response.
-pub fn parse_list(result: &serde_json::Value, now_secs: u64) -> (Vec<ListedNode>, f64) {
+pub fn parse_list(result: &serde_json::Value, now_secs: u64) -> CloudList {
     let nodes = result["nodes"].as_array().cloned().unwrap_or_default();
     let listed = nodes
         .iter()
         .filter_map(|v| serde_json::from_value::<CloudNode>(v.clone()).ok())
         .map(|n| ListedNode::from_node(&n, now_secs))
         .collect();
-    let cap = result["max_monthly_spend_usd"].as_f64().unwrap_or(0.0);
-    (listed, cap)
+    CloudList {
+        nodes: listed,
+        spend_usd: result["spend_usd"].as_f64().unwrap_or(0.0),
+        cap_usd: result["max_monthly_spend_usd"].as_f64().unwrap_or(0.0),
+        tracked: result["spend_tracked"].as_bool().unwrap_or(false),
+    }
 }
 
 /// Render `cloud list` text output.
-pub fn render_list_text(nodes: &[ListedNode], spend_cap: f64) -> String {
+pub fn render_list_text(list: &CloudList) -> String {
+    let spend = if list.tracked {
+        format!("spend ${:.2}", list.spend_usd)
+    } else {
+        "live spend untracked".to_string()
+    };
     let mut out = format!(
-        "cloud nodes: {} (spend cap ${:.2}/mo, live spend untracked)\n",
-        nodes.len(),
-        spend_cap
+        "cloud nodes: {} ({spend} / cap ${:.2}/mo)\n",
+        list.nodes.len(),
+        list.cap_usd
     );
-    for node in nodes {
+    for node in &list.nodes {
         out.push_str(&format!(
             "  - {} [{}] {} up {}\n",
             node.id, node.provider, node.status, node.uptime
@@ -53,8 +70,9 @@ pub fn render_list_text(nodes: &[ListedNode], spend_cap: f64) -> String {
 }
 
 /// Render `cloud list` JSON output.
-pub fn render_list_json(nodes: &[ListedNode], spend_cap: f64) -> String {
-    let items: Vec<serde_json::Value> = nodes
+pub fn render_list_json(list: &CloudList) -> String {
+    let items: Vec<serde_json::Value> = list
+        .nodes
         .iter()
         .map(|n| {
             serde_json::json!({
@@ -65,8 +83,9 @@ pub fn render_list_json(nodes: &[ListedNode], spend_cap: f64) -> String {
         .collect();
     serde_json::to_string_pretty(&serde_json::json!({
         "nodes": items,
-        "max_monthly_spend_usd": spend_cap,
-        "spend_tracked": false,
+        "spend_usd": list.spend_usd,
+        "max_monthly_spend_usd": list.cap_usd,
+        "spend_tracked": list.tracked,
     }))
     .unwrap_or_else(|_| "{}".to_string())
 }
@@ -94,37 +113,66 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_list_computes_uptime_and_cap() {
-        let result = serde_json::json!({
-            "nodes": [node("i-1"), {"id": "bogus"}],
-            "max_monthly_spend_usd": 25.0,
-        });
-        let (listed, cap) = parse_list(&result, 1_000_000 + 125);
-        assert_eq!(cap, 25.0);
-        // Malformed entries are skipped, not fatal.
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, "i-1");
-        assert_eq!(listed[0].uptime, "2m");
-    }
-
-    #[test]
-    fn renderers_cover_empty_and_populated() {
-        let text = render_list_text(&[], 10.0);
-        assert!(text.contains("cloud nodes: 0"));
-        assert!(text.contains("$10.00/mo"));
-        let nodes = vec![ListedNode {
-            id: "i-9".to_string(),
+    fn listed(id: &str) -> ListedNode {
+        ListedNode {
+            id: id.to_string(),
             provider: "render".to_string(),
             status: "active".to_string(),
             uptime: "1h05m".to_string(),
-        }];
-        let text = render_list_text(&nodes, 10.0);
+        }
+    }
+
+    #[test]
+    fn parse_list_computes_uptime_cap_and_spend() {
+        let result = serde_json::json!({
+            "nodes": [node("i-1"), {"id": "bogus"}],
+            "max_monthly_spend_usd": 25.0,
+            "spend_usd": 1.5,
+            "spend_tracked": true,
+        });
+        let list = parse_list(&result, 1_000_000 + 125);
+        assert_eq!(list.cap_usd, 25.0);
+        assert_eq!(list.spend_usd, 1.5);
+        assert!(list.tracked);
+        // Malformed entries are skipped, not fatal.
+        assert_eq!(list.nodes.len(), 1);
+        assert_eq!(list.nodes[0].id, "i-1");
+        assert_eq!(list.nodes[0].uptime, "2m");
+        // Old daemons without the new keys parse as untracked.
+        let legacy = parse_list(&serde_json::json!({"nodes": []}), 0);
+        assert!(!legacy.tracked);
+        assert_eq!(legacy.spend_usd, 0.0);
+    }
+
+    #[test]
+    fn renderers_cover_empty_populated_and_untracked() {
+        let empty = CloudList {
+            nodes: vec![],
+            spend_usd: 0.0,
+            cap_usd: 10.0,
+            tracked: true,
+        };
+        let text = render_list_text(&empty);
+        assert!(text.contains("cloud nodes: 0"));
+        assert!(text.contains("spend $0.00 / cap $10.00/mo"));
+        let full = CloudList {
+            nodes: vec![listed("i-9")],
+            spend_usd: 0.05,
+            cap_usd: 10.0,
+            tracked: true,
+        };
+        let text = render_list_text(&full);
         assert!(text.contains("i-9 [render] active up 1h05m"));
-        let json: serde_json::Value =
-            serde_json::from_str(&render_list_json(&nodes, 10.0)).unwrap();
+        assert!(text.contains("spend $0.05"));
+        let json: serde_json::Value = serde_json::from_str(&render_list_json(&full)).unwrap();
         assert_eq!(json["nodes"][0]["id"], "i-9");
-        assert_eq!(json["spend_tracked"], false);
+        assert_eq!(json["spend_usd"], 0.05);
+        assert_eq!(json["spend_tracked"], true);
+        let untracked = CloudList {
+            tracked: false,
+            ..full
+        };
+        assert!(render_list_text(&untracked).contains("live spend untracked"));
     }
 
     #[test]

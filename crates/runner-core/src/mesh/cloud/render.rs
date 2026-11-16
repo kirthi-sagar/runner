@@ -63,6 +63,7 @@ impl CreateWorker {
 pub struct RenderClient {
     token: String,
     http: reqwest::Client,
+    base_url: String,
 }
 
 impl RenderClient {
@@ -74,7 +75,18 @@ impl RenderClient {
         Ok(Self {
             token,
             http: reqwest::Client::new(),
+            base_url: SERVICES_URL.to_string(),
         })
+    }
+
+    /// Override the API base (mock harness, private mirrors).
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    fn service_url(&self, id: &str) -> String {
+        format!("{}/{}", self.base_url, id)
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -84,7 +96,7 @@ impl RenderClient {
     /// Create a background worker; returns the service id.
     pub async fn create_worker(&self, spec: &CreateWorker) -> Result<String, String> {
         let res = self
-            .auth(self.http.post(SERVICES_URL))
+            .auth(self.http.post(self.base_url.clone()))
             .json(&spec.body())
             .send()
             .await
@@ -104,7 +116,7 @@ impl RenderClient {
     /// Suspend a service (stops billing accrual on paid instances).
     pub async fn suspend(&self, id: &str) -> Result<(), String> {
         let res = self
-            .auth(self.http.post(suspend_path(id)))
+            .auth(self.http.post(format!("{}/suspend", self.service_url(id))))
             .send()
             .await
             .map_err(|e| format!("worker suspend failed: {e}"))?;
@@ -117,7 +129,7 @@ impl RenderClient {
     /// Delete a service permanently.
     pub async fn delete(&self, id: &str) -> Result<(), String> {
         let res = self
-            .auth(self.http.delete(service_path(id)))
+            .auth(self.http.delete(self.service_url(id)))
             .send()
             .await
             .map_err(|e| format!("worker delete failed: {e}"))?;

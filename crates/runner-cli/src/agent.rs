@@ -134,8 +134,9 @@ impl AgentTools for CliAgentTools {
                 "active_nodes": nodes.len(),
                 "nodes": nodes,
                 "providers": providers,
+                "spend_usd": result["spend_usd"],
                 "max_monthly_spend_usd": result["max_monthly_spend_usd"],
-                "spend_tracked": false,
+                "spend_tracked": result["spend_tracked"],
             }));
         }
         Ok(result)

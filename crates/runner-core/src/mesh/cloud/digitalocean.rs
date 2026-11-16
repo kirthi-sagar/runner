@@ -70,6 +70,7 @@ pub fn parse_created_id(body: &serde_json::Value) -> Result<u64, String> {
 pub struct DoClient {
     token: String,
     http: reqwest::Client,
+    base_url: String,
 }
 
 impl DoClient {
@@ -81,7 +82,14 @@ impl DoClient {
         Ok(Self {
             token,
             http: reqwest::Client::new(),
+            base_url: API_BASE.to_string(),
         })
+    }
+
+    /// Override the API base (mock harness, private mirrors).
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -90,8 +98,9 @@ impl DoClient {
 
     /// Create a droplet; returns its id on `202 Accepted`.
     pub async fn create_droplet(&self, spec: &CreateDroplet) -> Result<u64, String> {
+        let base = self.base_url.as_str();
         let res = self
-            .auth(self.http.post(format!("{API_BASE}{DROPLETS_PATH}")))
+            .auth(self.http.post(format!("{base}{DROPLETS_PATH}")))
             .json(&spec.body())
             .send()
             .await
@@ -108,8 +117,9 @@ impl DoClient {
 
     /// Destroy a droplet (`204`, irreversible).
     pub async fn destroy_droplet(&self, id: u64) -> Result<(), String> {
+        let base = self.base_url.as_str();
         let res = self
-            .auth(self.http.delete(format!("{API_BASE}{}", droplet_path(id))))
+            .auth(self.http.delete(format!("{base}{}", droplet_path(id))))
             .send()
             .await
             .map_err(|e| format!("droplet destroy failed: {e}"))?;
@@ -157,11 +167,9 @@ impl DoClient {
         struct IdRef {
             id: serde_json::Value,
         }
+        let base = self.base_url.as_str();
         let res = self
-            .auth(
-                self.http
-                    .get(format!("{API_BASE}/v2/droplets/{id}/snapshots")),
-            )
+            .auth(self.http.get(format!("{base}/v2/droplets/{id}/snapshots")))
             .send()
             .await
             .map_err(|e| format!("snapshots: {e}"))?;
@@ -191,8 +199,9 @@ impl DoClient {
             #[serde(default)]
             droplet_ids: Vec<u64>,
         }
+        let base = self.base_url.as_str();
         let res = self
-            .auth(self.http.get(format!("{API_BASE}/v2/volumes?per_page=200")))
+            .auth(self.http.get(format!("{base}/v2/volumes?per_page=200")))
             .send()
             .await
             .map_err(|e| format!("volumes: {e}"))?;
@@ -210,10 +219,10 @@ impl DoClient {
 
     async fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), String> {
         let res = self
-            .auth(
-                self.http
-                    .delete(format!("{API_BASE}/v2/snapshots/{snapshot_id}")),
-            )
+            .auth(self.http.delete({
+                let base = self.base_url.as_str();
+                format!("{base}/v2/snapshots/{snapshot_id}")
+            }))
             .send()
             .await
             .map_err(|e| format!("snapshot delete: {e}"))?;
@@ -225,10 +234,10 @@ impl DoClient {
 
     async fn delete_volume(&self, volume_id: &str) -> Result<(), String> {
         let res = self
-            .auth(
-                self.http
-                    .delete(format!("{API_BASE}/v2/volumes/{volume_id}")),
-            )
+            .auth(self.http.delete({
+                let base = self.base_url.as_str();
+                format!("{base}/v2/volumes/{volume_id}")
+            }))
             .send()
             .await
             .map_err(|e| format!("volume delete: {e}"))?;

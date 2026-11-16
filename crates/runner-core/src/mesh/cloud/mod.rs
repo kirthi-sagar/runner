@@ -2,7 +2,10 @@
 
 pub mod autoscale;
 pub mod digitalocean;
+pub mod ledger;
 pub mod render;
+
+pub use ledger::{hourly_rate, SpendLedger};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +55,7 @@ pub struct CloudPool {
     digitalocean: Option<digitalocean::DoClient>,
     render: Option<(render::RenderClient, String)>,
     air_gapped: bool,
+    ledger: Option<SpendLedger>,
 }
 
 impl CloudPool {
@@ -75,6 +79,63 @@ impl CloudPool {
             digitalocean,
             render,
             air_gapped: config.security.air_gapped,
+            ledger: ledger::default_ledger_path().map(SpendLedger::new),
+        }
+    }
+
+    /// Pool from explicit clients (mock harness, tests). No ledger: the
+    /// harness asserts API traffic, never touches the real spend file.
+    pub fn from_clients(
+        digitalocean: Option<digitalocean::DoClient>,
+        render: Option<(render::RenderClient, String)>,
+    ) -> Self {
+        Self {
+            digitalocean,
+            render,
+            air_gapped: false,
+            ledger: None,
+        }
+    }
+
+    /// Attach a spend ledger (tests point this at a temp path).
+    pub fn with_ledger(mut self, ledger: SpendLedger) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// True when lifecycle events are being recorded.
+    pub fn spend_tracked(&self) -> bool {
+        self.ledger.is_some()
+    }
+
+    /// USD accrued in the current calendar month (0.0 without a ledger
+    /// or when the file is unreadable — callers fail open and log).
+    pub fn month_spend(&self) -> f64 {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return 0.0;
+        };
+        ledger
+            .current_month_spend(now_epoch_secs())
+            .unwrap_or_else(|e| {
+                eprintln!("runner: spend ledger unreadable ({e}); treating spend as $0");
+                0.0
+            })
+    }
+
+    /// Record a lifecycle event; ledger failures are loud but never
+    /// fail the cloud operation itself.
+    fn record(&self, node: &CloudNode, terminated: bool) {
+        let Some(ledger) = self.ledger.as_ref() else {
+            return;
+        };
+        let now = now_epoch_secs();
+        let result = if terminated {
+            ledger.record_termination(&node.id, now)
+        } else {
+            ledger.record_launch(&node.id, &node.provider, node.launched_at)
+        };
+        if let Err(e) = result {
+            eprintln!("runner: spend ledger write failed ({e})");
         }
     }
 
@@ -101,12 +162,14 @@ impl CloudPool {
                 let id = client
                     .create_droplet(&digitalocean::CreateDroplet::ci_worker(name))
                     .await?;
-                Ok(CloudNode {
+                let node = CloudNode {
                     id: id.to_string(),
                     provider: provider.to_string(),
                     status: "provisioning".to_string(),
                     launched_at: now_epoch_secs(),
-                })
+                };
+                self.record(&node, false);
+                Ok(node)
             }
             "render" => {
                 let (client, owner) = self
@@ -116,12 +179,14 @@ impl CloudPool {
                 let id = client
                     .create_worker(&render::CreateWorker::ci_worker(name, owner))
                     .await?;
-                Ok(CloudNode {
+                let node = CloudNode {
                     id,
                     provider: provider.to_string(),
                     status: "provisioning".to_string(),
                     launched_at: now_epoch_secs(),
-                })
+                };
+                self.record(&node, false);
+                Ok(node)
             }
             _ => Err(format!("unknown provider: {provider}")),
         }
@@ -129,7 +194,7 @@ impl CloudPool {
 
     /// Terminate one worker (full cleanup on DigitalOcean).
     pub async fn terminate(&self, node: &CloudNode) -> Result<Vec<String>, String> {
-        match node.provider.as_str() {
+        let cleanup = match node.provider.as_str() {
             "digitalocean" => {
                 let client = self
                     .digitalocean
@@ -150,7 +215,9 @@ impl CloudPool {
                 Ok(Vec::new())
             }
             _ => Err(format!("unknown provider: {}", node.provider)),
-        }
+        }?;
+        self.record(node, true);
+        Ok(cleanup)
     }
 }
 

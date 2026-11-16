@@ -247,6 +247,13 @@ pub async fn dispatch_local(
 /// Coordinator poll loop: poll queued jobs, route each one, and execute
 /// local/cloud dispatches when `dispatch` is `Some` (auto-dispatch).
 /// Runs until the process shuts down.
+/// True when new cloud spend is allowed: a positive cap the ledgered
+/// month total has not yet reached. A zero cap means bursting was
+/// never enabled, so nothing is allowed.
+pub fn budget_allows(month_spend_usd: f64, cap_usd: f64) -> bool {
+    cap_usd > 0.0 && month_spend_usd < cap_usd
+}
+
 /// Sync termination hook for the scale-to-zero watchdog: a deliberate
 /// no-op. Production teardown is async (`CloudPool::terminate`), so the
 /// coordinator acts on [`ScaleAction::Terminate`](runner_core::mesh::cloud::autoscale::ScaleAction)
@@ -404,6 +411,17 @@ pub async fn run_coordinator(
                         job.id, job.name
                     );
                     if let (Some(pool), true) = (cloud.clone(), auto) {
+                        // Hard budget stop: refuse new spend once the
+                        // ledgered month total reaches the cap.
+                        let spend = pool.month_spend();
+                        let cap = state.read().await.cloud_spend_cap();
+                        if !budget_allows(spend, cap) {
+                            eprintln!(
+                                "runner: budget stop: month spend ${spend:.2} reached cap ${cap:.2}; job {} waits",
+                                job.id
+                            );
+                            continue;
+                        }
                         let state = state.clone();
                         let pool = pool.clone();
                         tokio::spawn(async move {
@@ -511,6 +529,16 @@ mod tests {
             0,
         );
         assert_eq!(actions, vec![ScaleAction::Keep]);
+    }
+
+    #[test]
+    fn budget_stop_triggers_at_cap() {
+        assert!(budget_allows(0.0, 25.0));
+        assert!(budget_allows(24.99, 25.0));
+        assert!(!budget_allows(25.0, 25.0));
+        assert!(!budget_allows(30.0, 25.0));
+        // Zero cap means bursting was never enabled.
+        assert!(!budget_allows(0.0, 0.0));
     }
 
     #[test]

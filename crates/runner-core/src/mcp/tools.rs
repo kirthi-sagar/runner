@@ -285,12 +285,22 @@ pub async fn execute_tool(
                 None => DiagnoseSystemArgs::default(),
                 Some(_) => parse_args(args)?,
             };
-            ctx.agent
+            let mut out = ctx
+                .agent
                 .diagnose(
                     args.egress.unwrap_or(false),
                     args.enterprise.unwrap_or(false),
                 )
-                .await
+                .await?;
+            // Merge forge health here: agent impls hold no daemon state.
+            if let Some(map) = out.as_object_mut() {
+                map.insert(
+                    "forges".to_string(),
+                    serde_json::to_value(ctx.state.read().await.forge_health())
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Ok(out)
         }
         TOOL_TEST_PROVIDER => {
             let args: TestProviderArgs = parse_args(args)?;
@@ -354,6 +364,7 @@ async fn get_ci_status(ctx: &ToolContext) -> Result<serde_json::Value, ToolError
             "id": r.id, "cores": r.cores, "ram_mb": r.ram_mb, "reason": r.reason,
         })).collect::<Vec<_>>(),
         "drained_nodes": state.drained_nodes(),
+        "forges": state.forge_health(),
     }))
 }
 

@@ -97,9 +97,9 @@ Existing self-hosted runners fail at this because:
    - **Super Admin (Human User)**: Sovereign authority over monthly cloud credit spend caps, trusted peer invitation approvals, node revocations, and emergency kill-switches.
    - **Admin (Autonomous AI Coding Agent via MCP)**: Operational fleet manager. Inspects node capacity, routes jobs based on hardware requirements (e.g., dispatching heavy PostgreSQL suites to cloud/peers while running quick linters locally), and requests cloud scaling within pre-approved budget boundaries.
 
-5. **Transparent LAN Caching (`ACTIONS_CACHE_URL`)**:
-   - Injects `ACTIONS_CACHE_URL` pointing to `runner`'s local LAN caching daemon into standard runner environments.
-   - Standard actions (`actions/cache@v4`, `actions/setup-node`, `actions/setup-python`, `Swatinem/rust-cache`) read and write cache archives over Gigabit LAN at **100–120 MB/s** with **zero workflow file edits**.
+5. **Transparent LAN Caching (`ACTIONS_CACHE_URL`)** — *coming in v0.5.0*:
+   - Will inject `ACTIONS_CACHE_URL` pointing to `runner`'s local LAN caching daemon into standard runner environments.
+   - Standard actions (`actions/cache@v4`, `actions/setup-node`, `actions/setup-python`, `Swatinem/rust-cache`) will read and write cache archives over Gigabit LAN at **100–120 MB/s** with **zero workflow file edits**.
 
 6. **100% GitHub Compatibility via Official Worker Wrapping**:
    - Embeds an ephemeral, pre-cached copy of Microsoft's official `actions/runner` worker binary inside an unprivileged container or microVM.
@@ -121,7 +121,7 @@ Existing self-hosted runners fail at this because:
 | **Cloud Credit Bursting** | **Yes (DigitalOcean / Render auto-scale)**| None | Custom autoscalers | None | Proprietary SaaS |
 | **AFK Boost Mode** | **Yes (Desktop Idle Listener)** | None | None | None | N/A |
 | **Infrastructure Overhead** | **Zero (Single static binary)** | Low (Directory install) | Very High (Kubernetes cluster) | Low (Docker CLI) | Managed SaaS |
-| **Distributed LAN Cache** | **Transparent (ACTIONS_CACHE_URL)**| No | Optional (MinIO / S3 setup) | Local Docker volume only | Cloud cache |
+| **Distributed LAN Cache** | **v0.5.0 (ACTIONS_CACHE_URL)**| No | Optional (MinIO / S3 setup) | Local Docker volume only | Cloud cache |
 | **macOS Apple Silicon Support** | **Darwin QoS (E-Core Pinning)** | Unmanaged | Not supported | Local Docker (Rosetta/arm) | Metered cloud |
 | **Multi-Provider CI** | **GitHub + GitLab + Bitbucket + Local** | GitHub only | GitHub only | GitHub emu only | GitHub (+ paid add-ons) |
 
@@ -152,7 +152,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.4.3 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.4.4 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -189,7 +189,7 @@ runner top
 ```
 
 ```text
-runner top v0.4.3  (q quit, live cadence)
+runner top v0.4.4  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -293,7 +293,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "0.4.3", "governor": "normal",
+{"status": "healthy", "version": "0.4.4", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -352,6 +352,23 @@ auto_dispatch = false     # true = launch sandboxes for routed jobs
 runner_group_id = 1       # JIT runner group (1 = Default)
 worker_version = "2.338.2"
 job_timeout_mins = 60     # supervisor kill ceiling per job
+
+[gitlab]                  # native GitLab CI runner (REST v4)
+enabled = false           # true = poll jobs/request on poll_secs cadence
+url = "https://gitlab.com"
+# runner_token = "..."    # or RUNNER_GITLAB_TOKEN (see §7)
+poll_secs = 10
+tags = ["zero-freeze", "linux", "runner"]
+
+[bitbucket]               # native Bitbucket Pipelines runner (OAuth)
+enabled = false           # true = poll the runner step queue
+workspace = ""            # workspace id
+repo_slug = ""            # repository slug
+runner_uuid = ""          # self-hosted runner UUID
+# oauth_client_id = "..."     # or RUNNER_BITBUCKET_CLIENT_ID
+# oauth_client_secret = "..." # or RUNNER_BITBUCKET_CLIENT_SECRET
+poll_secs = 10
+labels = ["zero-freeze", "linux", "runner"]
 ```
 
 Key behaviors:
@@ -393,6 +410,22 @@ reports fine-grained tokens as offline-unverifiable (proven by the JIT
 call itself). Point the coordinator at a repo (`repo_owner`/`repo_name`)
 and set `auto_dispatch = true` to execute queued `[self-hosted, runner]`
 jobs; starter workflows live in [`examples/`](file:///home/linux/runner/examples).
+
+Prefer the credential helper over hand-editing the env file (prompts
+when values are omitted; always stored `0600`):
+
+```bash
+runner auth github --token ghp_...
+runner auth gitlab --token glpat-...
+runner auth bitbucket --client-id <id> --client-secret <sec>
+```
+
+GitLab runners need a runner token (GitLab → Admin → Runners, or the
+project's *Settings → CI/CD → Runners*); set `[gitlab] enabled = true`
+and matching `tags`, then restart the daemon. Bitbucket runners need
+an OAuth consumer (workspace *Settings → OAuth consumers* with
+*pipelines* scope) plus `workspace`, `repo_slug`, and `runner_uuid`
+in `[bitbucket]`; starter configs live in [`examples/`](file:///home/linux/runner/examples).
 
 ---
 

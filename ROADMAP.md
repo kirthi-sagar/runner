@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.4.2 and prior)
+## Shipped (v0.4.3 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 11 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,7 +14,14 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 
-## Current: v0.4.3 Multi-Forge Daemon Wiring
+## Current: v0.4.4 Multi-Forge Hardening
+
+- Atomic slot reservation + namespaced job lifecycle.
+- Broadcast wakeups for all forge loops.
+- Sandboxed git checkout before forge scripts.
+- Per-forge health over IPC/MCP/CLI + doc truth.
+
+## Shipped in v0.4.3: Multi-Forge Daemon Wiring
 
 - GitLab CI + Bitbucket Pipelines coordinator loops.
 - Provider-namespaced in-flight deduplication.

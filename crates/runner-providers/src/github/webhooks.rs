@@ -376,10 +376,15 @@ pub async fn run_coordinator(
             Ok(jobs) => jobs,
             Err(e) => {
                 eprintln!("runner: queue poll failed: {e}");
+                state.write().await.record_forge_poll("github", 0, Some(e));
                 continue;
             }
         };
-        state.write().await.set_queue_depth(jobs.len() as u32);
+        {
+            let mut guard = state.write().await;
+            guard.set_queue_depth(jobs.len() as u32);
+            guard.record_forge_poll("github", jobs.len() as u32, None);
+        }
         for job in jobs {
             let (free, peers, drained, flying) = {
                 let guard = state.read().await;
@@ -402,15 +407,25 @@ pub async fn run_coordinator(
                 RouteDecision::Local => {
                     eprintln!("runner: job {} ({}) routed local", job.id, job.name);
                     if let Some(ctx) = dispatch.clone() {
+                        // Atomic reserve at dispatch: another forge may
+                        // have taken the last slot since routing read it.
+                        // Losing the race degrades to Wait (next poll).
+                        if !state.write().await.try_reserve_slot() {
+                            eprintln!(
+                                "runner: job {} ({}) lost slot race; waiting for capacity",
+                                job.id, job.name
+                            );
+                            continue;
+                        }
                         let state = state.clone();
                         let slice = slice.clone();
                         let job = job.clone();
                         let job_id = job.id.to_string();
-                        {
-                            let mut guard = state.write().await;
-                            guard.in_flight_inc();
-                            guard.job_started("github", &job_id, &job.name);
-                        }
+                        // The reservation is this job's slot (no second inc).
+                        state
+                            .write()
+                            .await
+                            .job_started("github", &job_id, &job.name);
                         tokio::spawn(async move {
                             let result = dispatch_local(&job, &ctx, Some(&slice)).await;
                             if let Err(e) = result {
@@ -418,7 +433,7 @@ pub async fn run_coordinator(
                             }
                             let mut guard = state.write().await;
                             guard.in_flight_dec();
-                            guard.job_finished(&job_id);
+                            guard.job_finished("github", &job_id);
                         });
                     }
                 }
@@ -705,7 +720,7 @@ mod tests {
         // Same numeric id from another forge is a different job.
         assert!(!already_in_flight(&state.in_flight_jobs(), "gitlab", "42"));
         // Completion releases the id for future runs.
-        state.job_finished("42");
+        state.job_finished("github", "42");
         assert!(!already_in_flight(&state.in_flight_jobs(), "github", "42"));
     }
 }

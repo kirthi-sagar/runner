@@ -213,16 +213,27 @@ impl GitlabClient {
 /// Chunk size for trace uploads.
 pub const TRACE_CHUNK_SIZE: usize = 64 * 1024;
 
-/// Execute a claimed job: run the assembled script in the zero-freeze
-/// sandbox, upload output in trace chunks, report completion.
-/// Returns true on script success.
+/// Execute a claimed job: check out the repo, run the assembled script
+/// in the zero-freeze sandbox, upload output in trace chunks, report
+/// completion. Returns true on script success.
 pub async fn execute_job(
     client: &GitlabClient,
     job: &GitlabJob,
     no_sandbox: bool,
     timeout: std::time::Duration,
 ) -> Result<bool> {
-    let script = job.script.join("\n");
+    // Clone first when the claim carries repo coordinates; the prefix
+    // runs in the same workspace cwd, so failures stream + fail cleanly.
+    // Token-in-URL argv is briefly ps-visible (accepted: forge convention).
+    let mut script = String::new();
+    if let (Some(repo_url), Some(git_ref)) = (job.repo_url.as_deref(), job.git_ref.as_deref()) {
+        if let Some(prefix) =
+            super::checkout_prefix(repo_url, Some(git_ref), "gitlab-ci-token", &job.token)
+        {
+            script.push_str(&prefix);
+        }
+    }
+    script.push_str(&job.script.join("\n"));
     let output = super::local::execute_captured(
         &["sh".to_string(), "-c".to_string(), script],
         &job.variables,
@@ -359,58 +370,66 @@ impl ProviderAdapter for GitlabProvider {
     }
 }
 
-/// One daemon iteration: capacity → poll → dedup → dispatch.
+/// One daemon iteration: reserve → poll → dedup → dispatch.
 /// Returns the number of jobs dispatched (0 or 1: each request hands
 /// out a single claimed job).
 ///
-/// Capacity is checked BEFORE polling: GitLab claims server-side at
-/// request time, so polling while full would abandon claimed jobs.
+/// The slot is reserved BEFORE polling: GitLab claims server-side at
+/// request time, so polling while full would abandon claimed jobs,
+/// and the atomic reservation keeps concurrent forge loops from
+/// over-dispatching a constrained host.
 pub async fn poll_gitlab_once(
     provider: &Arc<GitlabProvider>,
     state: &runner_core::governor::supervisor::SharedState,
     no_sandbox: bool,
     timeout: std::time::Duration,
 ) -> usize {
-    let free = {
-        let guard = state.read().await;
-        guard.last_slots.saturating_sub(guard.in_flight())
-    };
-    if free == 0 {
+    if !state.write().await.try_reserve_slot() {
         return 0;
     }
     let jobs = match provider.poll_pending_jobs().await {
         Ok(jobs) => jobs,
         Err(e) => {
             eprintln!("runner: gitlab poll failed: {e:#}");
+            let mut guard = state.write().await;
+            guard.record_forge_poll("gitlab", 0, Some(format!("{e:#}")));
+            guard.release_slot_reservation();
             return 0;
         }
     };
     let Some(job) = jobs.into_iter().next() else {
+        let mut guard = state.write().await;
+        guard.record_forge_poll("gitlab", 0, None);
+        guard.release_slot_reservation();
         return 0;
     };
+    state.write().await.record_forge_poll("gitlab", 1, None);
     let flying = state.read().await.in_flight_jobs();
     if crate::github::webhooks::already_in_flight(&flying, "gitlab", &job.id) {
         // Drop the duplicate server-side claim; the original execution
         // owns completion reporting.
         provider.pending.lock().await.take();
         eprintln!("runner: gitlab job {} already in flight; skipping", job.id);
+        state.write().await.release_slot_reservation();
         return 0;
     }
     let claimed = provider.pending.lock().await.take();
     let Some(claimed) = claimed else {
+        state.write().await.release_slot_reservation();
         return 0;
     };
     if claimed.id.to_string() != job.id {
         // Impossible in the sequential loop (poll sets pending just
         // above); restore and bail rather than drop a live claim.
         *provider.pending.lock().await = Some(claimed);
+        state.write().await.release_slot_reservation();
         return 0;
     }
-    {
-        let mut guard = state.write().await;
-        guard.in_flight_inc();
-        guard.job_started("gitlab", &job.id, &job.name);
-    }
+    // The reservation converts into this job's slot (no second inc).
+    state
+        .write()
+        .await
+        .job_started("gitlab", &job.id, &job.name);
     let provider = Arc::clone(provider);
     let state = state.clone();
     let job_id = job.id.clone();
@@ -419,7 +438,7 @@ pub async fn poll_gitlab_once(
             eprintln!("runner: gitlab provider disabled mid-flight; dropping job {job_id}");
             let mut guard = state.write().await;
             guard.in_flight_dec();
-            guard.job_finished(&job_id);
+            guard.job_finished("gitlab", &job_id);
             return;
         };
         match execute_job(client, &claimed, no_sandbox, timeout).await {
@@ -429,7 +448,7 @@ pub async fn poll_gitlab_once(
         }
         let mut guard = state.write().await;
         guard.in_flight_dec();
-        guard.job_finished(&job_id);
+        guard.job_finished("gitlab", &job_id);
     });
     1
 }

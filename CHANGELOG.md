@@ -6,7 +6,22 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
-## Unreleased (v0.4.3)
+## Unreleased (v0.4.4)
+
+- Atomic slot reservation across all three forge loops: concurrent
+  polls can no longer over-dispatch a constrained host.
+- Provider-namespaced job lifecycle: identical job IDs from
+  different forges coexist; finishing never evicts another forge.
+- Broadcast wakeups (`notify_waiters`) rouse every enabled forge.
+- Sandboxed git checkout before GitLab/Bitbucket script execution
+  (shallow clone with forge token auth; failures stream + fail).
+- Per-forge poll health (`last_poll`, `queue_depth`, `last_error`)
+  over IPC `status`, MCP `get_ci_status`/`diagnose_system`, and
+  `runner status --format json`.
+- Doc truth: `[gitlab]`/`[bitbucket]` config reference, `runner
+  auth` for all forges, starter TOMLs, cache marked v0.5.0.
+
+## v0.4.3 — 2026-11-17
 
 - Multi-forge daemon wiring: the coordinator supervises GitLab CI
   and Bitbucket Pipelines (poll → claim → sandbox-execute → stream

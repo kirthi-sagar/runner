@@ -44,13 +44,24 @@ async fn ipc_snapshot_and_poll_now() {
     assert_eq!(snap["queue_depth"], 3);
     assert!(snap.get("psi_warn").and_then(|v| v.as_f64()).unwrap() > 0.0);
 
-    // poll_now notifies the shared wakeup without error.
-    let notified = state.read().await.wakeup();
+    // poll_now broadcasts: every waiting forge loop wakes, not just one.
+    // (notify_waiters only reaches current waiters, so wait first.)
+    let wakeup = state.read().await.wakeup();
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let wakeup = wakeup.clone();
+        waiters.push(tokio::spawn(async move { wakeup.notified().await }));
+    }
+    // Let all three waiters park before notifying.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let res = ipc_call(&path, "poll_now").await.unwrap();
     assert_eq!(res["result"]["notified"], true);
-    tokio::time::timeout(std::time::Duration::from_secs(1), notified.notified())
-        .await
-        .expect("wakeup must fire");
+    for waiter in waiters {
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("wakeup must fire")
+            .unwrap();
+    }
 
     task.abort();
 }

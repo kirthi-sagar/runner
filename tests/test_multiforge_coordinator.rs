@@ -128,6 +128,9 @@ async fn gitlab_poll_dispatches_executes_and_reports() {
             "PUT /api/v4/jobs/9".to_string(),
         ]
     );
+    let health = state.read().await.forge_health();
+    assert_eq!(health["gitlab"].queue_depth, 1);
+    assert!(health["gitlab"].last_error.is_none());
 }
 
 #[tokio::test]
@@ -143,21 +146,21 @@ async fn bitbucket_poll_dispatches_executes_and_reports() {
             },
             Route {
                 method: "GET",
-                path: "/2.0/repositories/w/r/pipelines-config/runners/u/steps",
+                path: "/2.0/repositories/w//pipelines-config/runners/u/steps",
                 status: 200,
                 reason: "OK",
                 body: r#"{"values":[{"uuid":"s-1","script":["echo canned"],"variables":{}}]}"#,
             },
             Route {
                 method: "POST",
-                path: "/2.0/repositories/w/r/pipelines/steps/s-1/log",
+                path: "/2.0/repositories/w//pipelines/steps/s-1/log",
                 status: 200,
                 reason: "OK",
                 body: "{}",
             },
             Route {
                 method: "PUT",
-                path: "/2.0/repositories/w/r/pipelines/steps/s-1/status",
+                path: "/2.0/repositories/w//pipelines/steps/s-1/status",
                 status: 200,
                 reason: "OK",
                 body: "{}",
@@ -165,9 +168,10 @@ async fn bitbucket_poll_dispatches_executes_and_reports() {
         ],
         4,
     );
-    let provider = Arc::new(
-        BitbucketProvider::new("id", "secret", "w", "r", "u", vec![]).with_base_url(&base),
-    );
+    // Empty repo_slug: checkout is skipped, keeping this hermetic (the
+    // clone URL would otherwise point at the real bitbucket.org host).
+    let provider =
+        Arc::new(BitbucketProvider::new("id", "secret", "w", "", "u", vec![]).with_base_url(&base));
     let state = new_shared_state();
     let dispatched = poll_bitbucket_once(&provider, &state, false, Duration::from_secs(60)).await;
     assert_eq!(dispatched, 1);
@@ -178,11 +182,14 @@ async fn bitbucket_poll_dispatches_executes_and_reports() {
         seen,
         vec![
             "POST /site/oauth2/token".to_string(),
-            "GET /2.0/repositories/w/r/pipelines-config/runners/u/steps".to_string(),
-            "POST /2.0/repositories/w/r/pipelines/steps/s-1/log".to_string(),
-            "PUT /2.0/repositories/w/r/pipelines/steps/s-1/status".to_string(),
+            "GET /2.0/repositories/w//pipelines-config/runners/u/steps".to_string(),
+            "POST /2.0/repositories/w//pipelines/steps/s-1/log".to_string(),
+            "PUT /2.0/repositories/w//pipelines/steps/s-1/status".to_string(),
         ]
     );
+    let health = state.read().await.forge_health();
+    assert_eq!(health["bitbucket"].queue_depth, 1);
+    assert!(health["bitbucket"].last_error.is_none());
 }
 
 #[tokio::test]

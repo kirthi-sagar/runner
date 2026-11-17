@@ -7,7 +7,7 @@
 //! Throttling is weight-only: this module never freezes cgroups, so test
 //! timers and TCP keepalives survive critical pressure on trickle CPU.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -63,6 +63,14 @@ pub struct InFlightJob {
 /// Cap on tracked jobs; oldest entries roll off first.
 pub const MAX_TRACKED_JOBS: usize = 64;
 
+/// Last-known poll health of one CI forge, surfaced over IPC/MCP/CLI.
+#[derive(Debug, Clone, Serialize)]
+pub struct ForgeHealth {
+    pub last_poll_unix_ms: u64,
+    pub queue_depth: u32,
+    pub last_error: Option<String>,
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -86,6 +94,7 @@ pub struct SupervisorState {
     in_flight: u32,
     jobs: Vec<InFlightJob>,
     queue_depth: u32,
+    forge_health: BTreeMap<String, ForgeHealth>,
     wakeup: Arc<Notify>,
     pub last_snapshot: PsiSnapshot,
     pub last_weight: Option<u32>,
@@ -111,6 +120,7 @@ impl SupervisorState {
             in_flight: 0,
             jobs: Vec::new(),
             queue_depth: 0,
+            forge_health: BTreeMap::new(),
             wakeup: Arc::new(Notify::new()),
             last_snapshot: PsiSnapshot::default(),
             last_weight: None,
@@ -252,9 +262,29 @@ impl SupervisorState {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
+    /// Atomically reserve one execution slot when capacity allows.
+    /// Check-and-increment under a single write lock so concurrent
+    /// forge loops can never over-dispatch a constrained host.
+    pub fn try_reserve_slot(&mut self) -> bool {
+        if self.in_flight < self.last_slots {
+            self.in_flight += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Release a reservation made by [`try_reserve_slot`](Self::try_reserve_slot)
+    /// when the poll yields no dispatchable job.
+    pub fn release_slot_reservation(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+
     /// Record a dispatch; oldest entries roll off past [`MAX_TRACKED_JOBS`].
+    /// Keyed by `(provider, id)` so identical job IDs from different
+    /// forges never evict each other.
     pub fn job_started(&mut self, provider: &str, id: &str, name: &str) {
-        self.jobs.retain(|j| j.id != id);
+        self.jobs.retain(|j| j.provider != provider || j.id != id);
         self.jobs.push(InFlightJob {
             id: id.to_string(),
             provider: provider.to_string(),
@@ -266,9 +296,26 @@ impl SupervisorState {
         }
     }
 
-    /// Drop a finished job from the registry.
-    pub fn job_finished(&mut self, id: &str) {
-        self.jobs.retain(|j| j.id != id);
+    /// Drop a finished job from the registry (caller's forge only).
+    pub fn job_finished(&mut self, provider: &str, id: &str) {
+        self.jobs.retain(|j| j.provider != provider || j.id != id);
+    }
+
+    /// Record one forge poll outcome for IPC/MCP/CLI visibility.
+    pub fn record_forge_poll(&mut self, provider: &str, queue_depth: u32, error: Option<String>) {
+        self.forge_health.insert(
+            provider.to_string(),
+            ForgeHealth {
+                last_poll_unix_ms: now_unix_ms(),
+                queue_depth,
+                last_error: error,
+            },
+        );
+    }
+
+    /// Last-known health per forge, in stable name order.
+    pub fn forge_health(&self) -> BTreeMap<String, ForgeHealth> {
+        self.forge_health.clone()
     }
 
     pub fn in_flight_jobs(&self) -> Vec<InFlightJob> {
@@ -442,7 +489,7 @@ mod tests {
         // Re-recording the same id replaces instead of duplicating.
         state.job_started("github", "1", "ci / a-retry");
         assert_eq!(state.in_flight_jobs().len(), 2);
-        state.job_finished("1");
+        state.job_finished("github", "1");
         let jobs = state.in_flight_jobs();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, "2");
@@ -453,6 +500,79 @@ mod tests {
         assert_eq!(state.in_flight_jobs().len(), MAX_TRACKED_JOBS);
         state.set_queue_depth(9);
         assert_eq!(state.queue_depth(), 9);
+    }
+
+    #[test]
+    fn job_lifecycle_is_namespaced_by_provider() {
+        let mut state = SupervisorState::new();
+        state.job_started("github", "42", "ci");
+        state.job_started("gitlab", "42", "test");
+        assert_eq!(state.in_flight_jobs().len(), 2);
+        // Finishing one forge's job keeps the other's record.
+        state.job_finished("gitlab", "42");
+        let jobs = state.in_flight_jobs();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].provider, "github");
+        // Wrong-forge finish is a no-op.
+        state.job_finished("bitbucket", "42");
+        assert_eq!(state.in_flight_jobs().len(), 1);
+        state.job_finished("github", "42");
+        assert!(state.in_flight_jobs().is_empty());
+    }
+
+    #[test]
+    fn slot_reservation_is_bounded_and_releasable() {
+        let mut state = SupervisorState::new();
+        state.last_slots = 2;
+        assert!(state.try_reserve_slot());
+        assert!(state.try_reserve_slot());
+        assert!(!state.try_reserve_slot());
+        assert_eq!(state.in_flight(), 2);
+        state.release_slot_reservation();
+        assert!(state.try_reserve_slot());
+        // Release saturates at zero instead of underflowing.
+        state.in_flight_dec();
+        state.in_flight_dec();
+        state.in_flight_dec();
+        state.release_slot_reservation();
+        assert_eq!(state.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_reservation_yields_exactly_last_slots_winners() {
+        let state = new_shared_state();
+        state.write().await.last_slots = 3;
+        let mut handles = Vec::new();
+        for _ in 0..12 {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                state.write().await.try_reserve_slot()
+            }));
+        }
+        let mut wins = 0;
+        for handle in handles {
+            if handle.await.unwrap() {
+                wins += 1;
+            }
+        }
+        assert_eq!(wins, 3);
+        assert_eq!(state.read().await.in_flight(), 3);
+    }
+
+    #[test]
+    fn forge_health_records_polls_and_errors() {
+        let mut state = SupervisorState::new();
+        assert!(state.forge_health().is_empty());
+        state.record_forge_poll("gitlab", 2, None);
+        state.record_forge_poll("github", 0, Some("HTTP 403".to_string()));
+        let health = state.forge_health();
+        assert_eq!(health["gitlab"].queue_depth, 2);
+        assert!(health["gitlab"].last_error.is_none());
+        assert!(health["gitlab"].last_poll_unix_ms > 0);
+        assert_eq!(health["github"].last_error.as_deref(), Some("HTTP 403"));
+        // Success clears the previous error.
+        state.record_forge_poll("github", 1, None);
+        assert!(state.forge_health()["github"].last_error.is_none());
     }
 
     #[test]

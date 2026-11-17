@@ -3,10 +3,13 @@
 //! Shared by `runner status`, the MCP `get_ci_status` tool, and the IPC
 //! `status` method so all three report identical shapes.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use crate::governor::cgroup::CgroupSlice;
 use crate::governor::psi::{read_snapshot, PressureLevel};
+use crate::governor::supervisor::{ForgeHealth, SupervisorState};
 use crate::governor::topology::{default_reserved_cores, detect_slots, CpuTopology};
 
 #[derive(Debug, Serialize)]
@@ -19,6 +22,9 @@ pub struct StatusReport {
     pub mesh_nodes: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub governor_error: Option<String>,
+    /// Per-forge poll health; present only when built with daemon state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub forges: Option<BTreeMap<String, ForgeHealth>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,6 +52,15 @@ pub struct ConcurrencyStatus {
     pub active_slots: u32,
     pub queued_github_jobs: u32,
     pub afk_boost: bool,
+}
+
+/// Build a live status report from kernel interfaces, enriched with
+/// daemon state (per-forge health). Never fails: read errors are
+/// captured in `governor_error` with safe fallbacks.
+pub fn status_report_with_state(state: &SupervisorState) -> StatusReport {
+    let mut report = status_report();
+    report.forges = Some(state.forge_health());
+    report
 }
 
 /// Build a live status report from kernel interfaces. Never fails: read
@@ -102,5 +117,6 @@ pub fn status_report() -> StatusReport {
         active_jobs: Vec::new(),
         mesh_nodes: Vec::new(),
         governor_error,
+        forges: None,
     }
 }

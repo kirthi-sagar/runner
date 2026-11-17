@@ -1,0 +1,23 @@
+# Starter config: Bitbucket Pipelines runner.
+#
+# Copy to ~/.config/runner/config.toml (0600), set enabled = true, fill in
+# workspace coordinates, then:
+#   runner auth bitbucket --client-id <id> --client-secret <sec>
+#   systemctl --user restart runner
+#
+# The daemon polls the runner step queue via OAuth, checks out the repo
+# default branch, executes steps sandboxed, and streams logs + status.
+
+[bitbucket]
+enabled = false
+workspace = ""
+repo_slug = ""
+runner_uuid = ""
+# oauth_client_id = "..."      # prefer RUNNER_BITBUCKET_CLIENT_ID
+# oauth_client_secret = "..."  # prefer RUNNER_BITBUCKET_CLIENT_SECRET
+poll_secs = 10
+labels = ["zero-freeze", "linux", "runner"]
+
+[coordinator]
+# Shared kill ceiling also applies to Bitbucket steps.
+job_timeout_mins = 60

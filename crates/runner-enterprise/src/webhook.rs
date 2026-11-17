@@ -127,7 +127,7 @@ async fn webhook(
     };
     if is_dispatch_event(&headers, &payload) {
         eprintln!("runner: webhook dispatch event: waking coordinator");
-        state.notify.notify_one();
+        state.notify.notify_waiters();
         (StatusCode::ACCEPTED, "dispatch woken").into_response()
     } else {
         (StatusCode::OK, "ignored").into_response()

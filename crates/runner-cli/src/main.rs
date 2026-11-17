@@ -978,7 +978,15 @@ async fn main() -> Result<()> {
         Commands::Status { format } => {
             let report = status_report();
             if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                // Prefer the daemon's state-enriched report (per-forge
+                // health included); fall back to a local kernel read.
+                let sock_path = resolve_sock_path();
+                match ipc_call(&sock_path, "status").await {
+                    Ok(resp) if resp.get("result").is_some() => {
+                        println!("{}", serde_json::to_string_pretty(&resp["result"])?);
+                    }
+                    _ => println!("{}", serde_json::to_string_pretty(&report)?),
+                }
             } else {
                 println!(
                     "runner {} | cores {}/{} | mem {}MB avail | cpu PSI {:.2}% ({:?}) | slots {} | weight {:?}",

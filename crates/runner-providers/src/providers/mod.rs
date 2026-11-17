@@ -1,10 +1,10 @@
 //! Universal CI provider abstraction.
 //!
-//! Every CI source (GitHub Actions today; GitLab, Bitbucket, local
-//! tomorrow) implements [`ProviderAdapter`]. The coordinator polls all
-//! registered providers and routes each job to local, peer, or cloud
-//! capacity. Provider-specific protocols live in submodules; everything
-//! downstream (sandboxing, governance, fleet state) is provider-agnostic.
+//! Every CI source (GitHub, GitLab, Bitbucket, local) implements
+//! [`ProviderAdapter`]. The daemon runs one coordinator loop per enabled
+//! forge; each loop polls, claims, sandbox-executes, and completes jobs
+//! through its submodule. Everything downstream (sandboxing, governance,
+//! fleet state) is provider-agnostic.
 
 pub mod bitbucket;
 pub mod github;
@@ -132,7 +132,44 @@ impl ProviderRegistry {
                 enabled: p.is_enabled(),
             })
     }
+}
 
+/// Single-quote a shell word (`'` → `'"'"'`), safe for `sh -c`.
+pub fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\"'\"'"))
+}
+
+/// Shallow-clone prefix prepended to forge scripts so jobs execute
+/// against a real checkout in the sandbox workspace cwd. The URL
+/// carries `{user}:{token}@` credentials; `git_ref` selects `--branch`
+/// (None = remote default branch). Clone failure aborts the script
+/// chain, streams stderr, and fails the job through the normal path.
+pub fn checkout_prefix(
+    repo_url: &str,
+    git_ref: Option<&str>,
+    user: &str,
+    token: &str,
+) -> Option<String> {
+    let authed = authed_clone_url(repo_url, user, token)?;
+    let mut clone = "git clone --depth 1".to_string();
+    if let Some(git_ref) = git_ref.filter(|r| !r.trim().is_empty()) {
+        clone.push_str(&format!(" --branch {}", shell_quote(git_ref)));
+    }
+    clone.push_str(&format!(" {} . &&\n", shell_quote(&authed)));
+    Some(clone)
+}
+
+/// Inject `{user}:{token}@` credentials into an https clone URL.
+/// Returns `None` for non-https URLs (never downgrade transports).
+fn authed_clone_url(repo_url: &str, user: &str, token: &str) -> Option<String> {
+    let rest = repo_url.strip_prefix("https://")?;
+    if user.trim().is_empty() || token.trim().is_empty() {
+        return None;
+    }
+    Some(format!("https://{user}:{token}@{rest}"))
+}
+
+impl ProviderRegistry {
     /// Poll every enabled provider, concatenating queued jobs.
     /// A failing provider is skipped (error logged) so one outage never
     /// stalls the whole mesh. The read lock is shared, so concurrent polls
@@ -195,6 +232,36 @@ mod tests {
         async fn complete_job(&self, _job_id: &str, _success: bool) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn checkout_prefix_quotes_and_gates_transports() {
+        // GitLab form with branch + token auth.
+        let prefix = checkout_prefix(
+            "https://gitlab.example.com/g/p.git",
+            Some("main"),
+            "gitlab-ci-token",
+            "JT",
+        )
+        .unwrap();
+        assert_eq!(
+            prefix,
+            "git clone --depth 1 --branch 'main' \
+             'https://gitlab-ci-token:JT@gitlab.example.com/g/p.git' . &&\n"
+        );
+        // Hostile ref cannot break out of quoting.
+        let hostile = checkout_prefix("https://h/r.git", Some("x'; rm -rf /"), "u", "t").unwrap();
+        assert!(hostile.contains("'x'\"'\"'; rm -rf /'"));
+        // Missing ref clones the remote default branch.
+        let bare =
+            checkout_prefix("https://bitbucket.org/w/r.git", None, "x-token-auth", "tok").unwrap();
+        assert!(!bare.contains("--branch"));
+        assert!(bare.contains("'https://x-token-auth:tok@bitbucket.org/w/r.git'"));
+        // Non-https transports and empty credentials refuse.
+        assert!(checkout_prefix("http://h/r.git", Some("m"), "u", "t").is_none());
+        assert!(checkout_prefix("git@h:r.git", Some("m"), "u", "t").is_none());
+        assert!(checkout_prefix("https://h/r.git", Some("m"), "u", "").is_none());
+        assert_eq!(shell_quote("plain"), "'plain'");
     }
 
     #[tokio::test]

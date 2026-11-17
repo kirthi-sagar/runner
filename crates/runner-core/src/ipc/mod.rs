@@ -45,9 +45,13 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     match method {
         "ping" => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": "pong" }),
-        "status" => serde_json::json!({
-            "jsonrpc": "2.0", "id": id, "result": crate::status::status_report(),
-        }),
+        "status" => {
+            let guard = state.read().await;
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": crate::status::status_report_with_state(&guard),
+            })
+        }
         "peers" => {
             let guard = state.read().await;
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
@@ -73,7 +77,7 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
             } })
         }
         "poll_now" => {
-            state.read().await.wakeup().notify_one();
+            state.read().await.wakeup().notify_waiters();
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "notified": true } })
         }
         "cloud_list" => {

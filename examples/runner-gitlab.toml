@@ -1,0 +1,19 @@
+# Starter config: GitLab CI runner.
+#
+# Copy to ~/.config/runner/config.toml (0600), set enabled = true, then:
+#   runner auth gitlab --token glpat-...
+#   systemctl --user restart runner
+#
+# The daemon polls POST <url>/api/v4/jobs/request for jobs tagged below,
+# checks out the repo, executes scripts sandboxed, and streams traces.
+
+[gitlab]
+enabled = false
+url = "https://gitlab.com"
+# runner_token = "..."   # prefer RUNNER_GITLAB_TOKEN via `runner auth gitlab`
+poll_secs = 10
+tags = ["zero-freeze", "linux", "runner"]
+
+[coordinator]
+# Shared kill ceiling also applies to GitLab jobs.
+job_timeout_mins = 60

@@ -62,7 +62,7 @@ async fn consecutive_polls_dispatch_each_job_once() {
     // Same ids from another forge are different jobs.
     assert!(!already_in_flight(&flying, "gitlab", "7"));
     // Completion releases the id for future runs.
-    state.write().await.job_finished("7");
+    state.write().await.job_finished("github", "7");
     let flying = state.read().await.in_flight_jobs();
     assert!(!already_in_flight(&flying, "github", "7"));
     assert!(already_in_flight(&flying, "github", "8"));

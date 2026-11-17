@@ -325,8 +325,8 @@ impl BitbucketClient {
     }
 }
 
-/// Execute a claimed step: sandboxed `sh -c` run, chunked log upload,
-/// status report. Returns true on script success.
+/// Execute a claimed step: check out the repo, sandboxed `sh -c` run,
+/// chunked log upload, status report. Returns true on script success.
 pub async fn execute_step(
     client: &BitbucketClient,
     workspace: &str,
@@ -335,7 +335,17 @@ pub async fn execute_step(
     no_sandbox: bool,
     timeout: Duration,
 ) -> Result<bool> {
-    let script = step.script.join("\n");
+    // Steps carry no repo/ref: clone the default branch from the
+    // workspace coordinates with the OAuth bearer token.
+    let mut script = String::new();
+    if !workspace.trim().is_empty() && !repo_slug.trim().is_empty() {
+        let repo_url = format!("https://bitbucket.org/{workspace}/{repo_slug}.git");
+        let token = client.bearer_token().await?;
+        if let Some(prefix) = super::checkout_prefix(&repo_url, None, "x-token-auth", &token) {
+            script.push_str(&prefix);
+        }
+    }
+    script.push_str(&step.script.join("\n"));
     let output = super::local::execute_captured(
         &["sh".to_string(), "-c".to_string(), script],
         &step.env,
@@ -483,35 +493,39 @@ impl ProviderAdapter for BitbucketProvider {
     }
 }
 
-/// One daemon iteration: capacity → poll → dedup → dispatch.
+/// One daemon iteration: reserve → poll → dedup → dispatch.
 /// Returns the number of steps dispatched (0 or 1: each poll hands
 /// out a single queued step).
 ///
-/// Capacity is checked BEFORE polling so a claimed step is never
-/// abandoned for lack of a local slot.
+/// The slot is reserved BEFORE polling so a claimed step is never
+/// abandoned for lack of a local slot, and concurrent forge loops
+/// cannot over-dispatch a constrained host.
 pub async fn poll_bitbucket_once(
     provider: &Arc<BitbucketProvider>,
     state: &runner_core::governor::supervisor::SharedState,
     no_sandbox: bool,
     timeout: std::time::Duration,
 ) -> usize {
-    let free = {
-        let guard = state.read().await;
-        guard.last_slots.saturating_sub(guard.in_flight())
-    };
-    if free == 0 {
+    if !state.write().await.try_reserve_slot() {
         return 0;
     }
     let jobs = match provider.poll_pending_jobs().await {
         Ok(jobs) => jobs,
         Err(e) => {
             eprintln!("runner: bitbucket poll failed: {e:#}");
+            let mut guard = state.write().await;
+            guard.record_forge_poll("bitbucket", 0, Some(format!("{e:#}")));
+            guard.release_slot_reservation();
             return 0;
         }
     };
     let Some(job) = jobs.into_iter().next() else {
+        let mut guard = state.write().await;
+        guard.record_forge_poll("bitbucket", 0, None);
+        guard.release_slot_reservation();
         return 0;
     };
+    state.write().await.record_forge_poll("bitbucket", 1, None);
     let flying = state.read().await.in_flight_jobs();
     if crate::github::webhooks::already_in_flight(&flying, "bitbucket", &job.id) {
         // Drop the duplicate claim; the original execution owns
@@ -521,23 +535,26 @@ pub async fn poll_bitbucket_once(
             "runner: bitbucket step {} already in flight; skipping",
             job.id
         );
+        state.write().await.release_slot_reservation();
         return 0;
     }
     let claimed = provider.pending.lock().await.take();
     let Some(claimed) = claimed else {
+        state.write().await.release_slot_reservation();
         return 0;
     };
     if claimed.step_uuid != job.id {
         // Impossible in the sequential loop (poll sets pending just
         // above); restore and bail rather than drop a live claim.
         *provider.pending.lock().await = Some(claimed);
+        state.write().await.release_slot_reservation();
         return 0;
     }
-    {
-        let mut guard = state.write().await;
-        guard.in_flight_inc();
-        guard.job_started("bitbucket", &job.id, &job.name);
-    }
+    // The reservation converts into this step's slot (no second inc).
+    state
+        .write()
+        .await
+        .job_started("bitbucket", &job.id, &job.name);
     let provider = Arc::clone(provider);
     let state = state.clone();
     let job_id = job.id.clone();
@@ -548,7 +565,7 @@ pub async fn poll_bitbucket_once(
             eprintln!("runner: bitbucket provider disabled mid-flight; dropping step {job_id}");
             let mut guard = state.write().await;
             guard.in_flight_dec();
-            guard.job_finished(&job_id);
+            guard.job_finished("bitbucket", &job_id);
             return;
         };
         match execute_step(
@@ -562,7 +579,7 @@ pub async fn poll_bitbucket_once(
         }
         let mut guard = state.write().await;
         guard.in_flight_dec();
-        guard.job_finished(&job_id);
+        guard.job_finished("bitbucket", &job_id);
     });
     1
 }

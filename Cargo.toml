@@ -3,7 +3,7 @@ resolver = "2"
 members = [".", "crates/*"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 
@@ -28,12 +28,12 @@ async-trait = "0.1"
 axum = { version = "0.7", default-features = false, features = ["tokio", "json", "query", "http1"] }
 jsonwebtoken = "9"
 libc = "0.2"
-runner-core = { path = "crates/runner-core", version = "0.5.0" }
-runner-sandbox = { path = "crates/runner-sandbox", version = "0.5.0" }
-runner-providers = { path = "crates/runner-providers", version = "0.5.0" }
-runner-telemetry = { path = "crates/runner-telemetry", version = "0.5.0" }
-runner-enterprise = { path = "crates/runner-enterprise", version = "0.5.0" }
-runner-cli = { path = "crates/runner-cli", version = "0.5.0" }
+runner-core = { path = "crates/runner-core", version = "0.5.1" }
+runner-sandbox = { path = "crates/runner-sandbox", version = "0.5.1" }
+runner-providers = { path = "crates/runner-providers", version = "0.5.1" }
+runner-telemetry = { path = "crates/runner-telemetry", version = "0.5.1" }
+runner-enterprise = { path = "crates/runner-enterprise", version = "0.5.1" }
+runner-cli = { path = "crates/runner-cli", version = "0.5.1" }
 
 [package]
 name = "runner"

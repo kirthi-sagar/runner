@@ -6,7 +6,12 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
-## Unreleased (v0.5.0)
+## v0.5.1 — 2026-11-17
+
+- Fixed `get_cache_stats` MCP tool returning `{"enabled": false}` by routing queries through daemon IPC.
+- Hardened doctor TCP port reachability test against ephemeral port reuse races.
+
+## v0.5.0 — 2026-11-17
 
 - Transparent LAN cache proxy: daemon-embedded `ACTIONS_CACHE_URL`
   server speaking the Actions Cache protocol (lookup with

@@ -7,12 +7,18 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::config::{default_env_path, GITHUB_TOKEN_ENV};
+use crate::config::{
+    default_env_path, BITBUCKET_CLIENT_ID_ENV, BITBUCKET_CLIENT_SECRET_ENV, GITHUB_TOKEN_ENV,
+    GITLAB_TOKEN_ENV,
+};
 
 /// Credential slot for one provider's token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderSlot {
     Github,
+    Gitlab,
+    BitbucketClientId,
+    BitbucketClientSecret,
 }
 
 impl ProviderSlot {
@@ -20,12 +26,18 @@ impl ProviderSlot {
     pub fn env_var(&self) -> &'static str {
         match self {
             Self::Github => GITHUB_TOKEN_ENV,
+            Self::Gitlab => GITLAB_TOKEN_ENV,
+            Self::BitbucketClientId => BITBUCKET_CLIENT_ID_ENV,
+            Self::BitbucketClientSecret => BITBUCKET_CLIENT_SECRET_ENV,
         }
     }
 
     pub fn name(&self) -> &'static str {
         match self {
             Self::Github => "github",
+            Self::Gitlab => "gitlab",
+            Self::BitbucketClientId => "bitbucket-client-id",
+            Self::BitbucketClientSecret => "bitbucket-client-secret",
         }
     }
 }
@@ -152,5 +164,26 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("RUNNER_GITHUB_TOKEN=").count(), 1);
         assert!(text.contains("ghp_next"));
+    }
+
+    #[test]
+    fn multiforge_slots_round_trip() {
+        let dir = crate::test_support::TempDir::new("auth-multi").unwrap();
+        let store = TokenStore::new(dir.path().join("env"));
+        store.set_token(ProviderSlot::Gitlab, "glpat_x").unwrap();
+        store
+            .set_token(ProviderSlot::BitbucketClientId, "bb-id")
+            .unwrap();
+        store
+            .set_token(ProviderSlot::BitbucketClientSecret, "bb-secret")
+            .unwrap();
+        assert!(store.has_token(ProviderSlot::Gitlab));
+        assert!(store.has_token(ProviderSlot::BitbucketClientId));
+        assert!(store.has_token(ProviderSlot::BitbucketClientSecret));
+        assert!(!store.has_token(ProviderSlot::Github));
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(text.contains("RUNNER_GITLAB_TOKEN=glpat_x"));
+        assert!(text.contains("RUNNER_BITBUCKET_CLIENT_ID=bb-id"));
+        assert!(text.contains("RUNNER_BITBUCKET_CLIENT_SECRET=bb-secret"));
     }
 }

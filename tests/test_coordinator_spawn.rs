@@ -48,7 +48,7 @@ async fn consecutive_polls_dispatch_each_job_once() {
     // Poll 1 observes jobs 7 and 8; both dispatch and get recorded.
     for (id, name) in [(7u64, "a"), (8u64, "b")] {
         let flying = state.read().await.in_flight_jobs();
-        assert!(!already_in_flight(&flying, id));
+        assert!(!already_in_flight(&flying, "github", &id.to_string()));
         state
             .write()
             .await
@@ -56,12 +56,14 @@ async fn consecutive_polls_dispatch_each_job_once() {
     }
     // Poll 2 observes the same queued ids: all skip, zero re-dispatch.
     let flying = state.read().await.in_flight_jobs();
-    assert!(already_in_flight(&flying, 7));
-    assert!(already_in_flight(&flying, 8));
+    assert!(already_in_flight(&flying, "github", "7"));
+    assert!(already_in_flight(&flying, "github", "8"));
     assert_eq!(flying.len(), 2);
+    // Same ids from another forge are different jobs.
+    assert!(!already_in_flight(&flying, "gitlab", "7"));
     // Completion releases the id for future runs.
     state.write().await.job_finished("7");
     let flying = state.read().await.in_flight_jobs();
-    assert!(!already_in_flight(&flying, 7));
-    assert!(already_in_flight(&flying, 8));
+    assert!(!already_in_flight(&flying, "github", "7"));
+    assert!(already_in_flight(&flying, "github", "8"));
 }

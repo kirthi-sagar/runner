@@ -190,14 +190,18 @@ pub fn route_job(
 
 /// True when the queued job is already tracked as in flight (a prior
 /// poll dispatched it locally or provisioned a cloud node for it).
-/// The coordinator skips such jobs so each unique job dispatches
-/// exactly once no matter how many polls observe it queued.
+/// Namespaced by provider so identical job IDs from different forges
+/// (GitHub `42` vs GitLab `42`) never collide. The coordinator skips
+/// such jobs so each unique job dispatches exactly once no matter how
+/// many polls observe it queued.
 pub fn already_in_flight(
     in_flight: &[runner_core::governor::supervisor::InFlightJob],
-    job_id: u64,
+    provider: &str,
+    job_id: &str,
 ) -> bool {
-    let id = job_id.to_string();
-    in_flight.iter().any(|j| j.id == id)
+    in_flight
+        .iter()
+        .any(|j| j.provider == provider && j.id == job_id)
 }
 
 /// JIT issuance scope for local dispatches.
@@ -386,7 +390,7 @@ pub async fn run_coordinator(
                     guard.in_flight_jobs(),
                 )
             };
-            if already_in_flight(&flying, job.id) {
+            if already_in_flight(&flying, "github", &job.id.to_string()) {
                 eprintln!(
                     "runner: job {} ({}) already in flight; skipping re-dispatch",
                     job.id, job.name
@@ -692,14 +696,16 @@ mod tests {
         use runner_core::governor::supervisor::SupervisorState;
         // Poll 1 observes the job, dispatches, and records it.
         let mut state = SupervisorState::default();
-        assert!(!already_in_flight(&state.in_flight_jobs(), 42));
+        assert!(!already_in_flight(&state.in_flight_jobs(), "github", "42"));
         state.job_started("github", "42", "ci");
         // Poll 2 observes the same queued job id: skip, no re-dispatch.
-        assert!(already_in_flight(&state.in_flight_jobs(), 42));
+        assert!(already_in_flight(&state.in_flight_jobs(), "github", "42"));
         // A different job still dispatches.
-        assert!(!already_in_flight(&state.in_flight_jobs(), 43));
+        assert!(!already_in_flight(&state.in_flight_jobs(), "github", "43"));
+        // Same numeric id from another forge is a different job.
+        assert!(!already_in_flight(&state.in_flight_jobs(), "gitlab", "42"));
         // Completion releases the id for future runs.
         state.job_finished("42");
-        assert!(!already_in_flight(&state.in_flight_jobs(), 42));
+        assert!(!already_in_flight(&state.in_flight_jobs(), "github", "42"));
     }
 }

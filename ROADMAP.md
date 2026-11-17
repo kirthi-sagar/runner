@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.4.1 and prior)
+## Shipped (v0.4.2 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 11 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,9 +14,15 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 
-## Current: v0.4.2 Stability & In-Flight Dedup
+## Current: v0.4.3 Multi-Forge Daemon Wiring
 
-- Fix coordinator startup abort with cloud bursting enabled.
+- GitLab CI + Bitbucket Pipelines coordinator loops.
+- Provider-namespaced in-flight deduplication.
+- `runner auth` credentials for all forges.
+
+## Shipped in v0.4.2: Stability & In-Flight Dedup
+
+- Fixed coordinator startup abort with cloud bursting enabled.
 - In-flight job deduplication across poll ticks.
 - Dynamic cloud provider resolution (DigitalOcean / Render).
 - Documentation synchronized with the shipped product.

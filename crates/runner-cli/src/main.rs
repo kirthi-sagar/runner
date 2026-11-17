@@ -217,6 +217,21 @@ enum AuthCommands {
         #[arg(long)]
         token: Option<String>,
     },
+    /// Store the GitLab runner token (prompts when --token is omitted)
+    Gitlab {
+        /// Token value (prefer piping; never pass via shared shell history on multi-user hosts)
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Store Bitbucket OAuth credentials (prompts for omitted values)
+    Bitbucket {
+        /// OAuth client id
+        #[arg(long)]
+        client_id: Option<String>,
+        /// OAuth client secret
+        #[arg(long)]
+        client_secret: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -575,6 +590,58 @@ fn cmd_auth_github(token: Option<String>) -> Result<()> {
     let path = store.set_token(ProviderSlot::Github, token.trim())?;
     println!(
         "github token stored in {} (0600); restart the daemon to apply",
+        path.display()
+    );
+    Ok(())
+}
+
+fn prompt_secret(label: &str) -> Result<String> {
+    eprint!("{label}: ");
+    use std::io::Write;
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+fn cmd_auth_gitlab(token: Option<String>) -> Result<()> {
+    use runner_core::auth::{ProviderSlot, TokenStore};
+
+    let token = match token {
+        Some(value) => value,
+        None => prompt_secret("GitLab runner token")?,
+    };
+    if token.trim().is_empty() {
+        anyhow::bail!("no token provided; aborting (nothing written)");
+    }
+    let store = TokenStore::default_store().context("no HOME for secrets file")?;
+    let path = store.set_token(ProviderSlot::Gitlab, token.trim())?;
+    println!(
+        "gitlab token stored in {} (0600); restart the daemon to apply",
+        path.display()
+    );
+    Ok(())
+}
+
+fn cmd_auth_bitbucket(client_id: Option<String>, client_secret: Option<String>) -> Result<()> {
+    use runner_core::auth::{ProviderSlot, TokenStore};
+
+    let client_id = match client_id {
+        Some(value) => value,
+        None => prompt_secret("Bitbucket OAuth client id")?,
+    };
+    let client_secret = match client_secret {
+        Some(value) => value,
+        None => prompt_secret("Bitbucket OAuth client secret")?,
+    };
+    if client_id.trim().is_empty() || client_secret.trim().is_empty() {
+        anyhow::bail!("client id and secret are both required; aborting (nothing written)");
+    }
+    let store = TokenStore::default_store().context("no HOME for secrets file")?;
+    store.set_token(ProviderSlot::BitbucketClientId, client_id.trim())?;
+    let path = store.set_token(ProviderSlot::BitbucketClientSecret, client_secret.trim())?;
+    println!(
+        "bitbucket credentials stored in {} (0600); restart the daemon to apply",
         path.display()
     );
     Ok(())
@@ -1000,6 +1067,11 @@ async fn main() -> Result<()> {
         },
         Commands::Auth { command } => match command {
             AuthCommands::Github { token } => cmd_auth_github(token)?,
+            AuthCommands::Gitlab { token } => cmd_auth_gitlab(token)?,
+            AuthCommands::Bitbucket {
+                client_id,
+                client_secret,
+            } => cmd_auth_bitbucket(client_id, client_secret)?,
         },
         Commands::Audit { command } => match command {
             AuditCommands::Verify { file } => cmd_audit_verify(file)?,

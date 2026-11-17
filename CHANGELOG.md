@@ -6,7 +6,16 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
-## Unreleased (v0.4.2)
+## Unreleased (v0.4.3)
+
+- Multi-forge daemon wiring: the coordinator supervises GitLab CI
+  and Bitbucket Pipelines (poll → claim → sandbox-execute → stream
+  logs → report) alongside GitHub, with per-forge loops, capacity-
+  first polling, and provider-namespaced in-flight dedup.
+- `runner auth gitlab` / `runner auth bitbucket` credential
+  management (0600 env file) with config environment overlay.
+
+## v0.4.2 — 2026-11-17
 
 - Fixed fatal daemon abort on startup whenever cloud bursting was
   enabled (`blocking_write` inside the tokio runtime; the

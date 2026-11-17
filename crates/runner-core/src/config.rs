@@ -226,12 +226,32 @@ impl Default for BitbucketConfig {
 
 /// Env var carrying the GitHub token (`administration:write` for JIT).
 pub const GITHUB_TOKEN_ENV: &str = "RUNNER_GITHUB_TOKEN";
+pub const GITLAB_TOKEN_ENV: &str = "RUNNER_GITLAB_TOKEN";
+pub const BITBUCKET_CLIENT_ID_ENV: &str = "RUNNER_BITBUCKET_CLIENT_ID";
+pub const BITBUCKET_CLIENT_SECRET_ENV: &str = "RUNNER_BITBUCKET_CLIENT_SECRET";
 
 /// Read the GitHub token from the environment (never stored in config).
 pub fn github_token_from_env() -> Option<String> {
-    std::env::var(GITHUB_TOKEN_ENV)
-        .ok()
-        .filter(|t| !t.trim().is_empty())
+    token_from_env(GITHUB_TOKEN_ENV)
+}
+
+/// Read the GitLab runner token from the environment.
+pub fn gitlab_token_from_env() -> Option<String> {
+    token_from_env(GITLAB_TOKEN_ENV)
+}
+
+/// Read the Bitbucket OAuth client id from the environment.
+pub fn bitbucket_client_id_from_env() -> Option<String> {
+    token_from_env(BITBUCKET_CLIENT_ID_ENV)
+}
+
+/// Read the Bitbucket OAuth client secret from the environment.
+pub fn bitbucket_client_secret_from_env() -> Option<String> {
+    token_from_env(BITBUCKET_CLIENT_SECRET_ENV)
+}
+
+fn token_from_env(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|t| !t.trim().is_empty())
 }
 
 /// Default environment file path (`~/.config/runner/env`).
@@ -587,6 +607,24 @@ impl RunnerConfig {
                     }
                 }
                 Err(e) => eprintln!("runner: ignoring {} ({e})", path.display()),
+            }
+        }
+        // Secrets overlay: environment (populated from the 0600 env file
+        // by the daemon, or `runner auth`) fills blank token fields.
+        // File values win; `Default()` stays pure for hermetic tests.
+        if config.gitlab.runner_token.trim().is_empty() {
+            if let Some(token) = gitlab_token_from_env() {
+                config.gitlab.runner_token = token;
+            }
+        }
+        if config.bitbucket.oauth_client_id.trim().is_empty() {
+            if let Some(id) = bitbucket_client_id_from_env() {
+                config.bitbucket.oauth_client_id = id;
+            }
+        }
+        if config.bitbucket.oauth_client_secret.trim().is_empty() {
+            if let Some(secret) = bitbucket_client_secret_from_env() {
+                config.bitbucket.oauth_client_secret = secret;
             }
         }
         config

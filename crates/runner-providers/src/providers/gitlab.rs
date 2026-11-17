@@ -5,6 +5,8 @@
 //! upload, `PUT ...` for completion. Claimed scripts execute through the
 //! same zero-freeze sandbox as every other provider.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -354,6 +356,103 @@ impl ProviderAdapter for GitlabProvider {
             }
             None => anyhow::bail!("gitlab provider not configured"),
         }
+    }
+}
+
+/// One daemon iteration: capacity → poll → dedup → dispatch.
+/// Returns the number of jobs dispatched (0 or 1: each request hands
+/// out a single claimed job).
+///
+/// Capacity is checked BEFORE polling: GitLab claims server-side at
+/// request time, so polling while full would abandon claimed jobs.
+pub async fn poll_gitlab_once(
+    provider: &Arc<GitlabProvider>,
+    state: &runner_core::governor::supervisor::SharedState,
+    no_sandbox: bool,
+    timeout: std::time::Duration,
+) -> usize {
+    let free = {
+        let guard = state.read().await;
+        guard.last_slots.saturating_sub(guard.in_flight())
+    };
+    if free == 0 {
+        return 0;
+    }
+    let jobs = match provider.poll_pending_jobs().await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            eprintln!("runner: gitlab poll failed: {e:#}");
+            return 0;
+        }
+    };
+    let Some(job) = jobs.into_iter().next() else {
+        return 0;
+    };
+    let flying = state.read().await.in_flight_jobs();
+    if crate::github::webhooks::already_in_flight(&flying, "gitlab", &job.id) {
+        // Drop the duplicate server-side claim; the original execution
+        // owns completion reporting.
+        provider.pending.lock().await.take();
+        eprintln!("runner: gitlab job {} already in flight; skipping", job.id);
+        return 0;
+    }
+    let claimed = provider.pending.lock().await.take();
+    let Some(claimed) = claimed else {
+        return 0;
+    };
+    if claimed.id.to_string() != job.id {
+        // Impossible in the sequential loop (poll sets pending just
+        // above); restore and bail rather than drop a live claim.
+        *provider.pending.lock().await = Some(claimed);
+        return 0;
+    }
+    {
+        let mut guard = state.write().await;
+        guard.in_flight_inc();
+        guard.job_started("gitlab", &job.id, &job.name);
+    }
+    let provider = Arc::clone(provider);
+    let state = state.clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        let Some(client) = provider.client.as_ref() else {
+            eprintln!("runner: gitlab provider disabled mid-flight; dropping job {job_id}");
+            let mut guard = state.write().await;
+            guard.in_flight_dec();
+            guard.job_finished(&job_id);
+            return;
+        };
+        match execute_job(client, &claimed, no_sandbox, timeout).await {
+            Ok(true) => eprintln!("runner: gitlab job {job_id} succeeded"),
+            Ok(false) => eprintln!("runner: gitlab job {job_id} failed"),
+            Err(e) => eprintln!("runner: gitlab job {job_id} error: {e:#}"),
+        }
+        let mut guard = state.write().await;
+        guard.in_flight_dec();
+        guard.job_finished(&job_id);
+    });
+    1
+}
+
+/// GitLab CI daemon loop: poll on `interval` (or webhook wakeup) and
+/// dispatch claimed jobs until shutdown. Mirrors `run_coordinator`.
+pub async fn run_gitlab_loop(
+    provider: Arc<GitlabProvider>,
+    state: runner_core::governor::supervisor::SharedState,
+    interval: std::time::Duration,
+    no_sandbox: bool,
+    timeout: std::time::Duration,
+) {
+    let wakeup = state.read().await.wakeup();
+    eprintln!("runner: gitlab coordinator polling every {interval:?} (webhook wakeups armed)");
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {},
+            _ = wakeup.notified() => {
+                eprintln!("runner: webhook wakeup: polling gitlab immediately");
+            }
+        }
+        poll_gitlab_once(&provider, &state, no_sandbox, timeout).await;
     }
 }
 

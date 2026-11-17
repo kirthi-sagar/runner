@@ -4,6 +4,7 @@
 //! runner step queue, executes claimed steps in the zero-freeze sandbox,
 //! and streams logs + completion status back to Bitbucket.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -162,6 +163,7 @@ pub struct BitbucketClient {
     oauth_client_id: String,
     oauth_client_secret: String,
     token_url: String,
+    api_base: String,
     http: reqwest::Client,
     cached: tokio::sync::Mutex<Option<(String, Instant)>>,
 }
@@ -172,6 +174,7 @@ impl BitbucketClient {
             oauth_client_id: oauth_client_id.into(),
             oauth_client_secret: oauth_client_secret.into(),
             token_url: OAUTH_TOKEN_URL.to_string(),
+            api_base: API_BASE.to_string(),
             http: reqwest::Client::new(),
             cached: tokio::sync::Mutex::new(None),
         }
@@ -181,6 +184,33 @@ impl BitbucketClient {
     pub fn with_token_url(mut self, token_url: impl Into<String>) -> Self {
         self.token_url = token_url.into();
         self
+    }
+
+    /// Point steps/log/status calls at a custom API base (tests).
+    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into();
+        self
+    }
+
+    fn steps_endpoint(&self, workspace: &str, repo_slug: &str, runner_uuid: &str) -> String {
+        format!(
+            "{}/repositories/{workspace}/{repo_slug}/pipelines-config/runners/{runner_uuid}/steps",
+            self.api_base
+        )
+    }
+
+    fn log_endpoint(&self, workspace: &str, repo_slug: &str, step_uuid: &str) -> String {
+        format!(
+            "{}/repositories/{workspace}/{repo_slug}/pipelines/steps/{step_uuid}/log",
+            self.api_base
+        )
+    }
+
+    fn status_endpoint(&self, workspace: &str, repo_slug: &str, step_uuid: &str) -> String {
+        format!(
+            "{}/repositories/{workspace}/{repo_slug}/pipelines/steps/{step_uuid}/status",
+            self.api_base
+        )
     }
 
     /// Validate credentials by performing the client-credentials grant.
@@ -230,7 +260,7 @@ impl BitbucketClient {
         let token = self.bearer_token().await?;
         let res = self
             .http
-            .get(steps_url(workspace, repo_slug, runner_uuid))
+            .get(self.steps_endpoint(workspace, repo_slug, runner_uuid))
             .bearer_auth(token)
             .send()
             .await
@@ -259,7 +289,7 @@ impl BitbucketClient {
         let token = self.bearer_token().await?;
         let res = self
             .http
-            .post(step_log_url(workspace, repo_slug, step_uuid))
+            .post(self.log_endpoint(workspace, repo_slug, step_uuid))
             .bearer_auth(token)
             .body(log_chunk.to_vec())
             .send()
@@ -282,7 +312,7 @@ impl BitbucketClient {
         let token = self.bearer_token().await?;
         let res = self
             .http
-            .put(step_status_url(workspace, repo_slug, step_uuid))
+            .put(self.status_endpoint(workspace, repo_slug, step_uuid))
             .bearer_auth(token)
             .json(&BitbucketStepStatus::completed(success))
             .send()
@@ -369,6 +399,20 @@ impl BitbucketProvider {
             pending: tokio::sync::Mutex::new(None),
         }
     }
+
+    /// Point OAuth + API at one loopback stub (tests): the token grant
+    /// goes to `{base}/site/oauth2/token`, API calls to `{base}/2.0`.
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        if let Some(client) = self.client.take() {
+            let base = base_url.trim_end_matches('/');
+            self.client = Some(
+                client
+                    .with_token_url(format!("{base}/site/oauth2/token"))
+                    .with_api_base(format!("{base}/2.0")),
+            );
+        }
+        self
+    }
 }
 
 #[async_trait::async_trait]
@@ -436,6 +480,112 @@ impl ProviderAdapter for BitbucketProvider {
             }
             None => anyhow::bail!("bitbucket provider not configured"),
         }
+    }
+}
+
+/// One daemon iteration: capacity → poll → dedup → dispatch.
+/// Returns the number of steps dispatched (0 or 1: each poll hands
+/// out a single queued step).
+///
+/// Capacity is checked BEFORE polling so a claimed step is never
+/// abandoned for lack of a local slot.
+pub async fn poll_bitbucket_once(
+    provider: &Arc<BitbucketProvider>,
+    state: &runner_core::governor::supervisor::SharedState,
+    no_sandbox: bool,
+    timeout: std::time::Duration,
+) -> usize {
+    let free = {
+        let guard = state.read().await;
+        guard.last_slots.saturating_sub(guard.in_flight())
+    };
+    if free == 0 {
+        return 0;
+    }
+    let jobs = match provider.poll_pending_jobs().await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            eprintln!("runner: bitbucket poll failed: {e:#}");
+            return 0;
+        }
+    };
+    let Some(job) = jobs.into_iter().next() else {
+        return 0;
+    };
+    let flying = state.read().await.in_flight_jobs();
+    if crate::github::webhooks::already_in_flight(&flying, "bitbucket", &job.id) {
+        // Drop the duplicate claim; the original execution owns
+        // completion reporting.
+        provider.pending.lock().await.take();
+        eprintln!(
+            "runner: bitbucket step {} already in flight; skipping",
+            job.id
+        );
+        return 0;
+    }
+    let claimed = provider.pending.lock().await.take();
+    let Some(claimed) = claimed else {
+        return 0;
+    };
+    if claimed.step_uuid != job.id {
+        // Impossible in the sequential loop (poll sets pending just
+        // above); restore and bail rather than drop a live claim.
+        *provider.pending.lock().await = Some(claimed);
+        return 0;
+    }
+    {
+        let mut guard = state.write().await;
+        guard.in_flight_inc();
+        guard.job_started("bitbucket", &job.id, &job.name);
+    }
+    let provider = Arc::clone(provider);
+    let state = state.clone();
+    let job_id = job.id.clone();
+    tokio::spawn(async move {
+        let workspace = provider.workspace.clone();
+        let repo_slug = provider.repo_slug.clone();
+        let Some(client) = provider.client.as_ref() else {
+            eprintln!("runner: bitbucket provider disabled mid-flight; dropping step {job_id}");
+            let mut guard = state.write().await;
+            guard.in_flight_dec();
+            guard.job_finished(&job_id);
+            return;
+        };
+        match execute_step(
+            client, &workspace, &repo_slug, &claimed, no_sandbox, timeout,
+        )
+        .await
+        {
+            Ok(true) => eprintln!("runner: bitbucket step {job_id} succeeded"),
+            Ok(false) => eprintln!("runner: bitbucket step {job_id} failed"),
+            Err(e) => eprintln!("runner: bitbucket step {job_id} error: {e:#}"),
+        }
+        let mut guard = state.write().await;
+        guard.in_flight_dec();
+        guard.job_finished(&job_id);
+    });
+    1
+}
+
+/// Bitbucket Pipelines daemon loop: poll on `interval` (or webhook
+/// wakeup) and dispatch claimed steps until shutdown.
+pub async fn run_bitbucket_loop(
+    provider: Arc<BitbucketProvider>,
+    state: runner_core::governor::supervisor::SharedState,
+    interval: std::time::Duration,
+    no_sandbox: bool,
+    timeout: std::time::Duration,
+) {
+    let wakeup = state.read().await.wakeup();
+    eprintln!("runner: bitbucket coordinator polling every {interval:?} (webhook wakeups armed)");
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {},
+            _ = wakeup.notified() => {
+                eprintln!("runner: webhook wakeup: polling bitbucket immediately");
+            }
+        }
+        poll_bitbucket_once(&provider, &state, no_sandbox, timeout).await;
     }
 }
 

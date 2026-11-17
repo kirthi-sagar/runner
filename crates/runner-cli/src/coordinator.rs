@@ -3,19 +3,27 @@
 //! Lives in the library (not `main.rs`) so integration tests can drive
 //! coordinator startup inside a tokio runtime.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use runner_core::config::{
     bitbucket_client_id_from_env, bitbucket_client_secret_from_env, github_token_from_env,
     gitlab_token_from_env, RunnerConfig,
 };
 use runner_core::governor::cgroup::CgroupSlice;
+use runner_core::governor::supervisor::SharedState;
 use runner_core::mesh::cloud::CloudPool;
 use runner_providers::github::client::GithubClient;
-use runner_providers::github::webhooks::{run_coordinator, DispatchContext, JitScope, QueuePoller};
+use runner_providers::github::webhooks::{
+    run_coordinator, run_watchdog_cycle, DispatchContext, JitScope, QueuePoller, WatchdogMap,
+};
 use runner_providers::providers::bitbucket::{run_bitbucket_loop, BitbucketProvider};
 use runner_providers::providers::gitlab::{run_gitlab_loop, GitlabProvider};
+
+/// Scale-to-zero cadence for the standalone watchdog (idle threshold
+/// is 300s, so 30s granularity loses nothing and halves API traffic).
+pub const WATCHDOG_INTERVAL_SECS: u64 = 30;
 
 /// CI forges the daemon can supervise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +91,51 @@ pub fn enabled_forges(config: &RunnerConfig, tokens: &ForgeTokens) -> Vec<Forge>
     forges
 }
 
+/// Startup reconciliation: discover live `runner-ci-*` nodes and track
+/// the unknown ones (launches ledger-recorded idempotently inside
+/// [`CloudPool::reconcile_active_nodes`]). Returns newly tracked nodes.
+/// Never fails the daemon: API errors log loudly and yield zero.
+pub async fn reconcile_into_state(pool: &CloudPool, state: &SharedState) -> usize {
+    let found = match pool.reconcile_active_nodes().await {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            eprintln!("runner: cloud reconcile failed ({e})");
+            return 0;
+        }
+    };
+    if found.is_empty() {
+        return 0;
+    }
+    let mut guard = state.write().await;
+    let known: Vec<String> = guard.cloud_nodes().iter().map(|n| n.id.clone()).collect();
+    let mut added = 0;
+    for node in found {
+        if known.contains(&node.id) {
+            continue;
+        }
+        eprintln!(
+            "runner: reconciled orphan cloud node {} [{}]",
+            node.id, node.provider
+        );
+        guard.add_cloud_node(node);
+        added += 1;
+    }
+    added
+}
+
+/// Standalone scale-to-zero watchdog: reconcile once at startup, then
+/// reap 5-minute-idle nodes every [`WATCHDOG_INTERVAL_SECS`]. Runs
+/// independently of every forge loop (and of forge outages).
+pub async fn spawn_cloud_watchdog(pool: CloudPool, state: SharedState) {
+    reconcile_into_state(&pool, &state).await;
+    let mut watchdogs: WatchdogMap = HashMap::new();
+    loop {
+        tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
+        let depth = state.read().await.queue_depth();
+        run_watchdog_cycle(&pool, &state, &mut watchdogs, Instant::now(), depth).await;
+    }
+}
+
 /// Spawn one coordinator task per enabled forge. Without any forge the
 /// daemon runs governor-only.
 ///
@@ -96,18 +149,21 @@ pub async fn spawn_coordinator(
 ) {
     let tokens = resolve_tokens(config);
     let forges = enabled_forges(config, &tokens);
-    if forges.is_empty() {
-        eprintln!("runner: no CI providers enabled; governor-only mode");
-        return;
-    }
     let cloud = (config.cloud.max_monthly_spend > 0.0).then(|| CloudPool::from_config(config));
     // Attach the pool to shared state so IPC-driven termination
-    // (`cloud_terminate`/`cloud_purge`) can reach the provider APIs.
+    // (`cloud_terminate`/`cloud_purge`) can reach the provider APIs,
+    // and start the watchdog regardless of forge enablement: orphans
+    // must reap even in governor-only mode or during forge outages.
     if let Some(pool) = cloud.clone() {
         state
             .write()
             .await
-            .set_cloud_pool(pool, config.cloud.max_monthly_spend);
+            .set_cloud_pool(pool.clone(), config.cloud.max_monthly_spend);
+        tokio::spawn(spawn_cloud_watchdog(pool, state.clone()));
+    }
+    if forges.is_empty() {
+        eprintln!("runner: no CI providers enabled; governor-only mode");
+        return;
     }
     let sandboxed = runner_sandbox::mounts::probe_userns();
     if !sandboxed {

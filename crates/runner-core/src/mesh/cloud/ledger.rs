@@ -77,6 +77,50 @@ pub fn year_month(epoch_secs: u64) -> (i32, u32) {
     (year as i32, month)
 }
 
+/// Days since the Unix epoch for a civil date (Hinnant's
+/// days-from-civil; inverse of [`year_month`]).
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year } as i64;
+    let era = year.div_euclid(400);
+    let year_of_era = (year - era * 400) as u64;
+    let month_prime = ((month as u64 + 9) % 12) as i64;
+    let day_of_year = (153 * month_prime + 2) / 5 + day as i64 - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year as u64;
+    era * 146_097 + day_of_era as i64 - 719_468
+}
+
+/// Parse a provider `created_at` timestamp (`YYYY-MM-DDTHH:MM:SSZ`,
+/// fractional seconds tolerated) into Unix epoch seconds. Returns
+/// `None` for anything else rather than guessing.
+pub fn parse_rfc3339_utc(text: &str) -> Option<u64> {
+    let text = text.strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let time = time.split('.').next()?;
+    let parse2 = |s: &str| s.parse::<u32>().ok().filter(|_| s.len() == 2);
+    let parse4 = |s: &str| s.parse::<i32>().ok().filter(|_| s.len() == 4);
+    let mut date = date.split('-');
+    let (year, month, day) = (
+        parse4(date.next()?)?,
+        parse2(date.next()?)?,
+        parse2(date.next()?)?,
+    );
+    if date.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut time = time.split(':');
+    let (hour, min, sec) = (
+        parse2(time.next()?)?,
+        parse2(time.next()?)?,
+        parse2(time.next()?)?,
+    );
+    if time.next().is_some() || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour as i64 * 3_600 + min as i64 * 60 + sec as i64;
+    u64::try_from(secs).ok()
+}
+
 /// Default ledger location (`~/.runner/spend_ledger.json`).
 pub fn default_ledger_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| {
@@ -197,6 +241,32 @@ mod tests {
         // Year boundary: 2025-12-31 23:59:59Z vs 2026-01-01.
         assert_eq!(year_month(1_767_225_599), (2025, 12));
         assert_eq!(year_month(1_767_225_600), (2026, 1));
+    }
+
+    #[test]
+    fn rfc3339_round_trips_known_dates() {
+        assert_eq!(parse_rfc3339_utc("2026-11-16T00:00:00Z"), Some(NOV_16));
+        assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z"), Some(0));
+        // Fractional seconds tolerated.
+        assert_eq!(
+            parse_rfc3339_utc("2026-11-16T00:00:00.123456Z"),
+            Some(NOV_16)
+        );
+        // Round-trip through year_month for a leap day.
+        let leap = parse_rfc3339_utc("2024-02-29T12:30:00Z").unwrap();
+        assert_eq!(year_month(leap), (2024, 2));
+        // Garbage rejected, never guessed.
+        for bad in [
+            "",
+            "2026-11-16",
+            "2026-13-01T00:00:00Z",
+            "2026-11-32T00:00:00Z",
+            "2026-11-16T25:00:00Z",
+            "2026-11-16T00:00:00+00:00",
+            "2026-11-16 00:00:00",
+        ] {
+            assert_eq!(parse_rfc3339_utc(bad), None, "input: {bad}");
+        }
     }
 
     #[test]

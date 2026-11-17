@@ -65,6 +65,44 @@ pub fn parse_created_id(body: &serde_json::Value) -> Result<u64, String> {
         .map_err(|e| format!("unexpected droplet response: {e}"))
 }
 
+/// One droplet row from the list endpoint (reconciliation input).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropletSummary {
+    pub id: u64,
+    pub name: String,
+    pub status: String,
+    pub created_at: String,
+}
+
+/// Parse `GET /v2/droplets` (pure; malformed rows are skipped, never
+/// fatal — one odd droplet must not block orphan discovery).
+pub fn parse_droplets_list(body: &serde_json::Value) -> Vec<DropletSummary> {
+    body.get("droplets")
+        .and_then(|v| v.as_array())
+        .map(|droplets| {
+            droplets
+                .iter()
+                .filter_map(|d| {
+                    Some(DropletSummary {
+                        id: d.get("id")?.as_u64()?,
+                        name: d.get("name")?.as_str()?.to_string(),
+                        status: d
+                            .get("status")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        created_at: d
+                            .get("created_at")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Live API client (Bearer token).
 #[derive(Debug, Clone)]
 pub struct DoClient {
@@ -113,6 +151,24 @@ impl DoClient {
             .await
             .map_err(|e| format!("droplet create body: {e}"))?;
         parse_created_id(&body)
+    }
+
+    /// List droplets (first page, 200 max) for orphan reconciliation.
+    pub async fn list_droplets(&self) -> Result<Vec<DropletSummary>, String> {
+        let base = self.base_url.as_str();
+        let res = self
+            .auth(self.http.get(format!("{base}{DROPLETS_PATH}?per_page=200")))
+            .send()
+            .await
+            .map_err(|e| format!("droplets list failed: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("droplets list: HTTP {}", res.status()));
+        }
+        let body: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| format!("droplets list body: {e}"))?;
+        Ok(parse_droplets_list(&body))
     }
 
     /// Destroy a droplet (`204`, irreversible).
@@ -255,6 +311,24 @@ mod tests {
     #[test]
     fn destroy_path_matches_api() {
         assert_eq!(droplet_path(42), "/v2/droplets/42");
+    }
+
+    #[test]
+    fn droplets_list_parses_and_skips_malformed_rows() {
+        let body = serde_json::json!({
+            "droplets": [
+                {"id": 7, "name": "runner-ci-1-2", "status": "active",
+                 "created_at": "2026-11-17T10:00:00Z"},
+                {"id": "nan", "name": "broken"},
+                {"name": "no-id"},
+            ],
+        });
+        let rows = parse_droplets_list(&body);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 7);
+        assert_eq!(rows[0].name, "runner-ci-1-2");
+        assert_eq!(rows[0].created_at, "2026-11-17T10:00:00Z");
+        assert!(parse_droplets_list(&serde_json::json!({})).is_empty());
     }
 
     #[test]

@@ -272,6 +272,12 @@ pub fn budget_allows(month_spend_usd: f64, cap_usd: f64) -> bool {
     cap_usd > 0.0 && month_spend_usd < cap_usd
 }
 
+/// Fail-closed budget gate over a ledger read: provision only when the
+/// read succeeds and the spend is under cap. A ledger error refuses.
+pub fn spend_within_cap(spend: Result<f64, String>, cap_usd: f64) -> bool {
+    spend.is_ok_and(|usd| budget_allows(usd, cap_usd))
+}
+
 /// Sync termination hook for the scale-to-zero watchdog: a deliberate
 /// no-op. Production teardown is async (`CloudPool::terminate`), so the
 /// coordinator acts on [`ScaleAction::Terminate`](runner_core::mesh::cloud::autoscale::ScaleAction)
@@ -334,7 +340,15 @@ pub async fn run_watchdog_cycle(
             match pool.terminate(node).await {
                 Ok(_) => {
                     eprintln!("runner: scale-to-zero terminated idle cloud node {instance_id}");
-                    state.write().await.remove_cloud_node(&instance_id);
+                    let mut guard = state.write().await;
+                    guard.remove_cloud_node(&instance_id);
+                    // Release the job record the provision left behind
+                    // (ours carry runner-ci-{run}-{job} names).
+                    if let Some(job_id) =
+                        runner_core::mesh::cloud::cloud_job_id_from_node_name(&node.name)
+                    {
+                        guard.job_finished("github", &job_id);
+                    }
                     controllers.remove(&instance_id);
                 }
                 Err(e) => {
@@ -358,18 +372,11 @@ pub async fn run_coordinator(
         "runner: coordinator polling every {:?} (auto_dispatch={auto}, webhook wakeups armed)",
         poller.interval()
     );
-    let mut watchdogs: WatchdogMap = HashMap::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(poller.interval()) => {},
             _ = wakeup.notified() => {
                 eprintln!("runner: webhook wakeup: polling immediately");
-                // Activity is imminent: reset every idle clock even
-                // before the queue is re-polled.
-                let now = Instant::now();
-                for controller in watchdogs.values_mut() {
-                    controller.mark_active(now);
-                }
             }
         }
         let jobs = match poller.poll_once().await {
@@ -451,14 +458,21 @@ pub async fn run_coordinator(
                     );
                     if let (Some(pool), true) = (cloud.clone(), auto) {
                         // Hard budget stop: refuse new spend once the
-                        // ledgered month total reaches the cap.
+                        // ledgered month total reaches the cap. A ledger
+                        // read failure also refuses (fail closed).
                         let spend = pool.month_spend();
                         let cap = state.read().await.cloud_spend_cap();
-                        if !budget_allows(spend, cap) {
-                            eprintln!(
-                                "runner: budget stop: month spend ${spend:.2} reached cap ${cap:.2}; job {} waits",
-                                job.id
-                            );
+                        if !spend_within_cap(spend.clone(), cap) {
+                            match spend {
+                                Ok(usd) => eprintln!(
+                                    "runner: budget stop: month spend ${usd:.2} reached cap ${cap:.2}; job {} waits",
+                                    job.id
+                                ),
+                                Err(e) => eprintln!(
+                                    "runner: budget stop: spend ledger unreadable ({e}); refusing cloud burst for job {} until fixed",
+                                    job.id
+                                ),
+                            }
                             continue;
                         }
                         // Track the cloud dispatch so later polls dedup
@@ -471,6 +485,7 @@ pub async fn run_coordinator(
                             .job_started("github", &job.id.to_string(), &job.name);
                         let state = state.clone();
                         let pool = pool.clone();
+                        let job_id = job.id.to_string();
                         tokio::spawn(async move {
                             let name = format!("runner-ci-{}-{}", job.run_id, job.id);
                             match pool.provision(&provider, &name).await {
@@ -481,7 +496,12 @@ pub async fn run_coordinator(
                                     );
                                     state.write().await.add_cloud_node(node);
                                 }
-                                Err(e) => eprintln!("runner: cloud burst failed: {e}"),
+                                Err(e) => {
+                                    // Release the dedup record so the next
+                                    // tick retries instead of deadlocking.
+                                    eprintln!("runner: cloud burst failed: {e}");
+                                    state.write().await.job_finished("github", &job_id);
+                                }
                             }
                         });
                     }
@@ -491,11 +511,8 @@ pub async fn run_coordinator(
                 }
             }
         }
-        // Scale-to-zero: reap cloud workers idle for 5+ minutes.
-        if let Some(pool) = cloud.as_ref() {
-            let depth = state.read().await.queue_depth();
-            run_watchdog_cycle(pool, &state, &mut watchdogs, Instant::now(), depth).await;
-        }
+        // Scale-to-zero runs in the standalone watchdog task
+        // (`spawn_cloud_watchdog`), independent of this loop.
     }
 }
 
@@ -513,6 +530,7 @@ mod tests {
             provider: "digitalocean".to_string(),
             status: "active".to_string(),
             launched_at: 0,
+            name: String::new(),
         }
     }
 
@@ -584,6 +602,10 @@ mod tests {
         assert!(budget_allows(24.99, 25.0));
         assert!(!budget_allows(25.0, 25.0));
         assert!(!budget_allows(30.0, 25.0));
+        // Fail-closed gate: ledger errors refuse like an exceeded cap.
+        assert!(spend_within_cap(Ok(0.0), 25.0));
+        assert!(!spend_within_cap(Ok(25.0), 25.0));
+        assert!(!spend_within_cap(Err("corrupt".to_string()), 25.0));
         // Zero cap means bursting was never enabled.
         assert!(!budget_allows(0.0, 0.0));
     }

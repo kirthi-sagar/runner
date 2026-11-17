@@ -30,6 +30,7 @@ pub struct CloudList {
     pub spend_usd: f64,
     pub cap_usd: f64,
     pub tracked: bool,
+    pub spend_error: Option<String>,
 }
 
 /// Parse the `result` object of a `cloud_list` IPC response.
@@ -45,12 +46,15 @@ pub fn parse_list(result: &serde_json::Value, now_secs: u64) -> CloudList {
         spend_usd: result["spend_usd"].as_f64().unwrap_or(0.0),
         cap_usd: result["max_monthly_spend_usd"].as_f64().unwrap_or(0.0),
         tracked: result["spend_tracked"].as_bool().unwrap_or(false),
+        spend_error: result["spend_error"].as_str().map(str::to_string),
     }
 }
 
 /// Render `cloud list` text output.
 pub fn render_list_text(list: &CloudList) -> String {
-    let spend = if list.tracked {
+    let spend = if let Some(err) = &list.spend_error {
+        format!("spend ledger error: {err}")
+    } else if list.tracked {
         format!("spend ${:.2}", list.spend_usd)
     } else {
         "live spend untracked".to_string()
@@ -86,6 +90,7 @@ pub fn render_list_json(list: &CloudList) -> String {
         "spend_usd": list.spend_usd,
         "max_monthly_spend_usd": list.cap_usd,
         "spend_tracked": list.tracked,
+        "spend_error": list.spend_error,
     }))
     .unwrap_or_else(|_| "{}".to_string())
 }
@@ -110,6 +115,7 @@ mod tests {
             provider: "digitalocean".to_string(),
             status: "active".to_string(),
             launched_at: 1_000_000,
+            name: String::new(),
         }
     }
 
@@ -145,12 +151,33 @@ mod tests {
     }
 
     #[test]
+    fn ledger_error_renders_honestly() {
+        let list = parse_list(
+            &serde_json::json!({
+                "nodes": [],
+                "max_monthly_spend_usd": 25.0,
+                "spend_usd": 0.0,
+                "spend_tracked": true,
+                "spend_error": "cannot parse ledger",
+            }),
+            0,
+        );
+        assert_eq!(list.spend_error.as_deref(), Some("cannot parse ledger"));
+        let text = render_list_text(&list);
+        assert!(text.contains("spend ledger error"), "got: {text}");
+        assert!(!text.contains("live spend untracked"));
+        let json: serde_json::Value = serde_json::from_str(&render_list_json(&list)).unwrap();
+        assert_eq!(json["spend_error"], "cannot parse ledger");
+    }
+
+    #[test]
     fn renderers_cover_empty_populated_and_untracked() {
         let empty = CloudList {
             nodes: vec![],
             spend_usd: 0.0,
             cap_usd: 10.0,
             tracked: true,
+            spend_error: None,
         };
         let text = render_list_text(&empty);
         assert!(text.contains("cloud nodes: 0"));
@@ -160,6 +187,7 @@ mod tests {
             spend_usd: 0.05,
             cap_usd: 10.0,
             tracked: true,
+            spend_error: None,
         };
         let text = render_list_text(&full);
         assert!(text.contains("i-9 [render] active up 1h05m"));

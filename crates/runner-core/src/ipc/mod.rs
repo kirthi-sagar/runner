@@ -84,7 +84,14 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
             let guard = state.read().await;
             let pool = guard.cloud_pool();
             let tracked = pool.as_ref().is_some_and(|p| p.spend_tracked());
-            let spend_usd = pool.as_ref().map(|p| p.month_spend()).unwrap_or(0.0);
+            let (spend_usd, spend_error) = match pool.as_ref().map(|p| p.month_spend()) {
+                Some(Ok(usd)) => (usd, None),
+                Some(Err(e)) => {
+                    eprintln!("runner: spend ledger unreadable ({e})");
+                    (0.0, Some(e))
+                }
+                None => (0.0, None),
+            };
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
                 "nodes": guard.cloud_nodes(),
                 "providers": {
@@ -94,6 +101,7 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                 "max_monthly_spend_usd": guard.cloud_spend_cap(),
                 "spend_usd": spend_usd,
                 "spend_tracked": tracked,
+                "spend_error": spend_error,
             } })
         }
         "cloud_terminate" => {
@@ -309,6 +317,7 @@ mod tests {
                 provider: "digitalocean".to_string(),
                 status: "active".to_string(),
                 launched_at: 0,
+                name: String::new(),
             });
             guard.set_cloud_pool(crate::mesh::cloud::CloudPool::default(), 25.0);
         }
@@ -327,6 +336,22 @@ mod tests {
         // Seeded pool carries no ledger: untracked, zero spend.
         assert_eq!(result["spend_usd"], 0.0);
         assert_eq!(result["spend_tracked"], false);
+    }
+
+    #[tokio::test]
+    async fn cloud_list_reports_corrupt_ledger_as_error() {
+        let dir = crate::test_support::TempDir::new("ipc-ledger").unwrap();
+        let ledger_path = dir.path().join("spend_ledger.json");
+        std::fs::write(&ledger_path, "{not json").unwrap();
+        let pool = crate::mesh::cloud::CloudPool::from_clients(None, None)
+            .with_ledger(crate::mesh::cloud::ledger::SpendLedger::new(ledger_path));
+        let state = new_shared_state();
+        state.write().await.set_cloud_pool(pool, 25.0);
+        let res = handle_ipc_request(cloud_req("cloud_list", serde_json::json!({})), &state).await;
+        let result = &res["result"];
+        // Tracked pool, but the error — not $0.00 — is the signal.
+        assert_eq!(result["spend_tracked"], true);
+        assert!(result["spend_error"].as_str().unwrap().contains("parse"));
     }
 
     #[tokio::test]
@@ -356,6 +381,7 @@ mod tests {
                 provider: "digitalocean".to_string(),
                 status: "active".to_string(),
                 launched_at: 0,
+                name: String::new(),
             });
         let res = handle_ipc_request(
             cloud_req(

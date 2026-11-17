@@ -6,7 +6,20 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
-## Unreleased (v0.4.4)
+## Unreleased (v0.4.5)
+
+- Fail-closed spend ledger: corrupt/unreadable ledgers refuse new
+  cloud provisioning (never $0.00 fail-open); the error surfaces
+  in `cloud list` and `/health` instead of zero spend.
+- Startup orphan reconciliation: live `runner-ci-*` droplets and
+  workers are discovered, ledger-recorded, tracked, and reaped
+  after the standard idle timeout.
+- Standalone scale-to-zero watchdog task (30s cadence), decoupled
+  from the GitHub loop; runs with any forge mix or none.
+- Provision-failure recovery: failed bursts release the job
+  record for retry; watchdog terminations clean up job records.
+
+## v0.4.4 — 2026-11-17
 
 - Atomic slot reservation across all three forge loops: concurrent
   polls can no longer over-dispatch a constrained host.

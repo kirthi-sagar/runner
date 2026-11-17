@@ -17,6 +17,49 @@ pub fn service_path(id: &str) -> String {
     format!("{SERVICES_URL}/{id}")
 }
 
+/// One service row from the list endpoint (reconciliation input).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceSummary {
+    pub id: String,
+    pub name: String,
+    pub service_type: String,
+    pub suspended: bool,
+    pub created_at: String,
+}
+
+/// Parse `GET /v1/services` (pure; malformed rows are skipped, never
+/// fatal — one odd service must not block orphan discovery).
+pub fn parse_services_list(body: &serde_json::Value) -> Vec<ServiceSummary> {
+    body.as_array()
+        .map(|services| {
+            services
+                .iter()
+                .filter_map(|entry| {
+                    let service = entry.get("service")?;
+                    Some(ServiceSummary {
+                        id: service.get("id")?.as_str()?.to_string(),
+                        name: service.get("name")?.as_str()?.to_string(),
+                        service_type: service
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        suspended: service
+                            .get("suspended")
+                            .and_then(|s| s.as_str())
+                            .is_some_and(|s| s == "suspended"),
+                        created_at: service
+                            .get("createdAt")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Service suspend endpoint.
 pub fn suspend_path(id: &str) -> String {
     format!("{}/suspend", service_path(id))
@@ -113,6 +156,23 @@ impl RenderClient {
             .ok_or_else(|| "worker create: missing service id".to_string())
     }
 
+    /// List services for orphan reconciliation.
+    pub async fn list_services(&self) -> Result<Vec<ServiceSummary>, String> {
+        let res = self
+            .auth(self.http.get(self.base_url.clone()))
+            .send()
+            .await
+            .map_err(|e| format!("services list failed: {e}"))?;
+        if !res.status().is_success() {
+            return Err(format!("services list: HTTP {}", res.status()));
+        }
+        let body: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| format!("services list body: {e}"))?;
+        Ok(parse_services_list(&body))
+    }
+
     /// Suspend a service (stops billing accrual on paid instances).
     pub async fn suspend(&self, id: &str) -> Result<(), String> {
         let res = self
@@ -143,6 +203,25 @@ impl RenderClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn services_list_parses_and_skips_malformed_rows() {
+        let body = serde_json::json!([
+            {"service": {"id": "srv-1", "name": "runner-ci-1-2",
+             "type": "background_worker", "suspended": "not_suspended",
+             "createdAt": "2026-11-17T10:00:00Z"}},
+            {"service": {"id": "srv-2", "name": "runner-ci-3-4",
+             "type": "background_worker", "suspended": "suspended"}},
+            {"service": {"name": "no-id"}},
+            {"nope": true},
+        ]);
+        let rows = parse_services_list(&body);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].suspended);
+        assert_eq!(rows[0].created_at, "2026-11-17T10:00:00Z");
+        assert!(rows[1].suspended);
+        assert!(parse_services_list(&serde_json::json!({})).is_empty());
+    }
 
     #[test]
     fn worker_body_has_required_fields() {

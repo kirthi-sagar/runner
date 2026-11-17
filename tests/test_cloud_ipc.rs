@@ -17,6 +17,7 @@ fn node(id: &str) -> CloudNode {
         provider: "digitalocean".to_string(),
         status: "active".to_string(),
         launched_at: 0,
+        name: String::new(),
     }
 }
 

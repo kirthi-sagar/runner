@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.4.3 and prior)
+## Shipped (v0.4.4 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 11 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,7 +14,13 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 
-## Current: v0.4.4 Multi-Forge Hardening
+## Current: v0.4.5 Cloud Money Safety
+
+- Fail-closed spend ledger enforcement.
+- Startup orphan reconciliation + always-run watchdog.
+- Provision-failure recovery + job cleanup.
+
+## Shipped in v0.4.4: Multi-Forge Hardening
 
 - Atomic slot reservation + namespaced job lifecycle.
 - Broadcast wakeups for all forge loops.

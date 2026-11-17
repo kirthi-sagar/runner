@@ -75,6 +75,10 @@ async fn cloud_stats() -> (Option<usize>, Option<f64>) {
         .get("nodes")
         .and_then(|n| n.as_array())
         .map(|nodes| nodes.len());
+    // A ledger error means spend is unknown, not zero.
+    if result.get("spend_error").and_then(|e| e.as_str()).is_some() {
+        return (count, None);
+    }
     let spend = result.get("spend_usd").and_then(|s| s.as_f64());
     (count, spend)
 }

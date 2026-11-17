@@ -18,6 +18,9 @@ pub struct CloudNode {
     /// Launch time as Unix epoch seconds (0 = unknown, pre-upgrade node).
     #[serde(default)]
     pub launched_at: u64,
+    /// Provider-side name (`runner-ci-{run}-{job}` for our nodes).
+    #[serde(default)]
+    pub name: String,
 }
 
 fn now_epoch_secs() -> u64 {
@@ -32,6 +35,15 @@ impl CloudNode {
     pub fn uptime_secs(&self, now_secs: u64) -> u64 {
         now_secs.saturating_sub(self.launched_at)
     }
+}
+
+/// Extract the CI job id from one of our node names
+/// (`runner-ci-{run_id}-{job_id}`). Anything else yields `None`.
+pub fn cloud_job_id_from_node_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix(CloudPool::NODE_PREFIX)?;
+    let (run, job) = rest.split_once('-')?;
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (numeric(run) && numeric(job) && !job.contains('-')).then(|| job.to_string())
 }
 
 /// Compact human duration: `45s`, `3m`, `2h12m`, `4d`.
@@ -108,18 +120,14 @@ impl CloudPool {
         self.ledger.is_some()
     }
 
-    /// USD accrued in the current calendar month (0.0 without a ledger
-    /// or when the file is unreadable — callers fail open and log).
-    pub fn month_spend(&self) -> f64 {
+    /// USD accrued in the current calendar month. No ledger (mock
+    /// harness pools) reads as zero; an unreadable or corrupt ledger is
+    /// an error so callers fail closed instead of spending blind.
+    pub fn month_spend(&self) -> Result<f64, String> {
         let Some(ledger) = self.ledger.as_ref() else {
-            return 0.0;
+            return Ok(0.0);
         };
-        ledger
-            .current_month_spend(now_epoch_secs())
-            .unwrap_or_else(|e| {
-                eprintln!("runner: spend ledger unreadable ({e}); treating spend as $0");
-                0.0
-            })
+        ledger.current_month_spend(now_epoch_secs())
     }
 
     /// Record a lifecycle event; ledger failures are loud but never
@@ -176,6 +184,7 @@ impl CloudPool {
                     provider: provider.to_string(),
                     status: "provisioning".to_string(),
                     launched_at: now_epoch_secs(),
+                    name: name.to_string(),
                 };
                 self.record(&node, false);
                 Ok(node)
@@ -193,12 +202,73 @@ impl CloudPool {
                     provider: provider.to_string(),
                     status: "provisioning".to_string(),
                     launched_at: now_epoch_secs(),
+                    name: name.to_string(),
                 };
                 self.record(&node, false);
                 Ok(node)
             }
             _ => Err(format!("unknown provider: {provider}")),
         }
+    }
+
+    /// Name prefix for nodes this daemon created (`runner-ci-{run}-{job}`).
+    pub const NODE_PREFIX: &'static str = "runner-ci-";
+
+    /// Discover live nodes we created (startup orphan reconciliation).
+    /// Queries each configured provider for `runner-ci-` instances;
+    /// a failing provider logs loudly and yields nothing rather than
+    /// failing the whole pass (reconcile must never kill startup).
+    /// Launches are ledger-recorded (idempotent per node id).
+    pub async fn reconcile_active_nodes(&self) -> Result<Vec<CloudNode>, String> {
+        let mut nodes = Vec::new();
+        if let Some(client) = self.digitalocean.as_ref() {
+            match client.list_droplets().await {
+                Ok(droplets) => {
+                    for droplet in droplets {
+                        if !droplet.name.starts_with(Self::NODE_PREFIX) {
+                            continue;
+                        }
+                        let node = CloudNode {
+                            id: droplet.id.to_string(),
+                            provider: "digitalocean".to_string(),
+                            status: droplet.status,
+                            launched_at: ledger::parse_rfc3339_utc(&droplet.created_at)
+                                .unwrap_or_else(now_epoch_secs),
+                            name: droplet.name,
+                        };
+                        self.record(&node, false);
+                        nodes.push(node);
+                    }
+                }
+                Err(e) => eprintln!("runner: reconcile digitalocean failed ({e})"),
+            }
+        }
+        if let Some((client, _)) = self.render.as_ref() {
+            match client.list_services().await {
+                Ok(services) => {
+                    for service in services {
+                        if !service.name.starts_with(Self::NODE_PREFIX)
+                            || service.service_type != render::BACKGROUND_WORKER_TYPE
+                            || service.suspended
+                        {
+                            continue;
+                        }
+                        let node = CloudNode {
+                            id: service.id,
+                            provider: "render".to_string(),
+                            status: "active".to_string(),
+                            launched_at: ledger::parse_rfc3339_utc(&service.created_at)
+                                .unwrap_or_else(now_epoch_secs),
+                            name: service.name,
+                        };
+                        self.record(&node, false);
+                        nodes.push(node);
+                    }
+                }
+                Err(e) => eprintln!("runner: reconcile render failed ({e})"),
+            }
+        }
+        Ok(nodes)
     }
 
     /// Terminate one worker (full cleanup on DigitalOcean).
@@ -249,6 +319,26 @@ mod tests {
     }
 
     #[test]
+    fn node_name_job_ids_parse_strictly() {
+        assert_eq!(
+            cloud_job_id_from_node_name("runner-ci-12-34").as_deref(),
+            Some("34")
+        );
+        for bad in [
+            "",
+            "runner-ci-12",
+            "runner-ci--34",
+            "runner-ci-12-",
+            "runner-ci-x-34",
+            "runner-ci-12-3x",
+            "runner-ci-12-34-56",
+            "other-12-34",
+        ] {
+            assert_eq!(cloud_job_id_from_node_name(bad), None, "input: {bad}");
+        }
+    }
+
+    #[test]
     fn preferred_provider_prefers_do_then_render() {
         let pool = CloudPool::from_clients(None, None);
         assert_eq!(pool.preferred_provider(), None);
@@ -283,6 +373,7 @@ mod tests {
             provider: "render".to_string(),
             status: "active".to_string(),
             launched_at: 1_000,
+            name: String::new(),
         };
         assert_eq!(node.uptime_secs(1_100), 100);
         assert_eq!(node.uptime_secs(999), 0);

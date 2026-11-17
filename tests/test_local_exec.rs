@@ -3,7 +3,7 @@
 //! Commands run through the real `execute_local_sandboxed` path
 //! (sandboxed where the kernel allows it, governed otherwise).
 
-use runner::providers::local::execute_local_sandboxed;
+use runner::providers::local::{execute_captured, execute_local_sandboxed, CAPTURE_CAP_BYTES};
 use std::time::Duration;
 
 fn cmd(parts: &[&str]) -> Vec<String> {
@@ -80,4 +80,36 @@ async fn direct_mode_inherits_caller_cwd() {
     let observed = std::fs::read_to_string(expected.join(&marker)).unwrap();
     std::fs::remove_file(expected.join(&marker)).unwrap();
     assert_eq!(observed.trim(), expected.to_string_lossy());
+}
+
+#[tokio::test]
+async fn capture_caps_runaway_output_at_ten_mib() {
+    // 12 MiB of output; only the trailing 10 MiB may be retained.
+    let out = execute_captured(
+        &cmd(&["head", "-c", "12582912", "/dev/zero"]),
+        &[],
+        true,
+        Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.code, 0);
+    assert_eq!(out.stdout.len(), CAPTURE_CAP_BYTES);
+    assert!(out.stdout.iter().all(|&b| b == 0));
+    assert!(out.stderr.is_empty());
+}
+
+#[tokio::test]
+async fn capture_keeps_small_output_intact() {
+    let out = execute_captured(
+        &cmd(&["sh", "-c", "echo out; echo err >&2"]),
+        &[],
+        true,
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.code, 0);
+    assert_eq!(out.stdout, b"out\n");
+    assert_eq!(out.stderr, b"err\n");
 }

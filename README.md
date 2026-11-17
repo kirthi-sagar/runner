@@ -4,7 +4,7 @@
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Shipped product (v0.4.x) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Shipped product (v0.5.x) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -118,13 +118,14 @@ Existing self-hosted runners fail at this because:
 | **Test Timer Protection** | **Yes (CFS weight 1 trickle)** | N/A (Runs at 100%) | N/A (Dedicated node) | No | Managed cloud VM |
 | **Autonomous AI Agent API** | **Native MCP + Unix Socket + CLI**| None | Kubernetes CRDs only | CLI flags only | Web UI / Cloud API |
 | **Dual-Tier RBAC** | **Yes (Human Super Admin / AI Admin)**| None | Kubernetes RBAC | None | SaaS Team Roles |
-| **Peer WAN Federation** | **Yes (WireGuard P2P Trusted Peers)**| Manual | Complex VPN / Multi-cluster | None | None |
+| **Peer WAN Federation** | **P2P WireGuard Mesh (Job Routing Planned)**| Manual | Complex VPN / Multi-cluster | None | None |
 | **Cloud Credit Bursting** | **Yes (DigitalOcean / Render auto-scale)**| None | Custom autoscalers | None | Proprietary SaaS |
-| **AFK Boost Mode** | **Yes (Desktop Idle Listener)** | None | None | None | N/A |
+| **AFK Boost Mode** | **Planned (cgroups CFS throttle active)** | None | None | None | N/A |
 | **Infrastructure Overhead** | **Zero (Single static binary)** | Low (Directory install) | Very High (Kubernetes cluster) | Low (Docker CLI) | Managed SaaS |
 | **Distributed LAN Cache** | **Transparent (ACTIONS_CACHE_URL)**| No | Optional (MinIO / S3 setup) | Local Docker volume only | Cloud cache |
-| **macOS Apple Silicon Support** | **Darwin QoS (E-Core Pinning)** | Unmanaged | Not supported | Local Docker (Rosetta/arm) | Metered cloud |
+| **macOS Apple Silicon Support** | **Planned (Linux cgroups v2 active)** | Unmanaged | Not supported | Local Docker (Rosetta/arm) | Metered cloud |
 | **Multi-Provider CI** | **GitHub + GitLab + Bitbucket + Local** | GitHub only | GitHub only | GitHub emu only | GitHub (+ paid add-ons) |
+| **Tier-1 MicroVMs** | **Partial (Firecracker ready, guest dispatch planned)** | None | None | None | Yes (Firecracker per job) |
 
 ---
 
@@ -153,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.5.1 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.5.2 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -190,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v0.5.1  (q quit, live cadence)
+runner top v0.5.2  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -294,7 +295,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "0.5.1", "governor": "normal",
+{"status": "healthy", "version": "0.5.2", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -308,10 +309,11 @@ auto-refreshing every 2.5 seconds from `/health` and `/api/v1/fleet`.
 runner mcp --transport=stdio
 ```
 
-11 tools over JSON-RPC 2.0 stdio: the 7 resource/fleet admin tools
-plus `diagnose_system`, `test_provider`, `exec_command`, and
-`manage_cloud_capacity`. One-command client registration with
-`runner mcp install --target cursor|claude|generic` (see §8).
+12 tools over JSON-RPC 2.0 stdio: the 7 resource/fleet admin tools
+plus `diagnose_system`, `test_provider`, `exec_command`,
+`manage_cloud_capacity`, and `get_cache_stats`. One-command client
+registration with `runner mcp install --target cursor|claude|generic`
+(see §8).
 
 ### Cloud bursting lifecycle
 

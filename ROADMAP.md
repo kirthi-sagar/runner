@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.5.1 and prior)
+## Shipped (v0.5.2 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -13,6 +13,12 @@ services or heavyweight frameworks.
 - eBPF egress, microVM tier, audit/policy, hooks, doctor.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
+
+## Shipped in v0.5.2: Daemon Resilience, Memory Safety & Doc Truth
+
+- Bounded output capture + streaming cache downloads.
+- Index persistence optimization + shutdown flush.
+- README truth synchronization.
 
 ## Next: v0.6.0 Mesh Cache Federation & Workstation Safety
 

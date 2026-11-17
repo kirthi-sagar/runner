@@ -180,20 +180,12 @@ pub async fn execute_captured(
     }
     // Drain pipes on background tasks so output larger than the pipe buffer
     // never deadlocks the child; `child` stays owned here for timeout kill.
+    // Each stream is capped: runaway output evicts the oldest bytes instead
+    // of growing daemon RAM without bound.
     let mut stdout_pipe = child.stdout.take().context("stdout pipe missing")?;
     let mut stderr_pipe = child.stderr.take().context("stderr pipe missing")?;
-    let out_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stdout_pipe, &mut buf)
-            .await
-            .map(|_| buf)
-    });
-    let err_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(&mut stderr_pipe, &mut buf)
-            .await
-            .map(|_| buf)
-    });
+    let out_task = tokio::spawn(async move { drain_reader(&mut stdout_pipe).await });
+    let err_task = tokio::spawn(async move { drain_reader(&mut stderr_pipe).await });
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(e)) => {
@@ -224,6 +216,29 @@ pub async fn execute_captured(
         stdout,
         stderr,
     })
+}
+
+/// Per-stream capture cap: 10 MiB retained, oldest bytes evicted first.
+pub const CAPTURE_CAP_BYTES: usize = 10 * 1024 * 1024;
+
+/// Drain a reader to EOF into a bounded ring (tail wins on overflow).
+async fn drain_reader<R>(reader: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use runner_telemetry::RingBuffer;
+    use tokio::io::AsyncReadExt;
+
+    let mut ring = RingBuffer::new(CAPTURE_CAP_BYTES);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        ring.push_bytes(&chunk[..n]);
+    }
+    Ok(ring.contents())
 }
 
 /// Direct-execution provider (drives `runner exec`; no remote queue).

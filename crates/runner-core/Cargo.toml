@@ -8,6 +8,8 @@ description = "Core engine: config, resource governor, federated mesh, IPC, MCP,
 [dependencies]
 tokio.workspace = true
 axum.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

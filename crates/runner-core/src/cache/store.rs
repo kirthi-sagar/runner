@@ -226,6 +226,8 @@ impl CacheStore {
                     })
                     .next()
             });
+        // Read path: counters update in memory only. The index hits
+        // disk on mutations (commit, clear, eviction) and clean shutdown.
         match found {
             Some(id) => {
                 let entry = inner.entries.get_mut(&id)?.clone();
@@ -234,17 +236,20 @@ impl CacheStore {
                     stored.accessed_unix_secs = now_unix_secs();
                     stored.hits += 1;
                 }
-                drop(inner);
-                let _ = self.persist();
                 Some(entry)
             }
             None => {
                 inner.stats.misses += 1;
-                drop(inner);
-                let _ = self.persist();
                 None
             }
         }
+    }
+
+    /// Flush in-memory counters/access times to `index.json`.
+    /// Called on mutations (via [`CacheStore::commit`]/`clear`), and once
+    /// on clean daemon shutdown so a quiet period loses nothing.
+    pub fn flush(&self) -> Result<(), String> {
+        self.persist()
     }
 
     /// Reserve an upload slot for (version, key). Returns the new numeric
@@ -273,8 +278,9 @@ impl CacheStore {
         inner
             .pending
             .insert(id, (key.to_string(), version.to_string()));
-        drop(inner);
-        self.persist()?;
+        // No persist: uncommitted ids are safely reusable after a crash
+        // (nothing references them; orphans are swept at open), and the
+        // next commit persists the advanced counter anyway.
         Ok(ReserveOutcome::Created(id))
     }
 
@@ -306,6 +312,16 @@ impl CacheStore {
             .lock()
             .map(|inner| inner.pending.contains_key(&id))
             .unwrap_or(false)
+    }
+
+    /// Staged byte count for a pending upload (None when not pending).
+    pub fn staged_len(&self, id: u64) -> Option<u64> {
+        if !self.has_pending(id) {
+            return None;
+        }
+        std::fs::metadata(self.dir.join(format!("{id}.tmp")))
+            .map(|m| m.len())
+            .ok()
     }
 
     /// Commit a staged upload: verify total size, atomically move into the
@@ -387,49 +403,27 @@ impl CacheStore {
     }
 
     /// Read archive bytes (full file or one range). Counts served bytes.
-    pub fn read_bytes(
-        &self,
-        id: u64,
-        start: u64,
-        len: Option<u64>,
-    ) -> Result<(Vec<u8>, u64), String> {
-        use std::io::{Read, Seek, SeekFrom};
-        let path = {
-            let inner = self
-                .inner
-                .lock()
-                .map_err(|_| "cache index lock poisoned".to_string())?;
-            inner
-                .entries
-                .get(&id)
-                .map(|e| self.dir.join(&e.file))
-                .ok_or_else(|| format!("unknown cache id {id}"))?
-        };
-        let mut file =
-            std::fs::File::open(&path).map_err(|_| format!("cache archive missing for id {id}"))?;
-        let total = file
-            .metadata()
-            .map(|m| m.len())
-            .map_err(|e| format!("cannot stat cache {id}: {e}"))?;
-        file.seek(SeekFrom::Start(start.min(total)))
-            .map_err(|e| format!("cannot seek cache {id}: {e}"))?;
-        let take = len
-            .unwrap_or(total.saturating_sub(start))
-            .min(total.saturating_sub(start));
-        let mut buf = vec![0u8; take as usize];
-        file.read_exact(&mut buf)
-            .map_err(|e| format!("cannot read cache {id}: {e}"))?;
-        let mut inner = self
-            .inner
+    /// Archive path for streaming serving (no bytes are read here).
+    pub fn archive_path(&self, id: u64) -> Option<PathBuf> {
+        self.inner
             .lock()
-            .map_err(|_| "cache index lock poisoned".to_string())?;
-        inner.stats.bytes_served += buf.len() as u64;
-        if let Some(entry) = inner.entries.get_mut(&id) {
-            entry.accessed_unix_secs = now_unix_secs();
+            .ok()
+            .and_then(|inner| inner.entries.get(&id).map(|e| self.dir.join(&e.file)))
+    }
+
+    /// Record a served byte range: bumps served counters + LRU access.
+    /// In-memory only (persisted on the next mutation or clean shutdown).
+    pub fn record_served(&self, id: u64, bytes: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        // Unknown ids are a silent no-op (the server 404'd already).
+        if inner.entries.contains_key(&id) {
+            inner.stats.bytes_served += bytes;
+            if let Some(entry) = inner.entries.get_mut(&id) {
+                entry.accessed_unix_secs = now_unix_secs();
+            }
         }
-        drop(inner);
-        let _ = self.persist();
-        Ok((buf, total))
     }
 
     /// Current counters + totals.
@@ -567,9 +561,8 @@ mod tests {
         };
         store.write_chunk(id3, 0, b"0123456789").unwrap();
         store.commit(id3, 10).unwrap();
-        let (bytes, total) = store.read_bytes(id3, 0, None).unwrap();
-        assert_eq!(bytes, b"0123456789");
-        assert_eq!(total, 10);
+        let path = store.archive_path(id3).expect("committed archive resolves");
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
         assert!(matches!(
             store.commit(424242, 1).unwrap_err(),
             StoreError::UnknownUpload(424242)
@@ -592,17 +585,18 @@ mod tests {
     }
 
     #[test]
-    fn ranges_read_slices_and_count_served() {
+    fn archive_path_resolves_and_served_counts() {
         let (_dir, store) = store(1 << 30);
         let id = commit_bytes(&store, "k", "v", b"0123456789");
-        let (bytes, total) = store.read_bytes(id, 4, Some(3)).unwrap();
-        assert_eq!(bytes, b"456");
-        assert_eq!(total, 10);
-        // Over-long ranges clamp to EOF.
-        let (bytes, _) = store.read_bytes(id, 8, Some(99)).unwrap();
-        assert_eq!(bytes, b"89");
+        let path = store.archive_path(id).expect("known id resolves");
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
+        assert!(store.archive_path(424242).is_none());
+        store.record_served(id, 3);
+        store.record_served(id, 2);
         assert_eq!(store.stats().bytes_served, 5);
-        assert!(store.read_bytes(424242, 0, None).is_err());
+        // Unknown ids are a silent no-op (server already 404'd).
+        store.record_served(424242, 99);
+        assert_eq!(store.stats().bytes_served, 5);
     }
 
     #[test]
@@ -625,6 +619,28 @@ mod tests {
         assert_eq!(removed, 1);
         let stats = store.stats();
         assert_eq!((stats.hits, stats.misses, stats.entries), (0, 0, 0));
+    }
+
+    #[test]
+    fn reads_do_not_rewrite_the_index() {
+        let dir = TempDir::new("cache-nopersist").unwrap();
+        let cache_dir = dir.path().join("cache");
+        let store = CacheStore::open(&cache_dir, 1 << 30).unwrap();
+        commit_bytes(&store, "k", "v", b"0123456789");
+        let before = std::fs::read(cache_dir.join("index.json")).unwrap();
+        store.lookup("v", &["k".to_string()]);
+        store.lookup("v", &["miss".to_string()]);
+        store.record_served(1, 10);
+        // Hot read path: zero disk writes.
+        assert_eq!(std::fs::read(cache_dir.join("index.json")).unwrap(), before);
+        // ...but in-memory counters advanced.
+        assert_eq!((store.stats().hits, store.stats().misses), (1, 1));
+        assert_eq!(store.stats().bytes_served, 10);
+        // Explicit flush persists; reload observes the counters.
+        store.flush().unwrap();
+        drop(store);
+        let reopened = CacheStore::open(&cache_dir, 1 << 30).unwrap();
+        assert_eq!((reopened.stats().hits, reopened.stats().misses), (1, 1));
     }
 
     #[test]

@@ -426,6 +426,13 @@ pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
         tokio::select! {
             _ = shutdown_signal() => {
                 eprintln!("runner: shutdown signal received");
+                // Persist cache counters/access times accrued since the
+                // last mutation so a quiet period loses nothing.
+                if let Some(store) = state.read().await.cache_store() {
+                    if let Err(e) = store.flush() {
+                        eprintln!("runner: cache index flush failed: {e}");
+                    }
+                }
                 break;
             }
             changed = rx.changed() => {

@@ -7,7 +7,6 @@
 //! default; Bearer auth enforced everywhere except the artifact
 //! download (the client's downloader sends no credentials).
 
-use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Json};
@@ -146,16 +145,19 @@ fn parse_content_range(value: &str) -> Option<(u64, u64)> {
 }
 
 /// `PATCH caches/{id}` chunk upload (explicit offsets; out-of-order safe).
+/// The body streams straight to disk: no size cap, no full buffering.
 async fn upload_chunk(
     State(state): State<CacheServerState>,
     headers: HeaderMap,
     Path(id): Path<u64>,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> axum::response::Response {
+    use futures_util::TryStreamExt;
+
     if !authorized(&headers) {
         return unauthorized();
     }
-    let Some(range) = headers
+    let Some((start, end)) = headers
         .get("content-range")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_range)
@@ -166,22 +168,53 @@ async fn upload_chunk(
         )
             .into_response();
     };
-    let (start, end) = range;
-    if body.len() as u64 != end - start + 1 {
+    let mut stream = body.into_data_stream();
+    let mut offset = start;
+    let mut received = 0u64;
+    loop {
+        let chunk = match stream.try_next().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "chunk stream failed" })),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) = state.store.write_chunk(id, offset, &chunk) {
+            return store_upload_error(id, e);
+        }
+        offset += chunk.len() as u64;
+        received += chunk.len() as u64;
+    }
+    if received != end - start + 1 {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "chunk length disagrees with Content-Range" })),
         )
             .into_response();
     }
-    match state.store.write_chunk(id, start, &body) {
-        Ok(received) => Json(serde_json::json!({ "receivedBytes": received })).into_response(),
-        Err(StoreError::UnknownUpload(_)) => (
+    match state.store.staged_len(id) {
+        Some(total) => Json(serde_json::json!({ "receivedBytes": total })).into_response(),
+        None => store_upload_error(id, StoreError::UnknownUpload(id)),
+    }
+}
+
+fn store_upload_error(id: u64, e: StoreError) -> axum::response::Response {
+    match e {
+        StoreError::UnknownUpload(_) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("unknown upload {id}") })),
         )
             .into_response(),
-        Err(e) => (
+        StoreError::SizeMismatch { .. } => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+        StoreError::Io(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
@@ -285,41 +318,51 @@ async fn download_artifact(
             if start > end {
                 return range_not_satisfiable(total);
             }
-            (start, Some(end - start + 1))
+            (start, end - start + 1)
         }
         Some(_) => return range_not_satisfiable(total),
-        None => (0, None),
+        None => (0, total),
     };
-    match state.store.read_bytes(id, start, len) {
-        Ok((bytes, total)) => {
-            let end = start + bytes.len() as u64 - 1;
-            if range.is_some() {
+    let Some(path) = state.store.archive_path(id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Stream from disk: open, seek, bound, and serve without ever
+    // materializing the archive in RAM.
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let stream = tokio_util::io::ReaderStream::new(file.take(len));
+    state.store.record_served(id, len);
+    let end = start + len.saturating_sub(1);
+    if range.is_some() {
+        (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                ("content-length".to_string(), len.to_string()),
+                ("accept-ranges".to_string(), "bytes".to_string()),
                 (
-                    StatusCode::PARTIAL_CONTENT,
-                    [
-                        ("content-length".to_string(), bytes.len().to_string()),
-                        ("accept-ranges".to_string(), "bytes".to_string()),
-                        (
-                            "content-range".to_string(),
-                            format!("bytes {start}-{end}/{total}"),
-                        ),
-                    ],
-                    bytes,
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::OK,
-                    [
-                        ("content-length".to_string(), bytes.len().to_string()),
-                        ("accept-ranges".to_string(), "bytes".to_string()),
-                    ],
-                    bytes,
-                )
-                    .into_response()
-            }
-        }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+                    "content-range".to_string(),
+                    format!("bytes {start}-{end}/{total}"),
+                ),
+            ],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [
+                ("content-length".to_string(), len.to_string()),
+                ("accept-ranges".to_string(), "bytes".to_string()),
+            ],
+            axum::body::Body::from_stream(stream),
+        )
+            .into_response()
     }
 }
 

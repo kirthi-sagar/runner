@@ -231,3 +231,65 @@ async fn misses_restore_prefixes_auth_and_size_mismatch() {
         .unwrap();
     assert_eq!(res.status().as_u16(), 404);
 }
+
+#[tokio::test]
+async fn large_archive_streams_end_to_end() {
+    let (base, store) = spawn_proxy().await;
+    let http = reqwest::Client::new();
+    // 20 MiB deterministic payload, uploaded in 4 MiB chunks.
+    const SIZE: usize = 20 * 1024 * 1024;
+    let payload: Vec<u8> = (0..SIZE as u32).map(|i| (i % 251) as u8).collect();
+
+    let res = auth(http.post(format!("{base}/_apis/artifactcache/caches")))
+        .json(&serde_json::json!({"key": "big-blob", "version": "v1"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 201);
+    let id = res.json::<serde_json::Value>().await.unwrap()["cacheId"]
+        .as_u64()
+        .unwrap();
+    for (n, chunk) in payload.chunks(4 * 1024 * 1024).enumerate() {
+        let start = n * 4 * 1024 * 1024;
+        let end = start + chunk.len() - 1;
+        let res = auth(http.patch(format!("{base}/_apis/artifactcache/caches/{id}")))
+            .header("content-range", format!("bytes {start}-{end}/*"))
+            .body(chunk.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+    }
+    let res = auth(http.post(format!("{base}/_apis/artifactcache/caches/{id}")))
+        .json(&serde_json::json!({"size": SIZE}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+
+    // Full streamed download is byte-identical.
+    let res = http
+        .get(format!("{base}/_apis/artifactcache/artifacts/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_eq!(res.bytes().await.unwrap().as_ref(), payload.as_slice());
+
+    // Mid-file range slice.
+    let res = http
+        .get(format!("{base}/_apis/artifactcache/artifacts/{id}"))
+        .header("range", "bytes=1048576-2097151")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 206);
+    assert_eq!(
+        res.bytes().await.unwrap().as_ref(),
+        &payload[1048576..2097152]
+    );
+
+    // Served counters reflect both downloads.
+    let stats = store.stats();
+    assert_eq!(stats.bytes_served, (SIZE + 1024 * 1024) as u64);
+}

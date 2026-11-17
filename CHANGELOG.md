@@ -6,6 +6,17 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v0.5.2 — 2026-11-17
+
+- Bounded CI output capture: 10 MiB ring per stream, tail wins on
+  runaway output (daemon OOM-proof).
+- Streaming cache downloads: archives stream from disk with HEAD /
+  Range support instead of full-file RAM buffering.
+- Cache index writes only on mutation and clean shutdown (no more
+  per-lookup disk rewrites).
+- README truth pass: version banner, 12 MCP tools, honest
+  comparison-table calibration.
+
 ## v0.5.1 — 2026-11-17
 
 - Fixed `get_cache_stats` MCP tool returning `{"enabled": false}` by routing queries through daemon IPC.

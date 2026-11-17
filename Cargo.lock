@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "runner-cli"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1400,13 +1400,14 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "boringtun",
+ "futures-util",
  "hmac",
  "mdns-sd",
  "nix 0.29.0",
@@ -1416,12 +1417,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-util",
  "toml",
 ]
 
 [[package]]
 name = "runner-enterprise"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1441,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "runner-providers"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1449,6 +1451,7 @@ dependencies = [
  "reqwest",
  "runner-core",
  "runner-sandbox",
+ "runner-telemetry",
  "serde",
  "serde_json",
  "tokio",
@@ -1456,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "runner-sandbox"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -1472,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "runner-telemetry"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1899,6 +1902,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
  "tokio",
 ]
 

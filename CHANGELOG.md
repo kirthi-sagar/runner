@@ -6,7 +6,21 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
-## Unreleased (v0.4.5)
+## Unreleased (v0.5.0)
+
+- Transparent LAN cache proxy: daemon-embedded `ACTIONS_CACHE_URL`
+  server speaking the Actions Cache protocol (lookup with
+  restore-key fallbacks, reserve/chunk/commit upload, HEAD +
+  Range downloads), verified against the real client source.
+- Content-addressed disk store (`~/.runner/cache/`, 10 GB LRU
+  budget) with atomic commits and persisted hit/miss stats.
+- Automatic `ACTIONS_CACHE_URL` + `ACTIONS_RUNTIME_TOKEN`
+  injection into GitHub workers; graceful upstream fallback.
+- `runner cache stats` / `runner cache clear`, IPC
+  `cache_stats`/`cache_clear`, MCP `get_cache_stats`, dashboard
+  KPI cards, and `/health.cache`.
+
+## v0.4.5 — 2026-11-17
 
 - Fail-closed spend ledger: corrupt/unreadable ledgers refuse new
   cloud provisioning (never $0.00 fail-open); the error surfaces

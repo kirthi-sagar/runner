@@ -20,7 +20,9 @@
 //! * Never mount `/home/*` into job sandboxes; block RFC 1918 egress.
 
 pub use runner_cli::service;
-pub use runner_core::{auth, config, governor, ipc, mcp, mesh, pidfile, status, test_support};
+pub use runner_core::{
+    auth, cache, config, governor, ipc, mcp, mesh, pidfile, status, test_support,
+};
 pub use runner_enterprise::{audit, control_plane, policy, sso, webhook};
 pub use runner_providers::{github, providers};
 pub use runner_sandbox as sandbox;

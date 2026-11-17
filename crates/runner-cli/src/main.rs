@@ -153,6 +153,11 @@ enum Commands {
         #[command(subcommand)]
         command: CloudCommands,
     },
+    /// Inspect and manage the LAN cache proxy via the daemon
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -270,6 +275,25 @@ enum CloudCommands {
     },
     /// Terminate all tracked cloud nodes immediately
     Purge,
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommands {
+    /// Show cache entries, size, hits, misses, and bandwidth saved
+    Stats {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Purge cached archives (all, or entries idle longer than N days)
+    Clear {
+        /// Remove every entry and reset counters
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Remove entries unaccessed for longer than N days
+        #[arg(long)]
+        older_than: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -886,6 +910,38 @@ async fn cmd_cloud_purge() -> Result<()> {
     Ok(())
 }
 
+/// `runner cache stats`: entries, size, hits, misses, bandwidth saved.
+async fn cmd_cache_stats(format: &str) -> Result<()> {
+    use runner_cli::cache::{parse_stats, render_stats_json, render_stats_text};
+
+    let result = daemon_call("cache_stats", None).await?;
+    let stats = parse_stats(&result);
+    match format.trim().to_ascii_lowercase().as_str() {
+        "text" => print!("{}", render_stats_text(&stats)),
+        "json" => println!("{}", render_stats_json(&stats)),
+        other => anyhow::bail!("unsupported cache stats format {other:?}: want text|json"),
+    }
+    Ok(())
+}
+
+/// `runner cache clear`: purge archives (all or idle longer than N days).
+async fn cmd_cache_clear(all: bool, older_than: Option<u64>) -> Result<()> {
+    if !all && older_than.is_none() {
+        anyhow::bail!("pass --all or --older-than <days>");
+    }
+    let result = daemon_call(
+        "cache_clear",
+        Some(serde_json::json!({ "all": all, "older_than_days": older_than })),
+    )
+    .await?;
+    println!(
+        "cleared {} entries ({} freed)",
+        result["removed"].as_u64().unwrap_or(0),
+        runner_cli::cache::format_bytes(result["freed_bytes"].as_u64().unwrap_or(0)),
+    );
+    Ok(())
+}
+
 /// `runner hook uninstall`: remove the managed hook, restore backup.
 fn cmd_hook_uninstall() -> Result<()> {
     use runner_cli::hook::uninstall;
@@ -961,6 +1017,43 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!("runner: ipc unavailable ({e}); continuing without socket");
+                }
+            }
+            // LAN cache proxy: bind synchronously so dispatch knows
+            // whether worker injection is safe; failure degrades to
+            // upstream caching without affecting the daemon.
+            {
+                use runner_core::cache::server::{public_base_url, serve_on, CacheServerState};
+                use runner_core::cache::store::CacheStore;
+                let dir = runner_core::config::resolve_cache_dir(&config.cache);
+                let max_bytes = config.cache.max_size_gb.saturating_mul(1024 * 1024 * 1024);
+                match CacheStore::open(&dir, max_bytes) {
+                    Ok(store) => match tokio::net::TcpListener::bind(&config.cache.listen).await {
+                        Ok(listener) => {
+                            let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
+                            let base = public_base_url(&config.cache.listen, port);
+                            state.write().await.set_cache(store.clone(), base.clone());
+                            eprintln!(
+                                "runner: cache proxy on {} (advertised {base})",
+                                config.cache.listen
+                            );
+                            tokio::spawn(async move {
+                                let state = CacheServerState {
+                                    store,
+                                    public_base: base,
+                                };
+                                if let Err(e) = serve_on(listener, state).await {
+                                    eprintln!("runner: cache proxy exited: {e}");
+                                }
+                            });
+                        }
+                        Err(e) => eprintln!(
+                            "runner: cache proxy unavailable ({e}); workers use upstream caching"
+                        ),
+                    },
+                    Err(e) => eprintln!(
+                        "runner: cache store unavailable ({e}); workers use upstream caching"
+                    ),
                 }
             }
             let pid_path = resolve_pid_path();
@@ -1123,6 +1216,14 @@ async fn main() -> Result<()> {
             }
             CloudCommands::Purge => {
                 cmd_cloud_purge().await?;
+            }
+        },
+        Commands::Cache { command } => match command {
+            CacheCommands::Stats { format } => {
+                cmd_cache_stats(&format).await?;
+            }
+            CacheCommands::Clear { all, older_than } => {
+                cmd_cache_clear(all, older_than).await?;
             }
         },
         Commands::Exec {

@@ -1,4 +1,4 @@
-//! MCP protocol tests: `tools/list` exposes all 11 admin tools and
+//! MCP protocol tests: `tools/list` exposes all 12 admin tools and
 //! `tools/call` executes them over JSON-RPC 2.0.
 
 use runner::config::RunnerConfig;

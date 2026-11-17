@@ -64,6 +64,8 @@
     <div class="card"><div class="label">Capacity slots</div><div class="value" id="k-slots">–</div></div>
     <div class="card"><div class="label">In-flight jobs</div><div class="value" id="k-jobs">–</div></div>
     <div class="card"><div class="label">Host load state</div><div class="value" id="k-gov">–</div></div>
+    <div class="card"><div class="label">Cache hit rate</div><div class="value" id="k-cache-hit">–</div></div>
+    <div class="card"><div class="label">Cached data</div><div class="value" id="k-cache-mb">–</div></div>
   </div>
   <section>
     <h2>Control-plane host PSI</h2>
@@ -124,6 +126,13 @@ async function refresh() {
       runners.reduce(function (a, r) { return a + (r.registration.capacity || 0); }, 0);
     document.getElementById("k-jobs").textContent =
       runners.reduce(function (a, r) { return a + (r.active_jobs || 0); }, 0);
+    var cache = health.cache || null;
+    document.getElementById("k-cache-hit").textContent =
+      (cache && typeof cache.hit_ratio === "number")
+        ? (cache.hit_ratio * 100).toFixed(1) + "%" : "–";
+    document.getElementById("k-cache-mb").textContent =
+      (cache && typeof cache.size_bytes === "number")
+        ? (cache.size_bytes / 1048576).toFixed(1) + " MB" : "–";
     var tb = document.getElementById("fleet");
     if (!runners.length) {
       tb.innerHTML = '<tr><td colspan="7" class="empty">no runners registered</td></tr>';

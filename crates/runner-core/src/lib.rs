@@ -2,6 +2,7 @@
 //! mesh, local IPC, agent MCP server, and host status.
 
 pub mod auth;
+pub mod cache;
 pub mod config;
 pub mod governor;
 pub mod ipc;

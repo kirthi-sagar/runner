@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.4.4 and prior)
+## Shipped (v0.4.5 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 11 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,7 +14,13 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 
-## Current: v0.4.5 Cloud Money Safety
+## Current: v0.5.0 Transparent LAN Cache Proxy
+
+- `ACTIONS_CACHE_URL` proxy server + content-addressed store.
+- Worker injection + `runner cache` operator CLI.
+- Cache visibility across IPC/MCP/dashboard/health.
+
+## Shipped in v0.4.5: Cloud Money Safety
 
 - Fail-closed spend ledger enforcement.
 - Startup orphan reconciliation + always-run watchdog.
@@ -40,14 +46,12 @@ services or heavyweight frameworks.
 - Dynamic cloud provider resolution (DigitalOcean / Render).
 - Documentation synchronized with the shipped product.
 
-## Next: v0.5.0 Transparent LAN Cache Proxy
+## Later: cache federation follow-ups
 
-- `ACTIONS_CACHE_URL`-compatible cache endpoint served from LAN
-  peers: cache hits stay on the local network instead of reaching
-  the internet, cutting job setup time on warm meshes.
-- Content-addressed store with TTL eviction and per-repo isolation.
-- Mesh-advertised capability with graceful fallback when no cache
-  peer is present.
+- Mesh-advertised cache capability: hits shared across LAN peers
+  with graceful fallback when no cache peer is present.
+- TTL eviction layered over LRU; per-repo isolation once the
+  protocol can carry repo identity (standard clients send none).
 
 ## Explicit non-goals
 

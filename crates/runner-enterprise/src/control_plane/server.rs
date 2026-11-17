@@ -48,6 +48,7 @@ async fn health() -> impl IntoResponse {
     // Cloud stats are best-effort: the daemon owns cloud nodes, and
     // this server may run on a host without one (nulls, still healthy).
     let (cloud_nodes_active, cloud_spend_usd) = cloud_stats().await;
+    let cache = cache_stats().await;
     Json(serde_json::json!({
         "status": "healthy",
         "version": env!("CARGO_PKG_VERSION"),
@@ -55,7 +56,21 @@ async fn health() -> impl IntoResponse {
         "governor": governor,
         "cloud_nodes_active": cloud_nodes_active,
         "cloud_spend_usd": cloud_spend_usd,
+        "cache": cache,
     }))
+}
+
+/// Daemon LAN-cache stats over IPC (`None` when the daemon or the
+/// cache proxy is unreachable).
+async fn cache_stats() -> Option<serde_json::Value> {
+    let sock = runner_core::ipc::resolve_sock_path();
+    let Ok(res) = runner_core::ipc::ipc_call(&sock, "cache_stats").await else {
+        return None;
+    };
+    if res.get("error").is_some() {
+        return None;
+    }
+    res.get("result").cloned()
 }
 
 /// Daemon cloud stats over the local IPC socket: active node count +

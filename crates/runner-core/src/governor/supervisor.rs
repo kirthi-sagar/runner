@@ -18,6 +18,7 @@ use super::afk::AfkBoost;
 use super::cgroup::{weight_for_cpu_psi_with, CgroupSlice};
 use super::psi::{PressureLevel, PsiPoller, PsiSnapshot};
 use super::topology::detect_slots;
+use crate::cache::CacheStore;
 use crate::config::{PeerRecord, RunnerConfig};
 use crate::mesh::cloud::{CloudNode, CloudPool};
 use crate::mesh::peer::apply_donor_caps;
@@ -89,6 +90,7 @@ pub struct SupervisorState {
     cloud_nodes: Vec<CloudNode>,
     cloud_pool: Option<CloudPool>,
     cloud_spend_cap: f64,
+    cache: Option<(CacheStore, String)>,
     donor_caps: Option<(u32, u64)>,
     next_reservation: u64,
     in_flight: u32,
@@ -115,6 +117,7 @@ impl SupervisorState {
             cloud_nodes: Vec::new(),
             cloud_pool: None,
             cloud_spend_cap: 0.0,
+            cache: None,
             donor_caps: None,
             next_reservation: 1,
             in_flight: 0,
@@ -237,6 +240,21 @@ impl SupervisorState {
 
     pub fn cloud_pool(&self) -> Option<CloudPool> {
         self.cloud_pool.clone()
+    }
+
+    /// Attach the LAN cache store + advertised base URL (once, at daemon
+    /// startup after the proxy binds). Absent when binding failed.
+    pub fn set_cache(&mut self, store: CacheStore, base_url: String) {
+        self.cache = Some((store, base_url));
+    }
+
+    pub fn cache_store(&self) -> Option<CacheStore> {
+        self.cache.as_ref().map(|(store, _)| store.clone())
+    }
+
+    /// Base URL workers use for `ACTIONS_CACHE_URL` (None = disabled).
+    pub fn cache_base_url(&self) -> Option<String> {
+        self.cache.as_ref().map(|(_, url)| url.clone())
     }
 
     pub fn cloud_spend_cap(&self) -> f64 {

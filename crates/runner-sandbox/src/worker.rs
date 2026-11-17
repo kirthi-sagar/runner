@@ -119,6 +119,8 @@ pub struct WorkerLaunch {
     /// Sandbox workspace setup for the child (mount namespaces + tmpfs).
     /// `None` runs unsandboxed (hosts blocking unprivileged userns).
     pub sandbox: Option<crate::mounts::SandboxSpec>,
+    /// Extra environment for the child (e.g. cache endpoint injection).
+    pub env: Vec<(String, String)>,
 }
 
 impl WorkerLaunch {
@@ -127,11 +129,17 @@ impl WorkerLaunch {
             work_dir,
             jit_config: jit_config.into(),
             sandbox: None,
+            env: Vec::new(),
         }
     }
 
     pub fn sandboxed(mut self, spec: crate::mounts::SandboxSpec) -> Self {
         self.sandbox = Some(spec);
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
         self
     }
 
@@ -151,6 +159,9 @@ impl WorkerLaunch {
             .arg("--jitconfig")
             .arg(&self.jit_config);
         for (key, value) in runner_core::governor::topology::sandbox_env_clamps() {
+            cmd.env(key, value);
+        }
+        for (key, value) in &self.env {
             cmd.env(key, value);
         }
         cmd
@@ -207,6 +218,9 @@ pub async fn run_supervised(
         .arg(&launch.jit_config)
         .kill_on_drop(true);
     for (key, value) in runner_core::governor::topology::sandbox_env_clamps() {
+        cmd.env(key, value);
+    }
+    for (key, value) in &launch.env {
         cmd.env(key, value);
     }
     if let Some(spec) = launch.sandbox.clone() {

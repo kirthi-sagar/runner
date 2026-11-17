@@ -220,6 +220,8 @@ pub struct DispatchContext {
     pub worker_version: String,
     pub sandboxed: bool,
     pub timeout: Duration,
+    /// LAN cache proxy base URL (None when the proxy failed to bind).
+    pub cache_url: Option<String>,
 }
 
 /// Dispatch one job locally: mint JIT → cache worker → sandbox → supervise.
@@ -250,6 +252,13 @@ pub async fn dispatch_local(
     if ctx.sandboxed {
         let spec = workspace.sandbox_spec()?;
         launch = launch.sandboxed(spec);
+    }
+    // Transparent LAN cache: no cache_url means the proxy failed to
+    // bind at boot, and the worker falls back to upstream caching.
+    if let Some(url) = ctx.cache_url.as_deref() {
+        for (key, value) in runner_core::cache::server::worker_env(url) {
+            launch = launch.env(key, value);
+        }
     }
     eprintln!(
         "runner: dispatching job {} ({}) sandboxed={}",

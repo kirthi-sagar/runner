@@ -4,8 +4,8 @@
 //! `get_fleet_topology`, `reserve_host_resources`,
 //! `release_host_resources`, `throttle_runner`, `request_cloud_capacity`,
 //! `drain_node`) plus three Phase 8 agent-native tools (`diagnose_system`,
-//! `test_provider`, `exec_command`) and Phase 10 `manage_cloud_capacity`,
-//! dispatched through [`AgentTools`].
+//! `test_provider`, `exec_command`), Phase 10 `manage_cloud_capacity`,
+//! and v0.5.0 `get_cache_stats`, dispatched through [`AgentTools`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,9 +29,10 @@ pub const TOOL_DIAGNOSE_SYSTEM: &str = "diagnose_system";
 pub const TOOL_TEST_PROVIDER: &str = "test_provider";
 pub const TOOL_EXEC_COMMAND: &str = "exec_command";
 pub const TOOL_MANAGE_CLOUD_CAPACITY: &str = "manage_cloud_capacity";
+pub const TOOL_GET_CACHE_STATS: &str = "get_cache_stats";
 
 /// All tool names, in contract order.
-pub const ALL_TOOLS: [&str; 11] = [
+pub const ALL_TOOLS: [&str; 12] = [
     TOOL_GET_CI_STATUS,
     TOOL_GET_FLEET_TOPOLOGY,
     TOOL_RESERVE_HOST_RESOURCES,
@@ -43,6 +44,7 @@ pub const ALL_TOOLS: [&str; 11] = [
     TOOL_TEST_PROVIDER,
     TOOL_EXEC_COMMAND,
     TOOL_MANAGE_CLOUD_CAPACITY,
+    TOOL_GET_CACHE_STATS,
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,6 +260,7 @@ pub async fn execute_tool(
 ) -> Result<serde_json::Value, ToolError> {
     match name {
         TOOL_GET_CI_STATUS => get_ci_status(ctx).await,
+        TOOL_GET_CACHE_STATS => get_cache_stats(ctx).await,
         TOOL_GET_FLEET_TOPOLOGY => get_fleet_topology(ctx).await,
         TOOL_RESERVE_HOST_RESOURCES => {
             let args: ReserveHostResourcesArgs = parse_args(args)?;
@@ -366,6 +369,26 @@ async fn get_ci_status(ctx: &ToolContext) -> Result<serde_json::Value, ToolError
         "drained_nodes": state.drained_nodes(),
         "forges": state.forge_health(),
     }))
+}
+
+async fn get_cache_stats(ctx: &ToolContext) -> Result<serde_json::Value, ToolError> {
+    let state = ctx.state.read().await;
+    match state.cache_store() {
+        Some(store) => {
+            let stats = store.stats();
+            Ok(serde_json::json!({
+                "enabled": true,
+                "entries": stats.entries,
+                "size_bytes": stats.size_bytes,
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "hit_ratio": stats.hit_ratio,
+                "bytes_served": stats.bytes_served,
+                "bytes_uploaded": stats.bytes_uploaded,
+            }))
+        }
+        None => Ok(serde_json::json!({ "enabled": false })),
+    }
 }
 
 async fn get_fleet_topology(ctx: &ToolContext) -> Result<serde_json::Value, ToolError> {
@@ -630,6 +653,7 @@ pub fn tool_description(name: &str) -> &'static str {
         TOOL_TEST_PROVIDER => "Verify CI provider credentials and connectivity.",
         TOOL_EXEC_COMMAND => "Run a command under zero-freeze governance; capture output.",
         TOOL_MANAGE_CLOUD_CAPACITY => "List, terminate, or purge daemon cloud burst workers.",
+        TOOL_GET_CACHE_STATS => "LAN cache entries, size, hits, misses, and bandwidth saved.",
         _ => "Unknown tool.",
     }
 }
@@ -679,9 +703,32 @@ mod tests {
         assert_eq!(err.code, -32601);
     }
 
+    #[tokio::test]
+    async fn cache_stats_reports_disabled_then_live_counters() {
+        let ctx = ctx();
+        let out = execute_tool(TOOL_GET_CACHE_STATS, None, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["enabled"], false);
+
+        let dir = crate::test_support::TempDir::new("mcp-cache").unwrap();
+        let store = crate::cache::store::CacheStore::open(&dir.path().join("c"), 1 << 30).unwrap();
+        store.lookup("v", &["nothing-here".to_string()]);
+        ctx.state
+            .write()
+            .await
+            .set_cache(store, "http://127.0.0.1:8787".to_string());
+        let out = execute_tool(TOOL_GET_CACHE_STATS, None, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["enabled"], true);
+        assert_eq!(out["misses"], 1);
+        assert_eq!(out["entries"], 0);
+    }
+
     #[test]
-    fn all_eleven_tools_have_schemas_and_descriptions() {
-        assert_eq!(ALL_TOOLS.len(), 11);
+    fn all_twelve_tools_have_schemas_and_descriptions() {
+        assert_eq!(ALL_TOOLS.len(), 12);
         for name in ALL_TOOLS {
             let schema = tool_schema(name);
             assert_eq!(schema["type"], "object", "{name}");

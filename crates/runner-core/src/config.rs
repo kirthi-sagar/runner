@@ -499,6 +499,52 @@ pub struct RunnerConfig {
     pub security: SecurityConfig,
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+}
+
+/// Transparent LAN cache proxy (`ACTIONS_CACHE_URL`) settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Listen address for the cache proxy (default 127.0.0.1:8787).
+    #[serde(default = "default_cache_listen")]
+    pub listen: String,
+    /// Store directory override (default `~/.runner/cache/`).
+    #[serde(default)]
+    pub dir: String,
+    /// Disk budget in GiB before LRU eviction (default 10).
+    #[serde(default = "default_cache_max_size_gb")]
+    pub max_size_gb: u64,
+}
+
+fn default_cache_listen() -> String {
+    "127.0.0.1:8787".to_string()
+}
+
+fn default_cache_max_size_gb() -> u64 {
+    10
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_cache_listen(),
+            dir: String::new(),
+            max_size_gb: default_cache_max_size_gb(),
+        }
+    }
+}
+
+/// Resolve the cache directory: explicit `[cache] dir` wins, else
+/// `~/.runner/cache/` (current dir fallback without HOME).
+pub fn resolve_cache_dir(config: &CacheConfig) -> std::path::PathBuf {
+    if !config.dir.trim().is_empty() {
+        return std::path::PathBuf::from(config.dir.trim());
+    }
+    std::env::var_os("HOME").map_or_else(
+        || std::path::PathBuf::from(".runner-cache"),
+        |home| std::path::PathBuf::from(home).join(".runner").join("cache"),
+    )
 }
 
 /// Resource-governor tuning: CPU PSI `some avg10` bands for the

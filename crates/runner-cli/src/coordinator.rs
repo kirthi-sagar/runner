@@ -173,7 +173,7 @@ pub async fn spawn_coordinator(
     // no per-forge timeout).
     let timeout = Duration::from_secs(config.coordinator.job_timeout_mins * 60);
     if forges.contains(&Forge::Github) {
-        spawn_github(config, &tokens, cloud.clone(), state.clone(), sandboxed);
+        spawn_github(config, &tokens, cloud.clone(), state.clone(), sandboxed).await;
     }
     if forges.contains(&Forge::Gitlab) {
         let provider = Arc::new(GitlabProvider::new(
@@ -214,7 +214,7 @@ pub async fn spawn_coordinator(
 }
 
 /// GitHub branch of [`spawn_coordinator`] (pre-existing behavior).
-fn spawn_github(
+async fn spawn_github(
     config: &RunnerConfig,
     tokens: &ForgeTokens,
     cloud: Option<CloudPool>,
@@ -243,6 +243,8 @@ fn spawn_github(
             repo: coord.repo_name.clone().unwrap_or_default(),
         },
     };
+    // Cache endpoint when the proxy bound successfully at boot.
+    let cache_url = state.read().await.cache_base_url();
     let dispatch = coord.auto_dispatch.then(|| DispatchContext {
         github,
         scope,
@@ -250,6 +252,7 @@ fn spawn_github(
         worker_version: coord.worker_version.clone(),
         sandboxed,
         timeout: std::time::Duration::from_secs(coord.job_timeout_mins * 60),
+        cache_url,
     });
     tokio::spawn(run_coordinator(
         poller,

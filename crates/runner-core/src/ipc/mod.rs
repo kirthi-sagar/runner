@@ -104,6 +104,47 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                 "spend_error": spend_error,
             } })
         }
+        "cache_stats" => {
+            let guard = state.read().await;
+            match guard.cache_store() {
+                Some(store) => {
+                    let stats = store.stats();
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                        "entries": stats.entries,
+                        "size_bytes": stats.size_bytes,
+                        "hits": stats.hits,
+                        "misses": stats.misses,
+                        "hit_ratio": stats.hit_ratio,
+                        "bytes_served": stats.bytes_served,
+                        "bytes_uploaded": stats.bytes_uploaded,
+                    } })
+                }
+                None => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": "cache proxy not running" } }),
+            }
+        }
+        "cache_clear" => {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
+            let older_than_days = params.get("older_than_days").and_then(Value::as_u64);
+            if !all && older_than_days.is_none() {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "all or older_than_days is required" } });
+            }
+            let guard = state.read().await;
+            match guard.cache_store() {
+                Some(store) => {
+                    let days = if all { None } else { older_than_days };
+                    let (removed, freed_bytes) = store.clear(days);
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                        "removed": removed,
+                        "freed_bytes": freed_bytes,
+                    } })
+                }
+                None => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": "cache proxy not running" } }),
+            }
+        }
         "cloud_terminate" => {
             let instance_id = value
                 .get("params")
@@ -352,6 +393,39 @@ mod tests {
         // Tracked pool, but the error — not $0.00 — is the signal.
         assert_eq!(result["spend_tracked"], true);
         assert!(result["spend_error"].as_str().unwrap().contains("parse"));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_and_clear_roundtrip() {
+        let state = new_shared_state();
+        // No cache attached: honest error, not zeros.
+        let res = handle_ipc_request(cloud_req("cache_stats", serde_json::json!({})), &state).await;
+        assert!(res.get("error").is_some());
+
+        let dir = crate::test_support::TempDir::new("ipc-cache").unwrap();
+        let store = crate::cache::store::CacheStore::open(&dir.path().join("c"), 1 << 30).unwrap();
+        store.reserve("k", "v").unwrap();
+        state
+            .write()
+            .await
+            .set_cache(store, "http://127.0.0.1:8787".to_string());
+        assert_eq!(
+            state.read().await.cache_base_url().as_deref(),
+            Some("http://127.0.0.1:8787")
+        );
+        let res = handle_ipc_request(cloud_req("cache_stats", serde_json::json!({})), &state).await;
+        assert_eq!(res["result"]["entries"], 0);
+        assert_eq!(res["result"]["hit_ratio"], 0.0);
+
+        // Clear requires explicit scope.
+        let res = handle_ipc_request(cloud_req("cache_clear", serde_json::json!({})), &state).await;
+        assert!(res.get("error").is_some());
+        let res = handle_ipc_request(
+            cloud_req("cache_clear", serde_json::json!({ "all": true })),
+            &state,
+        )
+        .await;
+        assert_eq!(res["result"]["removed"], 0);
     }
 
     #[tokio::test]

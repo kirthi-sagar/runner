@@ -148,6 +148,9 @@ pub trait AgentTools: Send + Sync + std::fmt::Debug {
         action: &str,
         instance_id: Option<&str>,
     ) -> Result<serde_json::Value, ToolError>;
+    /// Report LAN cache counters. Goes through daemon IPC: the cache
+    /// store lives in the daemon, not the MCP server process.
+    async fn cache_stats(&self) -> Result<serde_json::Value, ToolError>;
 }
 
 /// Placeholder impl used until the host wires the real agent tools.
@@ -182,6 +185,10 @@ impl AgentTools for StubAgentTools {
         _action: &str,
         _instance_id: Option<&str>,
     ) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::internal("agent tools not configured"))
+    }
+
+    async fn cache_stats(&self) -> Result<serde_json::Value, ToolError> {
         Err(ToolError::internal("agent tools not configured"))
     }
 }
@@ -260,7 +267,7 @@ pub async fn execute_tool(
 ) -> Result<serde_json::Value, ToolError> {
     match name {
         TOOL_GET_CI_STATUS => get_ci_status(ctx).await,
-        TOOL_GET_CACHE_STATS => get_cache_stats(ctx).await,
+        TOOL_GET_CACHE_STATS => ctx.agent.cache_stats().await,
         TOOL_GET_FLEET_TOPOLOGY => get_fleet_topology(ctx).await,
         TOOL_RESERVE_HOST_RESOURCES => {
             let args: ReserveHostResourcesArgs = parse_args(args)?;
@@ -369,26 +376,6 @@ async fn get_ci_status(ctx: &ToolContext) -> Result<serde_json::Value, ToolError
         "drained_nodes": state.drained_nodes(),
         "forges": state.forge_health(),
     }))
-}
-
-async fn get_cache_stats(ctx: &ToolContext) -> Result<serde_json::Value, ToolError> {
-    let state = ctx.state.read().await;
-    match state.cache_store() {
-        Some(store) => {
-            let stats = store.stats();
-            Ok(serde_json::json!({
-                "enabled": true,
-                "entries": stats.entries,
-                "size_bytes": stats.size_bytes,
-                "hits": stats.hits,
-                "misses": stats.misses,
-                "hit_ratio": stats.hit_ratio,
-                "bytes_served": stats.bytes_served,
-                "bytes_uploaded": stats.bytes_uploaded,
-            }))
-        }
-        None => Ok(serde_json::json!({ "enabled": false })),
-    }
 }
 
 async fn get_fleet_topology(ctx: &ToolContext) -> Result<serde_json::Value, ToolError> {
@@ -704,26 +691,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_stats_reports_disabled_then_live_counters() {
-        let ctx = ctx();
-        let out = execute_tool(TOOL_GET_CACHE_STATS, None, &ctx)
-            .await
-            .unwrap();
-        assert_eq!(out["enabled"], false);
-
-        let dir = crate::test_support::TempDir::new("mcp-cache").unwrap();
-        let store = crate::cache::store::CacheStore::open(&dir.path().join("c"), 1 << 30).unwrap();
-        store.lookup("v", &["nothing-here".to_string()]);
-        ctx.state
-            .write()
-            .await
-            .set_cache(store, "http://127.0.0.1:8787".to_string());
+    async fn cache_stats_delegates_to_agent() {
+        let (ctx, _agent) = agent_ctx();
         let out = execute_tool(TOOL_GET_CACHE_STATS, None, &ctx)
             .await
             .unwrap();
         assert_eq!(out["enabled"], true);
-        assert_eq!(out["misses"], 1);
-        assert_eq!(out["entries"], 0);
+        assert_eq!(out["entries"], 3);
     }
 
     #[test]
@@ -798,6 +772,10 @@ mod tests {
                 .unwrap()
                 .push((action.to_string(), instance_id.map(str::to_string)));
             Ok(serde_json::json!({ "action": action, "active_nodes": 0 }))
+        }
+
+        async fn cache_stats(&self) -> Result<serde_json::Value, ToolError> {
+            Ok(serde_json::json!({ "enabled": true, "entries": 3 }))
         }
     }
 

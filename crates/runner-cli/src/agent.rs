@@ -141,4 +141,25 @@ impl AgentTools for CliAgentTools {
         }
         Ok(result)
     }
+
+    async fn cache_stats(&self) -> Result<serde_json::Value, ToolError> {
+        // Same split as manage_cloud: the daemon owns the store, so this
+        // goes over daemon IPC — the same method `runner cache` uses.
+        let sock = resolve_sock_path();
+        let res = ipc_call_with(&sock, "cache_stats", None)
+            .await
+            .map_err(|_| {
+                ToolError::internal(format!("daemon not reachable at {}", sock.display()))
+            })?;
+        if res.get("error").is_some() {
+            // Proxy not running in the daemon: honest disabled signal.
+            return Ok(serde_json::json!({ "enabled": false }));
+        }
+        let Some(result) = res.get("result").and_then(|v| v.as_object()) else {
+            return Ok(serde_json::json!({ "enabled": false }));
+        };
+        let mut out = serde_json::Value::Object(result.clone());
+        out["enabled"] = serde_json::Value::Bool(true);
+        Ok(out)
+    }
 }

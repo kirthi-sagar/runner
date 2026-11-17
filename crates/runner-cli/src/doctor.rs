@@ -460,8 +460,18 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         assert!(tcp_reachable(addr));
         drop(listener);
-        // The closed port now refuses (fast, no timeout burn).
-        assert!(!tcp_reachable(addr));
+        // The closed port now refuses (fast, no timeout burn). Retry
+        // briefly: a parallel test binary can reuse the ephemeral port
+        // within microseconds of the drop.
+        let mut refused = false;
+        for _ in 0..20 {
+            if !tcp_reachable(addr) {
+                refused = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(refused, "closed port stayed reachable: {addr}");
         // Documentation prefix is unroutable; must report unreachable,
         // not hang past the timeout (generous upper bound for CI).
         let dark = std::net::SocketAddr::from_str("192.0.2.1:443").unwrap();

@@ -147,6 +147,15 @@ impl CloudPool {
         }
     }
 
+    /// First configured burst provider (DigitalOcean preferred, Render
+    /// fallback). `None` when no provider client is configured.
+    pub fn preferred_provider(&self) -> Option<String> {
+        ["digitalocean", "render"]
+            .into_iter()
+            .find(|p| self.has_provider(p))
+            .map(str::to_string)
+    }
+
     /// Provision one ephemeral worker on the named provider.
     /// Refused outright when the security profile is air-gapped.
     pub async fn provision(&self, provider: &str, name: &str) -> Result<CloudNode, String> {
@@ -237,6 +246,30 @@ mod tests {
         let open = CloudPool::from_config(&crate::config::RunnerConfig::default());
         let err = open.provision("digitalocean", "ci-1").await.unwrap_err();
         assert!(err.contains("not configured"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn preferred_provider_prefers_do_then_render() {
+        let pool = CloudPool::from_clients(None, None);
+        assert_eq!(pool.preferred_provider(), None);
+
+        let render_only = CloudPool::from_clients(
+            None,
+            Some((
+                render::RenderClient::new("t").unwrap(),
+                "owner-id".to_string(),
+            )),
+        );
+        assert_eq!(render_only.preferred_provider().as_deref(), Some("render"));
+
+        let both = CloudPool::from_clients(
+            Some(digitalocean::DoClient::new("t").unwrap()),
+            Some((
+                render::RenderClient::new("t").unwrap(),
+                "owner-id".to_string(),
+            )),
+        );
+        assert_eq!(both.preferred_provider().as_deref(), Some("digitalocean"));
     }
 
     #[test]

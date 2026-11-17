@@ -5,15 +5,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use runner_core::config::{
-    github_token_from_env, load_env_file, DonorConfig, PeerRecord, RunnerConfig,
-};
-use runner_core::governor::cgroup::CgroupSlice;
+use runner_cli::coordinator::spawn_coordinator;
+use runner_core::config::{load_env_file, DonorConfig, PeerRecord, RunnerConfig};
 use runner_core::governor::supervisor::{new_shared_state, run_supervisor};
 use runner_core::ipc::{ipc_call, ipc_call_with, resolve_sock_path, IpcServer};
 use runner_core::mcp::server::McpServer;
 use runner_core::mcp::tools::ToolContext;
-use runner_core::mesh::cloud::CloudPool;
 use runner_core::mesh::invite::{
     generate_secret_hex, parse_size_mb, parse_ttl_secs, secret_from_hex, InviteAuthority,
     InviteCaps, InviteRole, InviteToken,
@@ -24,8 +21,6 @@ use runner_core::pidfile::{
     wait_for_exit, write_current_pid,
 };
 use runner_core::status::status_report;
-use runner_providers::github::client::GithubClient;
-use runner_providers::github::webhooks::{run_coordinator, DispatchContext, JitScope, QueuePoller};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -522,62 +517,6 @@ async fn cmd_listen(port: u16, secret: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Spawn the coordinator poll loop when a repo + token are configured.
-/// Without them the daemon runs governor-only.
-fn spawn_coordinator(config: &RunnerConfig, state: runner_core::governor::supervisor::SharedState) {
-    let coord = &config.coordinator;
-    let (Some(owner), Some(repo)) = (coord.repo_owner.clone(), coord.repo_name.clone()) else {
-        eprintln!("runner: no coordinator repo configured; governor-only mode");
-        return;
-    };
-    let Some(token) = github_token_from_env() else {
-        eprintln!("runner: RUNNER_GITHUB_TOKEN unset; governor-only mode");
-        return;
-    };
-    let github = match GithubClient::new(token) {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("runner: github client: {e}");
-            return;
-        }
-    };
-    let poller = QueuePoller::new(github.clone(), owner, repo)
-        .with_interval(std::time::Duration::from_secs(coord.poll_secs.max(5)));
-    let scope = match config.org.clone() {
-        Some(org) => JitScope::Org { org },
-        None => JitScope::Repo {
-            owner: coord.repo_owner.clone().unwrap_or_default(),
-            repo: coord.repo_name.clone().unwrap_or_default(),
-        },
-    };
-    let dispatch = coord.auto_dispatch.then(|| DispatchContext {
-        github,
-        scope,
-        runner_group_id: coord.runner_group_id,
-        worker_version: coord.worker_version.clone(),
-        sandboxed: runner_sandbox::mounts::probe_userns(),
-        timeout: std::time::Duration::from_secs(coord.job_timeout_mins * 60),
-    });
-    if dispatch.as_ref().is_some_and(|d| !d.sandboxed) {
-        eprintln!("runner: unprivileged userns blocked; dispatches run unsandboxed");
-    }
-    let cloud = (config.cloud.max_monthly_spend > 0.0).then(|| CloudPool::from_config(config));
-    // Attach the pool to shared state so IPC-driven termination
-    // (`cloud_terminate`/`cloud_purge`) can reach the provider APIs.
-    if let Some(pool) = cloud.clone() {
-        state
-            .blocking_write()
-            .set_cloud_pool(pool, config.cloud.max_monthly_spend);
-    }
-    tokio::spawn(run_coordinator(
-        poller,
-        dispatch,
-        cloud,
-        state,
-        CgroupSlice::system_default(),
-    ));
-}
-
 fn cmd_stop(force: bool) -> Result<()> {
     let pid_path = resolve_pid_path();
     let sock_path = resolve_sock_path();
@@ -961,7 +900,7 @@ async fn main() -> Result<()> {
             if let Err(e) = write_current_pid(&pid_path) {
                 eprintln!("runner: pid file unavailable ({e})");
             }
-            spawn_coordinator(&config, state.clone());
+            spawn_coordinator(&config, state.clone()).await;
             spawn_embedded_listener(&config, state.clone()).await;
             run_supervisor(state).await?;
             remove_pidfile(&pid_path);

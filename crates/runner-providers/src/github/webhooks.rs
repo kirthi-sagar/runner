@@ -164,11 +164,13 @@ pub enum RouteDecision {
 }
 
 /// Route one job: local slot → non-drained WAN peer → cloud burst → wait.
+/// `cloud_provider` is the resolved burst target (`None` when no cloud
+/// provider is configured); routing never hardcodes a provider name.
 pub fn route_job(
     local_slots_free: u32,
     peers: &[runner_core::config::PeerRecord],
     drained: &std::collections::HashMap<String, String>,
-    cloud_available: bool,
+    cloud_provider: Option<&str>,
 ) -> RouteDecision {
     if local_slots_free > 0 {
         return RouteDecision::Local;
@@ -178,12 +180,24 @@ pub fn route_job(
             node_id: peer.node_id.clone(),
         };
     }
-    if cloud_available {
+    if let Some(provider) = cloud_provider {
         return RouteDecision::Cloud {
-            provider: "digitalocean".to_string(),
+            provider: provider.to_string(),
         };
     }
     RouteDecision::Wait
+}
+
+/// True when the queued job is already tracked as in flight (a prior
+/// poll dispatched it locally or provisioned a cloud node for it).
+/// The coordinator skips such jobs so each unique job dispatches
+/// exactly once no matter how many polls observe it queued.
+pub fn already_in_flight(
+    in_flight: &[runner_core::governor::supervisor::InFlightJob],
+    job_id: u64,
+) -> bool {
+    let id = job_id.to_string();
+    in_flight.iter().any(|j| j.id == id)
 }
 
 /// JIT issuance scope for local dispatches.
@@ -363,18 +377,24 @@ pub async fn run_coordinator(
         };
         state.write().await.set_queue_depth(jobs.len() as u32);
         for job in jobs {
-            let (free, peers, drained) = {
+            let (free, peers, drained, flying) = {
                 let guard = state.read().await;
                 (
                     guard.last_slots.saturating_sub(guard.in_flight()),
                     guard.peers(),
                     guard.drained_nodes(),
+                    guard.in_flight_jobs(),
                 )
             };
-            let cloud_available = cloud.as_ref().is_some_and(|pool| {
-                pool.has_provider("digitalocean") || pool.has_provider("render")
-            });
-            match route_job(free, &peers, &drained, cloud_available) {
+            if already_in_flight(&flying, job.id) {
+                eprintln!(
+                    "runner: job {} ({}) already in flight; skipping re-dispatch",
+                    job.id, job.name
+                );
+                continue;
+            }
+            let cloud_provider = cloud.as_ref().and_then(|pool| pool.preferred_provider());
+            match route_job(free, &peers, &drained, cloud_provider.as_deref()) {
                 RouteDecision::Local => {
                     eprintln!("runner: job {} ({}) routed local", job.id, job.name);
                     if let Some(ctx) = dispatch.clone() {
@@ -422,6 +442,14 @@ pub async fn run_coordinator(
                             );
                             continue;
                         }
+                        // Track the cloud dispatch so later polls dedup
+                        // against it. Cloud entries persist (remote jobs
+                        // report no completion signal) and roll off via
+                        // the tracked-jobs cap.
+                        state
+                            .write()
+                            .await
+                            .job_started("github", &job.id.to_string(), &job.name);
                         let state = state.clone();
                         let pool = pool.clone();
                         tokio::spawn(async move {
@@ -619,30 +647,59 @@ mod tests {
             status: "online".to_string(),
         };
         assert_eq!(
-            route_job(1, &[], &HashMap::new(), false),
+            route_job(1, &[], &HashMap::new(), None),
             RouteDecision::Local
         );
         assert_eq!(
-            route_job(0, std::slice::from_ref(&peer), &HashMap::new(), false),
+            route_job(0, std::slice::from_ref(&peer), &HashMap::new(), None),
             RouteDecision::WanPeer {
                 node_id: "n1".to_string()
             }
         );
         assert_eq!(
-            route_job(0, &[], &HashMap::new(), true),
+            route_job(0, &[], &HashMap::new(), Some("digitalocean")),
             RouteDecision::Cloud {
                 provider: "digitalocean".to_string()
             }
         );
         assert_eq!(
-            route_job(0, &[], &HashMap::new(), false),
+            route_job(0, &[], &HashMap::new(), None),
             RouteDecision::Wait
         );
         let mut drained = HashMap::new();
         drained.insert("n1".to_string(), "t".to_string());
         assert_eq!(
-            route_job(0, std::slice::from_ref(&peer), &drained, false),
+            route_job(0, std::slice::from_ref(&peer), &drained, None),
             RouteDecision::Wait
         );
+    }
+
+    #[test]
+    fn routing_selects_render_fallback_provider() {
+        use std::collections::HashMap;
+        // Render-only pool: the resolved provider flows through
+        // instead of a hardcoded DigitalOcean selection.
+        assert_eq!(
+            route_job(0, &[], &HashMap::new(), Some("render")),
+            RouteDecision::Cloud {
+                provider: "render".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn consecutive_polls_dispatch_once() {
+        use runner_core::governor::supervisor::SupervisorState;
+        // Poll 1 observes the job, dispatches, and records it.
+        let mut state = SupervisorState::default();
+        assert!(!already_in_flight(&state.in_flight_jobs(), 42));
+        state.job_started("github", "42", "ci");
+        // Poll 2 observes the same queued job id: skip, no re-dispatch.
+        assert!(already_in_flight(&state.in_flight_jobs(), 42));
+        // A different job still dispatches.
+        assert!(!already_in_flight(&state.in_flight_jobs(), 43));
+        // Completion releases the id for future runs.
+        state.job_finished("42");
+        assert!(!already_in_flight(&state.in_flight_jobs(), 42));
     }
 }

@@ -6,7 +6,20 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
-## Unreleased (v0.4.1)
+## Unreleased (v0.4.2)
+
+- Fixed fatal daemon abort on startup whenever cloud bursting was
+  enabled (`blocking_write` inside the tokio runtime; the
+  coordinator spawn path is now fully async).
+- In-flight job deduplication: each unique queued job dispatches
+  or provisions exactly once across poll ticks.
+- Cloud routing resolves the burst provider dynamically
+  (DigitalOcean preferred, Render fallback) instead of hardcoding
+  DigitalOcean.
+- Documentation synchronized with the shipped product (release
+  close-out, 11-tool MCP catalog, ledger-backed spend samples).
+
+## v0.4.1 — 2026-11-17
 
 - Persistent cloud spend ledger (`~/.runner/spend_ledger.json`) with
   hard budget stops in the coordinator.

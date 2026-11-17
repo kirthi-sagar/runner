@@ -5,21 +5,23 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.4.0 and prior)
+## Shipped (v0.4.1 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 11 MCP tools, embedded dashboard, OIDC control plane.
 - Mesh federation, cloud bursting + 5-minute scale-to-zero watchdog.
 - eBPF egress, microVM tier, audit/policy, hooks, doctor.
+- Spend ledger + budget stops, dynamic eBPF IHL walking, mock
+  cloud lifecycle harness.
 
-## Next: v0.4.1 Hardening (in progress)
+## Current: v0.4.2 Stability & In-Flight Dedup
 
-- Persistent spend ledger + coordinator budget stops.
-- Dynamic eBPF IHL walking for IPv4.
-- Mock cloud lifecycle test harness.
-- CHANGELOG + ROADMAP hygiene (this release).
+- Fix coordinator startup abort with cloud bursting enabled.
+- In-flight job deduplication across poll ticks.
+- Dynamic cloud provider resolution (DigitalOcean / Render).
+- Documentation synchronized with the shipped product.
 
-## Then: v0.5.0 Transparent LAN Cache Proxy
+## Next: v0.5.0 Transparent LAN Cache Proxy
 
 - `ACTIONS_CACHE_URL`-compatible cache endpoint served from LAN
   peers: cache hits stay on the local network instead of reaching

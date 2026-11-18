@@ -274,7 +274,9 @@ mod tests {
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::env::set_var("RUNNER_LOGINCTL", &stub);
-        assert_eq!(poll_desktop_idle(300), IdleState::Idle);
+        // Threshold 0: the stub idles since boot, so any host uptime
+        // (even a fresh CI VM under the 300s default) reads Idle.
+        assert_eq!(poll_desktop_idle(0), IdleState::Idle);
         // Missing binary fails safe to Active.
         std::env::set_var("RUNNER_LOGINCTL", "/nonexistent/loginctl-stub");
         assert_eq!(poll_desktop_idle(300), IdleState::Active);

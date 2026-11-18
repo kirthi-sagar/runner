@@ -6,6 +6,18 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v0.8.0 — 2026-11-18
+
+- `runner doctor` covers cache (proxy reachability, store
+  writability, TTL state), workstation guards (temp/power with
+  85°C latch note), and AFK (mode + idle-detector presence).
+- New checks are Pass/Warn only; MCP `diagnose_system` inherits
+  them via the shared `run_all`.
+- ROADMAP normalized to reverse-chronological order with a
+  v1.0 GA-readiness horizon; README doctor flags documented.
+- Release smoke tests pin installer asset naming, checksum flow,
+  and version-literal consistency.
+
 ## v0.7.0 — 2026-11-18
 
 - AFK Boost wiring: `loginctl` desktop-idle probing (5s throttle on the

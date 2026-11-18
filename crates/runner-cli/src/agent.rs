@@ -34,7 +34,7 @@ impl AgentTools for CliAgentTools {
     ) -> Result<serde_json::Value, ToolError> {
         // Reuse the CLI renderer, then parse back: MCP and `doctor
         // --format json` share one schema by construction.
-        let checks = run_all(enterprise, egress).await;
+        let checks = run_all(&self.config, enterprise, egress).await;
         serde_json::from_str(&render_json(&checks)).map_err(|e| ToolError::internal(e.to_string()))
     }
 

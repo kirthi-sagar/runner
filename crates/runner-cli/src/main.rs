@@ -801,10 +801,15 @@ fn cmd_mcp_install(target: &str) -> Result<()> {
 }
 
 /// `runner doctor`: print the readiness report; exit 1 on any failure.
-async fn cmd_doctor(enterprise: bool, egress: bool, format: &str) -> Result<()> {
+async fn cmd_doctor(
+    config: &RunnerConfig,
+    enterprise: bool,
+    egress: bool,
+    format: &str,
+) -> Result<()> {
     use runner_cli::doctor::{overall_ok, render_json, render_text, run_all};
 
-    let checks = run_all(enterprise, egress).await;
+    let checks = run_all(config, enterprise, egress).await;
     match format.trim().to_ascii_lowercase().as_str() {
         "text" => print!("{}", render_text(&checks)),
         "json" => println!("{}", render_json(&checks)),
@@ -1257,7 +1262,7 @@ async fn main() -> Result<()> {
             egress,
             format,
         } => {
-            cmd_doctor(enterprise, egress, &format).await?;
+            cmd_doctor(&config, enterprise, egress, &format).await?;
         }
         Commands::Provider { command } => match command {
             ProviderCommands::Test { provider } => {

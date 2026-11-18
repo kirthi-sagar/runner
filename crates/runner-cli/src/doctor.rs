@@ -324,9 +324,177 @@ fn check_egress() -> Vec<Check> {
         .collect()
 }
 
+/// Compact duration rendering for TTL details (`7d`, `12h`, `90s`).
+fn format_ttl(ttl_secs: u64) -> String {
+    if ttl_secs == 0 {
+        return "disabled".to_string();
+    }
+    if ttl_secs.is_multiple_of(86_400) {
+        return format!("{}d", ttl_secs / 86_400);
+    }
+    if ttl_secs.is_multiple_of(3600) {
+        return format!("{}h", ttl_secs / 3600);
+    }
+    format!("{ttl_secs}s")
+}
+
+/// Gathered cache facts; verdict logic lives in [`cache_verdict`].
+struct CacheFacts {
+    listen: String,
+    writable: bool,
+    reachable: bool,
+    reachable_known: bool,
+    ttl_secs: u64,
+}
+
+/// Cache verdict: Pass only when the store is writable, the proxy
+/// answers on loopback, and TTL is enabled. Anything else is Warn —
+/// a stopped daemon or a fresh host must never fail `doctor`.
+fn cache_verdict(facts: &CacheFacts) -> Check {
+    let ttl = format_ttl(facts.ttl_secs);
+    if !facts.writable {
+        return Check::warn(
+            "cache",
+            format!("store not writable; proxy on {}", facts.listen),
+        );
+    }
+    if !facts.reachable_known {
+        return Check::warn(
+            "cache",
+            format!(
+                "store writable, but listen {:?} is unparseable",
+                facts.listen
+            ),
+        );
+    }
+    if !facts.reachable {
+        return Check::warn(
+            "cache",
+            format!(
+                "proxy on {} unreachable (daemon down?), store writable, TTL {ttl}",
+                facts.listen
+            ),
+        );
+    }
+    if facts.ttl_secs == 0 {
+        return Check::warn(
+            "cache",
+            format!("proxy on {}, store writable, TTL disabled", facts.listen),
+        );
+    }
+    Check::pass(
+        "cache",
+        format!(
+            "proxy on {}, store writable, TTL {ttl} active",
+            facts.listen
+        ),
+    )
+}
+
+/// Real writability proof: permission bits lie under ACLs and
+/// overlays, so create the directory and round-trip a probe file.
+fn store_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".doctor-write-probe");
+    if std::fs::write(&probe, b"ok").is_err() {
+        return false;
+    }
+    std::fs::remove_file(&probe).is_ok()
+}
+
+fn check_cache(config: &runner_core::config::RunnerConfig) -> Check {
+    use runner_core::config::resolve_cache_dir;
+    use std::str::FromStr;
+
+    let dir = resolve_cache_dir(&config.cache);
+    let writable = store_writable(&dir);
+    let listen = config.cache.listen.clone();
+    let (reachable, reachable_known) = match std::net::SocketAddr::from_str(&listen) {
+        Ok(addr) => (tcp_reachable(addr), true),
+        Err(_) => (false, false),
+    };
+    cache_verdict(&CacheFacts {
+        listen,
+        writable,
+        reachable,
+        reachable_known,
+        ttl_secs: config.cache.ttl_secs,
+    })
+}
+
+/// Gathered workstation-guard facts; verdict in [`guards_verdict`].
+struct GuardFacts {
+    temp_c: Option<f64>,
+    discharging: bool,
+}
+
+/// Guard verdict: always Pass except on battery (Warn: the governor
+/// halts intake while discharging, which operators should know).
+/// Missing sensors read as no-temp / AC, never as failure.
+fn guards_verdict(facts: &GuardFacts) -> Check {
+    let temp = facts
+        .temp_c
+        .map(|t| format!("{t:.1}°C"))
+        .unwrap_or_else(|| "n/a (no sensor)".to_string());
+    let power = if facts.discharging { "battery" } else { "AC" };
+    let detail = format!("temp {temp}, power {power} (85°C latch armed)");
+    if facts.discharging {
+        Check::warn("guards", detail)
+    } else {
+        Check::pass("guards", detail)
+    }
+}
+
+fn check_workstation_guards() -> Check {
+    use runner_core::governor::thermal::{package_temp_c, power_state, PowerState};
+
+    guards_verdict(&GuardFacts {
+        temp_c: package_temp_c(),
+        discharging: power_state() == PowerState::Discharging,
+    })
+}
+
+/// Gathered AFK facts; verdict in [`afk_verdict`].
+struct AfkFacts {
+    mode: String,
+    detector: bool,
+}
+
+/// AFK verdict: the configured mode (canonicalized) plus detector
+/// presence. A missing detector is Warn, never Fail: headless hosts
+/// without logind govern safely via fail-safe Active.
+fn afk_verdict(facts: &AfkFacts) -> Check {
+    if facts.detector {
+        Check::pass("afk", format!("mode {}, idle detector ready", facts.mode))
+    } else {
+        Check::warn(
+            "afk",
+            format!(
+                "mode {}, no loginctl detector (headless-safe: reads Active)",
+                facts.mode
+            ),
+        )
+    }
+}
+
+fn check_afk_boost(config: &runner_core::config::RunnerConfig) -> Check {
+    use runner_core::governor::afk::{detector_available, AfkMode};
+
+    afk_verdict(&AfkFacts {
+        mode: AfkMode::parse(&config.governor.afk_mode).name().to_string(),
+        detector: detector_available(),
+    })
+}
+
 /// Gather every check; `enterprise` adds policy + audit continuity,
 /// `egress` adds the report-only network compliance probes.
-pub async fn run_all(enterprise: bool, egress: bool) -> Vec<Check> {
+pub async fn run_all(
+    config: &runner_core::config::RunnerConfig,
+    enterprise: bool,
+    egress: bool,
+) -> Vec<Check> {
     let mut checks = vec![
         check_kernel(),
         check_cgroup(),
@@ -335,6 +503,9 @@ pub async fn run_all(enterprise: bool, egress: bool) -> Vec<Check> {
         check_ebpf(),
         check_daemon().await,
         check_mcp(),
+        check_cache(config),
+        check_workstation_guards(),
+        check_afk_boost(config),
     ];
     if enterprise {
         checks.push(check_policy());
@@ -478,5 +649,130 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(!tcp_reachable(dark));
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn ttl_renders_compact_units() {
+        assert_eq!(format_ttl(0), "disabled");
+        assert_eq!(format_ttl(604_800), "7d");
+        assert_eq!(format_ttl(43_200), "12h");
+        assert_eq!(format_ttl(90), "90s");
+    }
+
+    fn cache_facts() -> CacheFacts {
+        CacheFacts {
+            listen: "127.0.0.1:8787".to_string(),
+            writable: true,
+            reachable: true,
+            reachable_known: true,
+            ttl_secs: 604_800,
+        }
+    }
+
+    #[test]
+    fn cache_verdict_passes_only_when_fully_healthy() {
+        let pass = cache_verdict(&cache_facts());
+        assert_eq!(pass.status, Status::Pass);
+        assert_eq!(pass.name, "cache");
+        assert!(pass.detail.contains("TTL 7d active"));
+
+        // Every degraded shape warns; none fails.
+        let mut down = cache_facts();
+        down.reachable = false;
+        let warn = cache_verdict(&down);
+        assert_eq!(warn.status, Status::Warn);
+        assert!(warn.detail.contains("unreachable"));
+
+        let mut ro = cache_facts();
+        ro.writable = false;
+        assert_eq!(cache_verdict(&ro).status, Status::Warn);
+
+        let mut no_ttl = cache_facts();
+        no_ttl.ttl_secs = 0;
+        let warn = cache_verdict(&no_ttl);
+        assert_eq!(warn.status, Status::Warn);
+        assert!(warn.detail.contains("TTL disabled"));
+
+        let mut bad_listen = cache_facts();
+        bad_listen.reachable_known = false;
+        assert_eq!(cache_verdict(&bad_listen).status, Status::Warn);
+    }
+
+    #[test]
+    fn store_probe_creates_dir_and_cleans_up() {
+        let dir = runner_core::test_support::TempDir::new("doctor-writable").unwrap();
+        let nested = dir.path().join("a").join("b");
+        assert!(store_writable(&nested));
+        assert!(nested.is_dir());
+        assert!(!nested.join(".doctor-write-probe").exists());
+        // A path blocked by a regular file is not writable.
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, b"x").unwrap();
+        assert!(!store_writable(&blocker.join("sub")));
+    }
+
+    #[test]
+    fn guards_verdict_reports_temp_power_and_battery_warn() {
+        let ac = guards_verdict(&GuardFacts {
+            temp_c: Some(51.25),
+            discharging: false,
+        });
+        assert_eq!(ac.status, Status::Pass);
+        assert!(ac.detail.contains("51.2°C"));
+        assert!(ac.detail.contains("power AC"));
+
+        let batt = guards_verdict(&GuardFacts {
+            temp_c: None,
+            discharging: true,
+        });
+        assert_eq!(batt.status, Status::Warn);
+        assert!(batt.detail.contains("n/a (no sensor)"));
+        assert!(batt.detail.contains("power battery"));
+    }
+
+    #[test]
+    fn afk_verdict_names_mode_and_detector_state() {
+        let ready = afk_verdict(&AfkFacts {
+            mode: "auto".to_string(),
+            detector: true,
+        });
+        assert_eq!(ready.status, Status::Pass);
+        assert!(ready.detail.contains("mode auto"));
+        assert!(ready.detail.contains("idle detector ready"));
+
+        let missing = afk_verdict(&AfkFacts {
+            mode: "never".to_string(),
+            detector: false,
+        });
+        assert_eq!(missing.status, Status::Warn);
+        assert!(missing.detail.contains("mode never"));
+    }
+
+    #[test]
+    fn renderers_include_new_checks() {
+        let checks = vec![
+            cache_verdict(&cache_facts()),
+            guards_verdict(&GuardFacts {
+                temp_c: Some(60.0),
+                discharging: false,
+            }),
+            afk_verdict(&AfkFacts {
+                mode: "always".to_string(),
+                detector: true,
+            }),
+        ];
+        let text = render_text(&checks);
+        assert!(text.contains("cache"));
+        assert!(text.contains("guards"));
+        assert!(text.contains("afk"));
+        let json: serde_json::Value = serde_json::from_str(&render_json(&checks)).unwrap();
+        assert_eq!(json["ok"], true);
+        let names: Vec<&str> = json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["cache", "guards", "afk"]);
     }
 }

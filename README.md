@@ -4,7 +4,7 @@
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Shipped product (v0.5.x) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Shipped product (v0.8.x) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -154,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.7.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.8.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -191,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v0.7.0  (q quit, live cadence)
+runner top v0.8.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -237,11 +237,19 @@ runner doctor
 [✓] ebpf       unprivileged socket-filter attach works
 [✓] daemon     IPC alive at /home/linux/.runner/runner.sock (0600)
 [!] mcp        no agent registration found; run `runner mcp install --target cursor|claude`
+[✓] cache      proxy on 127.0.0.1:8787, store writable, TTL 7d active
+[✓] guards     temp 51.2°C, power AC (85°C latch armed)
+[✓] afk        mode auto, idle detector ready
 [✓] egress:metadata 169.254.169.254:80: expected blocked, observed blocked
 [✓] egress:rfc1918 10.255.255.1:443: expected blocked, observed blocked
 [✓] egress:https 1.1.1.1:443: expected allowed, observed reachable
 result: healthy
 ```
+
+Flags: `--enterprise` adds fleet-policy and audit-chain checks,
+`--egress` adds the report-only network compliance probes,
+`--format json` emits the machine-readable report (exit code is 0
+unless a check fails).
 
 Fail-capable checks (kernel, PSI, cgroups) gate readiness; KVM, eBPF,
 daemon, and MCP degrade to warnings. `--egress` adds report-only
@@ -295,7 +303,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "0.7.0", "governor": "normal",
+{"status": "healthy", "version": "0.8.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 

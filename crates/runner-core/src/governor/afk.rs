@@ -97,6 +97,15 @@ fn loginctl_bin() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/usr/bin/loginctl"))
 }
 
+/// True when session idle detection is available: the `loginctl`
+/// binary exists. Existence only (no subprocess): headless hosts
+/// without logind, and hosts where probing fails, still govern
+/// safely via fail-safe Active — this reports detector presence,
+/// not idle state.
+pub fn detector_available() -> bool {
+    loginctl_bin().is_file()
+}
+
 /// Session ids from `loginctl list-sessions --no-legend` output.
 pub fn parse_sessions_list(text: &str) -> Vec<String> {
     text.lines()
@@ -277,9 +286,11 @@ mod tests {
         // Threshold 0: the stub idles since boot, so any host uptime
         // (even a fresh CI VM under the 300s default) reads Idle.
         assert_eq!(poll_desktop_idle(0), IdleState::Idle);
+        assert!(detector_available());
         // Missing binary fails safe to Active.
         std::env::set_var("RUNNER_LOGINCTL", "/nonexistent/loginctl-stub");
         assert_eq!(poll_desktop_idle(300), IdleState::Active);
+        assert!(!detector_available());
         std::env::remove_var("RUNNER_LOGINCTL");
     }
 }

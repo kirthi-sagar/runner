@@ -317,8 +317,25 @@ fn stdout_is_tty() -> bool {
 
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    // Registration can fail in restricted containers; degrade to
+    // "no signal handling" (the monitor keeps redrawing; SIGKILL
+    // still works) instead of aborting.
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("runner: SIGINT handler unavailable ({e}); signals ignored");
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("runner: SIGTERM handler unavailable ({e}); signals ignored");
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+    };
     tokio::select! {
         _ = sigint.recv() => {},
         _ = sigterm.recv() => {},

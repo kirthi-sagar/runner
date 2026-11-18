@@ -9,8 +9,12 @@ on:
 
 jobs:
   cloud-verify:
-    name: Production CI (ubuntu-latest)
-    runs-on: ubuntu-latest
+    name: Production CI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

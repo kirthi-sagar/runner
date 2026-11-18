@@ -13,7 +13,7 @@ fn instruction_encodings_match_isa() {
 
 #[test]
 fn program_filters_ipv4_ranges() {
-    let insns = EgressFilterProgram::new().to_instructions();
+    let insns = EgressFilterProgram::new().to_instructions().unwrap();
     let imms: Vec<i32> = insns.iter().map(|i| i.imm).collect();
     // Masked network constants for 10/8, 172.16/12, 192.168/16, 169.254/16.
     for net in [
@@ -34,7 +34,7 @@ fn program_filters_ipv4_ranges() {
 
 #[test]
 fn program_filters_ipv6_ula() {
-    let insns = EgressFilterProgram::new().to_instructions();
+    let insns = EgressFilterProgram::new().to_instructions().unwrap();
     let has_ula = insns.iter().any(|i| i.code == op::LD_ABS_B && i.imm == 24)
         && insns
             .iter()
@@ -44,7 +44,7 @@ fn program_filters_ipv6_ula() {
 
 #[test]
 fn port_whitelist_covers_dns_and_https() {
-    let insns = EgressFilterProgram::new().to_instructions();
+    let insns = EgressFilterProgram::new().to_instructions().unwrap();
     for port in [53i32, 443i32] {
         assert!(
             insns

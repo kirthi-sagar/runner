@@ -4,7 +4,7 @@
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Shipped product (v0.9.x) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Generally Available (v1.0.x) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -83,7 +83,7 @@ Existing self-hosted runners fail at this because:
    - On macOS Apple Silicon, maps to Darwin QoS (`PRIO_DARWIN_BG`), pinning CI workloads exclusively to Efficiency (E) cores while keeping Performance (P) cores 100% dedicated to user apps.
 
 2. **First-Class Autonomous AI Agent Control & Native MCP Server**:
-   - Terminal-native JSON CLI (`runner status --format=json`, `runner throttle --level=high`).
+   - Terminal-native JSON CLI (`runner status --format=json`, `runner throttle --level=high --duration=5`).
    - High-speed Unix domain socket (`/run/runner.sock`).
    - Native **Model Context Protocol (MCP)** server (`runner mcp`) enabling agents (Claude Code, Cursor, Windsurf, Codex CLI, Antigravity) to mount runner tools (`reserve_host_resources`, `get_ci_status`, `request_cloud_capacity`) directly into their context window.
    - **AFK Boost Mode**: Listens to desktop screen-lock events (`org.freedesktop.ScreenSaver` / Wayland idle notify) to automatically collapse reserved headroom to zero when the user is away, converting the workstation into a 100% dedicated build server until user input resumes.
@@ -154,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.9.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v1.0.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -191,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v0.9.0  (q quit, live cadence)
+runner top v1.0.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -273,6 +273,22 @@ Probes credentials, API reachability, identity, and JIT issuance
 rights for `github`, `gitlab`, `bitbucket`, or `local`. Tokens are
 never printed; exit code is nonzero on failure for scripting.
 
+### Lifecycle, service & compliance commands
+
+```bash
+runner init --org=my-org        # reserved: prints only, no writes yet
+runner stop                     # graceful SIGTERM (--force for SIGKILL)
+runner throttle --level=high --duration=5   # weight 1 for 5 min (never freezes)
+runner service install          # user systemd unit: enable + start
+runner audit verify             # SHA-256 chain integrity of the audit trail
+runner policy inspect           # tenant ceilings and burst restrictions
+```
+
+`service` also offers `status`, `stop`, `start`, and `uninstall`;
+`audit export` streams verified JSONL for SIEM ingestion;
+`throttle` accepts `warning` (weight 25), `critical`/`high`
+(weight 1) with `--duration` in minutes (default 15).
+
 ### Zero-freeze pre-commit hooks
 
 ```bash
@@ -303,7 +319,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "0.9.0", "governor": "normal",
+{"status": "healthy", "version": "1.0.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 

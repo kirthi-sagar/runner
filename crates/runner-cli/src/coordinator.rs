@@ -176,40 +176,50 @@ pub async fn spawn_coordinator(
         spawn_github(config, &tokens, cloud.clone(), state.clone(), sandboxed).await;
     }
     if forges.contains(&Forge::Gitlab) {
-        let provider = Arc::new(GitlabProvider::new(
-            config.gitlab.url.clone(),
-            tokens.gitlab.clone().expect("enabled_forges checked"),
-            config.gitlab.tags.clone(),
-        ));
-        let interval = Duration::from_secs(config.gitlab.poll_secs.max(5));
-        tokio::spawn(run_gitlab_loop(
-            provider,
-            state.clone(),
-            interval,
-            !sandboxed,
-            timeout,
-        ));
+        // Defensive: `enabled_forges` guarantees the token, but a
+        // future mismatch must skip one forge, never abort the daemon
+        // (release profile is `panic = "abort"`).
+        if let Some(token) = tokens.gitlab.clone() {
+            let provider = Arc::new(GitlabProvider::new(
+                config.gitlab.url.clone(),
+                token,
+                config.gitlab.tags.clone(),
+            ));
+            let interval = Duration::from_secs(config.gitlab.poll_secs.max(5));
+            tokio::spawn(run_gitlab_loop(
+                provider,
+                state.clone(),
+                interval,
+                !sandboxed,
+                timeout,
+            ));
+        } else {
+            eprintln!("runner: gitlab enabled without a token; skipping forge");
+        }
     }
     if forges.contains(&Forge::Bitbucket) {
-        let provider = Arc::new(BitbucketProvider::new(
-            tokens.bitbucket_id.clone().expect("enabled_forges checked"),
-            tokens
-                .bitbucket_secret
-                .clone()
-                .expect("enabled_forges checked"),
-            config.bitbucket.workspace.clone(),
-            config.bitbucket.repo_slug.clone(),
-            config.bitbucket.runner_uuid.clone(),
-            config.bitbucket.labels.clone(),
-        ));
-        let interval = Duration::from_secs(config.bitbucket.poll_secs.max(5));
-        tokio::spawn(run_bitbucket_loop(
-            provider,
-            state.clone(),
-            interval,
-            !sandboxed,
-            timeout,
-        ));
+        if let (Some(id), Some(secret)) =
+            (tokens.bitbucket_id.clone(), tokens.bitbucket_secret.clone())
+        {
+            let provider = Arc::new(BitbucketProvider::new(
+                id,
+                secret,
+                config.bitbucket.workspace.clone(),
+                config.bitbucket.repo_slug.clone(),
+                config.bitbucket.runner_uuid.clone(),
+                config.bitbucket.labels.clone(),
+            ));
+            let interval = Duration::from_secs(config.bitbucket.poll_secs.max(5));
+            tokio::spawn(run_bitbucket_loop(
+                provider,
+                state.clone(),
+                interval,
+                !sandboxed,
+                timeout,
+            ));
+        } else {
+            eprintln!("runner: bitbucket enabled without credentials; skipping forge");
+        }
     }
 }
 
@@ -222,7 +232,10 @@ async fn spawn_github(
     sandboxed: bool,
 ) {
     let coord = &config.coordinator;
-    let token = tokens.github.clone().expect("enabled_forges checked");
+    let Some(token) = tokens.github.clone() else {
+        eprintln!("runner: github enabled without a token; skipping forge");
+        return;
+    };
     let github = match GithubClient::new(token) {
         Ok(client) => client,
         Err(e) => {
@@ -325,5 +338,33 @@ mod tests {
             ..ForgeTokens::default()
         };
         assert!(enabled_forges(&config, &half).is_empty());
+    }
+
+    #[test]
+    fn enabled_forge_always_carries_its_token() {
+        // Invariant behind the defensive skips in `spawn_coordinator`:
+        // an enabled forge implies its credential resolved. If this
+        // ever fails, dispatch degrades to skip-one-forge, never abort.
+        let mut config = RunnerConfig::default();
+        config.coordinator.repo_owner = Some("o".to_string());
+        config.coordinator.repo_name = Some("r".to_string());
+        config.gitlab.enabled = true;
+        config.bitbucket.enabled = true;
+        config.bitbucket.workspace = "w".to_string();
+        config.bitbucket.runner_uuid = "u".to_string();
+        let full = tokens(Some("g"), Some("gl"), Some(("id", "secret")));
+        for forge in enabled_forges(&config, &full) {
+            match forge {
+                Forge::Github => assert!(full.github.is_some()),
+                Forge::Gitlab => assert!(full.gitlab.is_some()),
+                Forge::Bitbucket => {
+                    assert!(full.bitbucket_id.is_some());
+                    assert!(full.bitbucket_secret.is_some());
+                }
+            }
+        }
+        // And no token can ever enable its forge.
+        let none = tokens(None, None, None);
+        assert!(enabled_forges(&config, &none).is_empty());
     }
 }

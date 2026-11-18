@@ -41,6 +41,20 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }} -p runner-cli
 
+      - name: Smoke-test release binary (native)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/runner"
+          "$BIN" --version
+          "$BIN" doctor --format json | python3 -c "import json,sys; assert json.load(sys.stdin)['ok'] is True, 'doctor not ok'"
+
+      - name: Verify cross-compiled artifact arch
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          # Cannot execute aarch64 on the x64 runner: assert arch instead.
+          file "target/${{ matrix.target }}/release/runner" | grep -q aarch64
+
       - name: Package archive with checksums
         run: |
           set -euo pipefail

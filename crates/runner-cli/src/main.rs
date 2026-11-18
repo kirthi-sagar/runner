@@ -126,6 +126,15 @@ enum Commands {
         #[arg(long)]
         secret: Option<String>,
     },
+    /// Force the governor weight down for a duration (never freezes)
+    Throttle {
+        /// Throttle level: warning (weight 25), critical or high (weight 1)
+        #[arg(long, default_value = "warning")]
+        level: String,
+        /// Override duration in minutes
+        #[arg(long, default_value_t = 15)]
+        duration: u64,
+    },
     /// Diagnose system readiness (kernel, cgroups, sandboxes, daemon, MCP)
     Doctor {
         /// Also validate enterprise policy loading and audit continuity
@@ -519,8 +528,24 @@ async fn spawn_embedded_listener(
 
 async fn listen_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    // Registration can fail in restricted containers; degrade to
+    // "no signal handling" (SIGKILL still works) instead of aborting.
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("runner: SIGINT handler unavailable ({e}); signals ignored");
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("runner: SIGTERM handler unavailable ({e}); signals ignored");
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+    };
     tokio::select! {
         _ = sigint.recv() => {},
         _ = sigterm.recv() => {},
@@ -900,6 +925,26 @@ async fn daemon_call(method: &str, params: Option<serde_json::Value>) -> Result<
         anyhow::bail!("daemon error: {message}");
     }
     Ok(res["result"].clone())
+}
+
+/// `runner throttle`: engage a timed governor weight override on the
+/// daemon. Text-only output (no JSON contract to freeze).
+async fn cmd_throttle(level: &str, duration: u64) -> Result<()> {
+    if duration == 0 {
+        anyhow::bail!("duration must be > 0 minutes");
+    }
+    let result = daemon_call(
+        "throttle_set",
+        Some(serde_json::json!({ "level": level, "duration_minutes": duration })),
+    )
+    .await?;
+    println!(
+        "throttle {} engaged: cpu weight {} for {} minutes",
+        result["level"].as_str().unwrap_or(level),
+        result["cpu_weight"].as_u64().unwrap_or(0),
+        result["duration_minutes"].as_u64().unwrap_or(duration),
+    );
+    Ok(())
 }
 
 /// `runner cloud list`: active burst workers with uptime + spend cap.
@@ -1284,6 +1329,9 @@ async fn main() -> Result<()> {
         }
         Commands::Listen { port, secret } => {
             cmd_listen(port, secret).await?;
+        }
+        Commands::Throttle { level, duration } => {
+            cmd_throttle(&level, duration).await?;
         }
         Commands::Doctor {
             enterprise,

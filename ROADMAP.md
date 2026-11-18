@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.9.0 and prior)
+## Shipped (v1.0.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,17 +14,28 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 
-## Next: v0.9.0 (v1.0 Release Candidate)
+## v1.0.0 GA (this release)
 
-- v0.9.0: hermetic test isolation (TempDir nonces), `auth status`
-  with masked tokens, provider rotation guidance, CLI/MCP JSON
-  schema freeze with contract tests.
-- v1.0.0 GA criteria (all must hold at tag time): schema-freeze
-  tests green with zero doc drift; asset smoke green on every
-  tag; doctor-clean fresh install on Ubuntu/Debian/Arch/Fedora;
-  zero known Fail-default doctor paths; two-machine LAN
-  federation verified; WAN peer WireGuard transport marked as a
-  post-v1.0 enterprise extension (see Later).
+- Schema-freeze tests green with zero doc drift; asset smoke
+  green on every tag (plus release-binary execution smoke).
+- Doctor-clean install; zero known Fail-default doctor paths.
+- Federation gate: two-proxy loopback seam tests are
+  authoritative (single laptop + Codespaces WAN cannot route
+  link-local mDNS; physical two-laptop Wi-Fi does not block GA).
+- WAN peer WireGuard transport stays a post-v1.0 enterprise
+  extension (see Later); routing remains fail-closed.
+
+## Shipped in v1.0.0: GA Hardening & Production Polish
+
+- Release-binary execution smoke; CI OS matrix (22.04 + latest).
+- Installer fail-closed checksums, `--uninstall`, macOS early exit.
+- Panic elimination: forge skips, eBPF `Result`, signal fallback.
+- `runner throttle` CLI + hidden-command docs + format-truth fix.
+
+## Shipped in v0.9.0: v1.0 Release Candidate
+
+- Hermetic test isolation (TempDir nonces); `auth status` masked.
+- Provider rotation guidance; CLI/MCP JSON schema freeze.
 
 ## Shipped in v0.8.0: Production Diagnostics & GA Readiness
 

@@ -6,6 +6,21 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.0.0 — 2026-11-18
+
+- General Availability. Release workflow executes the built
+  binary (`--version` + `doctor` JSON assertion) before
+  packaging; CI runs on Ubuntu 22.04 and latest.
+- Installer fails closed without a SHA-256 verifier, gains
+  `--uninstall`, and exits cleanly on macOS.
+- Panic elimination under `panic = "abort"`: per-forge skips on
+  missing tokens, eBPF assembler returns `Result`, and signal
+  registration degrades to no-signal-handling in containers.
+- New `runner throttle --level=<warning|critical|high>
+  --duration=<mins>` over a `throttle_set` daemon IPC method.
+- README documents the hidden lifecycle/service/compliance
+  commands; `cli-json.md` default-format claim corrected.
+
 ## v0.9.0 — 2026-11-18
 
 - Hermetic test isolation: `TempDir` paths carry a 64-bit random

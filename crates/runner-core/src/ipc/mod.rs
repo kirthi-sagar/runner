@@ -230,8 +230,50 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                     "error": { "code": -32602, "message": format!("bad peer record: {e}") } }),
             }
         }
+        "throttle_set" => {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let level = params
+                .get("level")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let minutes = params
+                .get("duration_minutes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let Some(weight) = throttle_weight_for_level(&level) else {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "level must be warning|critical|high" } });
+            };
+            if minutes == 0 {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "duration_minutes must be > 0" } });
+            }
+            state.write().await.set_throttle(
+                weight,
+                std::time::Duration::from_secs(minutes * 60),
+                std::time::Instant::now(),
+            );
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "level": level,
+                "cpu_weight": weight,
+                "duration_minutes": minutes,
+            } })
+        }
         _ => serde_json::json!({ "jsonrpc": "2.0", "id": id,
             "error": { "code": -32601, "message": format!("method not found: {method}") } }),
+    }
+}
+
+/// Map a throttle level name to its cgroup weight. `high` is the
+/// README's word for maximum throttling (alias of `critical`).
+pub fn throttle_weight_for_level(level: &str) -> Option<u32> {
+    use crate::governor::cgroup::{WEIGHT_TRICKLE, WEIGHT_WARNING};
+    match level.trim().to_ascii_lowercase().as_str() {
+        "warning" => Some(WEIGHT_WARNING),
+        "critical" | "high" => Some(WEIGHT_TRICKLE),
+        _ => None,
     }
 }
 
@@ -485,5 +527,56 @@ mod tests {
         )
         .await;
         assert!(res["result"]["purged"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn throttle_levels_map_to_ladder_weights() {
+        use crate::governor::cgroup::{WEIGHT_TRICKLE, WEIGHT_WARNING};
+        assert_eq!(throttle_weight_for_level("warning"), Some(WEIGHT_WARNING));
+        assert_eq!(throttle_weight_for_level("critical"), Some(WEIGHT_TRICKLE));
+        // `high` is the README alias for maximum throttling.
+        assert_eq!(throttle_weight_for_level("high"), Some(WEIGHT_TRICKLE));
+        assert_eq!(throttle_weight_for_level("HIGH"), Some(WEIGHT_TRICKLE));
+        assert_eq!(throttle_weight_for_level("medium"), None);
+        assert_eq!(throttle_weight_for_level(""), None);
+    }
+
+    #[tokio::test]
+    async fn throttle_set_engages_and_validates() {
+        let state = new_shared_state();
+        let res = handle_ipc_request(
+            cloud_req(
+                "throttle_set",
+                serde_json::json!({ "level": "high", "duration_minutes": 5 }),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(res["result"]["level"], "high");
+        assert_eq!(res["result"]["cpu_weight"], 1);
+        assert_eq!(res["result"]["duration_minutes"], 5);
+        // Latch visible on shared state until expiry.
+        let now = std::time::Instant::now();
+        assert_eq!(state.read().await.throttle_weight(now), Some(1));
+
+        // Invalid level and zero duration reject with -32602.
+        let res = handle_ipc_request(
+            cloud_req(
+                "throttle_set",
+                serde_json::json!({ "level": "medium", "duration_minutes": 5 }),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(res["error"]["code"], -32602);
+        let res = handle_ipc_request(
+            cloud_req(
+                "throttle_set",
+                serde_json::json!({ "level": "warning", "duration_minutes": 0 }),
+            ),
+            &state,
+        )
+        .await;
+        assert_eq!(res["error"]["code"], -32602);
     }
 }

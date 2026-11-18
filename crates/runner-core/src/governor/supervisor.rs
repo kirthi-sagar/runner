@@ -486,11 +486,27 @@ pub fn apply_workstation_guards(slots: u32, throttled: bool, discharging: bool) 
     slots
 }
 
-/// Wait for SIGINT or SIGTERM.
+/// Wait for SIGINT or SIGTERM. Registration can fail in restricted
+/// containers; that degrades to "no signal handling" (the loop keeps
+/// its own cadence; SIGKILL still works) instead of aborting startup.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
-    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    let mut sigint = match signal(SignalKind::interrupt()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("runner: SIGINT handler unavailable ({e}); signals ignored");
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+    };
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            eprintln!("runner: SIGTERM handler unavailable ({e}); signals ignored");
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves");
+        }
+    };
     tokio::select! {
         _ = sigint.recv() => {},
         _ = sigterm.recv() => {},

@@ -182,13 +182,15 @@ impl Assembler {
         self.insns.push(jmp_imm(op, dst, imm, 0));
     }
 
-    fn finish(mut self) -> Vec<BpfInstruction> {
+    fn finish(mut self) -> Result<Vec<BpfInstruction>, String> {
         for (pos, target) in std::mem::take(&mut self.fixups) {
-            let dest = *self.labels.get(&target).expect("assembler label");
-            let rel = dest as isize - pos as isize - 1;
+            let Some(dest) = self.labels.get(&target) else {
+                return Err(format!("assembler: unknown label {target:?}"));
+            };
+            let rel = *dest as isize - pos as isize - 1;
             self.insns[pos].off = rel as i16;
         }
-        self.insns
+        Ok(self.insns)
     }
 }
 
@@ -220,8 +222,9 @@ impl EgressFilterProgram {
         Self::default()
     }
 
-    /// Generate the complete filter program.
-    pub fn to_instructions(&self) -> Vec<BpfInstruction> {
+    /// Generate the complete filter program. Fails closed on an
+    /// unknown jump label instead of aborting the daemon.
+    pub fn to_instructions(&self) -> Result<Vec<BpfInstruction>, String> {
         use op::*;
         let mut asm = Assembler::new();
 
@@ -374,7 +377,7 @@ mod tests {
 
     #[test]
     fn program_has_balanced_allow_and_drop_exits() {
-        let insns = EgressFilterProgram::new().to_instructions();
+        let insns = EgressFilterProgram::new().to_instructions().unwrap();
         let exits = insns.iter().filter(|i| i.code == op::EXIT).count();
         assert_eq!(exits, 2);
         assert!(insns.len() > 30);
@@ -387,7 +390,7 @@ mod tests {
 
     #[test]
     fn ipv4_ports_use_dynamic_ihl_indirect_loads() {
-        let insns = EgressFilterProgram::new().to_instructions();
+        let insns = EgressFilterProgram::new().to_instructions().unwrap();
         // Both v4 paths walk IHL: AND nibble, *4, stash in R1, bound it.
         let ands = insns
             .iter()
@@ -489,5 +492,18 @@ mod tests {
         // Unknown proto and truncated packets drop.
         assert!(!v4_verdict(&v4_packet(5, 1, public, 443), true, true));
         assert!(!v4_verdict(&[0x45u8; 10], true, true));
+    }
+
+    #[test]
+    fn unknown_label_fails_closed() {
+        let mut asm = Assembler::new();
+        asm.jump(0x00, 0, 0, "typo_label");
+        let err = asm.finish().expect_err("unknown label must fail");
+        assert!(err.contains("typo_label"), "unexpected: {err}");
+        // Full program still assembles after the Result change.
+        assert!(!EgressFilterProgram::new()
+            .to_instructions()
+            .unwrap()
+            .is_empty());
     }
 }

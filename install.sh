@@ -6,12 +6,13 @@
 #   ./install.sh --help       show help
 set -eu
 
-VERSION="0.9.0"
+VERSION="1.0.0"
 MIN_KERNEL_MAJOR=5
 MIN_KERNEL_MINOR=8
 
 MODE="auto"
 DRY_RUN=0
+UNINSTALL=0
 
 usage() {
     cat <<'EOF'
@@ -24,6 +25,7 @@ Options:
   --user      force unprivileged install (~/.local/bin, user service)
   --system    force privileged install (/usr/local/bin, system service)
   --dry-run   print what would be done without changing anything
+  --uninstall remove the service, binary, and unit (keeps config + data)
   --help      show this help
 
 Without flags, root installs system-wide and everyone else installs
@@ -48,6 +50,7 @@ for arg in "$@"; do
         --user) MODE="user" ;;
         --system) MODE="system" ;;
         --dry-run) DRY_RUN=1 ;;
+        --uninstall|uninstall) UNINSTALL=1 ;;
         --help|-h) usage; exit 0 ;;
         *) log "unknown option: $arg"; usage; exit 2 ;;
     esac
@@ -55,6 +58,48 @@ done
 
 if [ "$MODE" = "auto" ]; then
     if [ "$(id -u)" -eq 0 ]; then MODE="system"; else MODE="user"; fi
+fi
+
+# --- Uninstall (before pre-flight: must work on broken hosts too) --------------
+if [ "$UNINSTALL" -eq 1 ]; then
+    if [ "$MODE" = "system" ]; then
+        BIN_DST="/usr/local/bin/runner"
+        UNIT_FILE="/etc/systemd/system/runner.service"
+        STOP="systemctl stop runner"
+        DISABLE="systemctl disable runner"
+        RELOAD="systemctl daemon-reload"
+    else
+        HOME_DIR="${HOME:-$HOME}"
+        BIN_DST="$HOME_DIR/.local/bin/runner"
+        UNIT_FILE="$HOME_DIR/.config/systemd/user/runner.service"
+        STOP="systemctl --user stop runner"
+        DISABLE="systemctl --user disable runner"
+        RELOAD="systemctl --user daemon-reload"
+    fi
+    log "uninstalling runner ($MODE mode; config and data are kept)"
+    if command -v systemctl >/dev/null 2>&1; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "[dry-run] $STOP; $DISABLE"
+        else
+            $STOP 2>/dev/null || true
+            $DISABLE 2>/dev/null || true
+        fi
+    fi
+    run rm -f "$BIN_DST" "$UNIT_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "[dry-run] $RELOAD"
+        else
+            $RELOAD 2>/dev/null || log "warning: systemd reload failed; run manually: $RELOAD"
+        fi
+    fi
+    log "runner uninstalled from $BIN_DST"
+    exit 0
+fi
+
+if [ "$(uname -s)" = "Darwin" ]; then
+    log "error: macOS is not supported: the supervisor requires Linux cgroups v2; macOS support is planned post-v1.0"
+    exit 1
 fi
 
 # --- Pre-flight checks -------------------------------------------------------
@@ -131,8 +176,14 @@ else
                 log "error: checksum mismatch for $TARBALL"
                 exit 1
             }
+        elif command -v shasum >/dev/null 2>&1; then
+            (cd "$TMP_DL" && shasum -a 256 -c "$TARBALL.sha256") || {
+                log "error: checksum mismatch for $TARBALL"
+                exit 1
+            }
         else
-            log "warning: sha256sum not found; skipping checksum verification"
+            log "error: sha256sum required for secure release verification"
+            exit 1
         fi
         tar -xzf "$TMP_DL/$TARBALL" -C "$TMP_DL"
         BIN_SRC="$TMP_DL/runner-v$VERSION-$TARGET/runner"

@@ -3,7 +3,8 @@
 Machine-readable output shapes for the four JSON CLI surfaces.
 `tests/test_schema_freeze.rs` pins every key set — changes must
 update this doc and that test together. All four accept
-`--format json` (`text` is the default).
+`--format json`: `doctor`, `cache stats`, and `cloud list` default
+to `text`, while `status` defaults to a one-line human summary.
 
 ## `runner status --format json`
 
@@ -11,7 +12,7 @@ Prefers the daemon's state-enriched report over IPC; falls back to a
 local kernel read when the daemon is down.
 
 - `status`: `"healthy"` (fixed string).
-- `version`: semver string (e.g. `"0.9.0"`).
+- `version`: semver string (e.g. `"1.0.0"`).
 - `host`: `total_cores`, `physical_cores`,
   `available_cores_for_ci`, `total_memory_bytes`,
   `available_memory_bytes`, `psi_pressure` (`cpu_some_avg10`,

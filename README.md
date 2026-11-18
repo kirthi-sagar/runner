@@ -154,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.6.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.7.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -191,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v0.6.0  (q quit, live cadence)
+runner top v0.7.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -295,7 +295,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "0.6.0", "governor": "normal",
+{"status": "healthy", "version": "0.7.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -377,6 +377,14 @@ labels = ["zero-freeze", "linux", "runner"]
 listen = "127.0.0.1:8787" # proxy bind address
 # dir = ""                # store override (default ~/.runner/cache/)
 max_size_gb = 10          # disk budget before LRU eviction
+ttl_secs = 604800         # entry age before background sweep evicts (7d; 0 disables)
+sweep_secs = 3600         # TTL sweep cadence (60s floor)
+
+[governor]                # PSI weight ladder + AFK boost
+warn_cpu_psi = 20.0       # CPU some-avg10 where throttling begins (weight 25)
+crit_cpu_psi = 40.0       # CPU some-avg10 for the trickle throttle (weight 1)
+afk_mode = "auto"         # auto | always (headless) | never
+afk_idle_seconds = 300    # desktop idle time before AFK boost engages
 ```
 
 Key behaviors:
@@ -386,7 +394,15 @@ Key behaviors:
   host compute. Stuck workers are killed, never frozen mid-test.
 - **Headroom**: the governor reserves `max(2, 25%)` cores and
   `max(4 GiB, 20%)` RAM for interactive apps; AFK Boost collapses headroom
-  when the desktop is idle and restores it on first input.
+  when the desktop is idle and restores it on first input. Idle state is
+  probed from `loginctl` every 5s; headless hosts read Active, so
+  headless CI servers should set `afk_mode = "always"`.
+- **Cache TTL**: the background sweep evicts entries older than `ttl_secs`
+  by creation age (staleness), independent of the `--older-than` access
+  idleness used by manual `cache clear`.
+- **WAN routing**: jobs route to a WAN peer only while its handshake
+  status reads `active`; otherwise routing falls through to cloud burst
+  or waits — unproven peers never receive jobs.
 - **Spend caps (Super Admin)**: agents and automation can request cloud
   capacity only within `max_monthly_spend`, and only for providers with
   configured tokens. A zero cap denies every request with a reason.

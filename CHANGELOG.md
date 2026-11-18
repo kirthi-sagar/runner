@@ -6,6 +6,19 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v0.7.0 — 2026-11-18
+
+- AFK Boost wiring: `loginctl` desktop-idle probing (5s throttle on the
+  250ms tick) with `auto`/`always`/`never` modes and a configurable
+  idle threshold; headless hosts fail safe to Active. Boost state and
+  mode surface in `runner status`, IPC snapshot, and MCP `get_ci_status`.
+- Background cache TTL sweep: creation-age eviction (`ttl_secs`,
+  default 7 days) on an hourly cadence, counters preserved.
+- WAN routing fail-closed: jobs route to a peer only while its
+  handshake status reads `active`; the dispatch arm falls back to
+  cloud burst or wait in the same tick when handoff is unavailable.
+- Config reference documents `[governor]` and the new `[cache]` keys.
+
 ## v0.6.0 — 2026-11-17
 
 - Workstation guards: thermal throttle at 85°C (trickle weight +

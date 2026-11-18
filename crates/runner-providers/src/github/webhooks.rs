@@ -163,9 +163,12 @@ pub enum RouteDecision {
     Wait,
 }
 
-/// Route one job: local slot → non-drained WAN peer → cloud burst → wait.
-/// `cloud_provider` is the resolved burst target (`None` when no cloud
-/// provider is configured); routing never hardcodes a provider name.
+/// Route one job: local slot → active, non-drained WAN peer → cloud
+/// burst → wait. Peers route only while their handshake status reads
+/// `active` (fail closed: `join` persists `joining`, so unproven
+/// peers never receive jobs). `cloud_provider` is the resolved burst
+/// target (`None` when no cloud provider is configured); routing never
+/// hardcodes a provider name.
 pub fn route_job(
     local_slots_free: u32,
     peers: &[runner_core::config::PeerRecord],
@@ -175,7 +178,10 @@ pub fn route_job(
     if local_slots_free > 0 {
         return RouteDecision::Local;
     }
-    if let Some(peer) = peers.iter().find(|p| !drained.contains_key(&p.node_id)) {
+    if let Some(peer) = peers
+        .iter()
+        .find(|p| p.status == "active" && !drained.contains_key(&p.node_id))
+    {
         return RouteDecision::WanPeer {
             node_id: peer.node_id.clone(),
         };
@@ -456,66 +462,30 @@ pub async fn run_coordinator(
                     }
                 }
                 RouteDecision::WanPeer { node_id } => {
+                    // No remote execution transport exists yet: an
+                    // active peer was selected, but handoff cannot
+                    // proceed, so fail closed to cloud-or-wait in this
+                    // same tick. Peers are excluded from the recompute
+                    // so the fallback cannot loop back here.
                     eprintln!(
-                        "runner: job {} ({}) routed to WAN peer {node_id} \
-                         (remote execution transport lands in hardening)",
+                        "runner: job {} ({}) peer {node_id} handoff unavailable; falling back",
                         job.id, job.name
                     );
+                    match route_job(free, &[], &drained, cloud_provider.as_deref()) {
+                        RouteDecision::Cloud { provider } => {
+                            burst_cloud(&job, &provider, &cloud, auto, &state).await;
+                        }
+                        _ => {
+                            eprintln!("runner: job {} ({}) waiting for capacity", job.id, job.name)
+                        }
+                    }
                 }
                 RouteDecision::Cloud { provider } => {
                     eprintln!(
                         "runner: job {} ({}) routed to cloud {provider}",
                         job.id, job.name
                     );
-                    if let (Some(pool), true) = (cloud.clone(), auto) {
-                        // Hard budget stop: refuse new spend once the
-                        // ledgered month total reaches the cap. A ledger
-                        // read failure also refuses (fail closed).
-                        let spend = pool.month_spend();
-                        let cap = state.read().await.cloud_spend_cap();
-                        if !spend_within_cap(spend.clone(), cap) {
-                            match spend {
-                                Ok(usd) => eprintln!(
-                                    "runner: budget stop: month spend ${usd:.2} reached cap ${cap:.2}; job {} waits",
-                                    job.id
-                                ),
-                                Err(e) => eprintln!(
-                                    "runner: budget stop: spend ledger unreadable ({e}); refusing cloud burst for job {} until fixed",
-                                    job.id
-                                ),
-                            }
-                            continue;
-                        }
-                        // Track the cloud dispatch so later polls dedup
-                        // against it. Cloud entries persist (remote jobs
-                        // report no completion signal) and roll off via
-                        // the tracked-jobs cap.
-                        state
-                            .write()
-                            .await
-                            .job_started("github", &job.id.to_string(), &job.name);
-                        let state = state.clone();
-                        let pool = pool.clone();
-                        let job_id = job.id.to_string();
-                        tokio::spawn(async move {
-                            let name = format!("runner-ci-{}-{}", job.run_id, job.id);
-                            match pool.provision(&provider, &name).await {
-                                Ok(node) => {
-                                    eprintln!(
-                                        "runner: cloud node {} up for job {}",
-                                        node.id, job.id
-                                    );
-                                    state.write().await.add_cloud_node(node);
-                                }
-                                Err(e) => {
-                                    // Release the dedup record so the next
-                                    // tick retries instead of deadlocking.
-                                    eprintln!("runner: cloud burst failed: {e}");
-                                    state.write().await.job_finished("github", &job_id);
-                                }
-                            }
-                        });
-                    }
+                    burst_cloud(&job, &provider, &cloud, auto, &state).await;
                 }
                 RouteDecision::Wait => {
                     eprintln!("runner: job {} ({}) waiting for capacity", job.id, job.name);
@@ -524,6 +494,66 @@ pub async fn run_coordinator(
         }
         // Scale-to-zero runs in the standalone watchdog task
         // (`spawn_cloud_watchdog`), independent of this loop.
+    }
+}
+
+/// Cloud burst for one job: hard budget stop, dedup record, async
+/// provision. Shared by the Cloud route and the WAN-peer fallback.
+async fn burst_cloud(
+    job: &QueuedJob,
+    provider: &str,
+    cloud: &Option<runner_core::mesh::cloud::CloudPool>,
+    auto: bool,
+    state: &runner_core::governor::supervisor::SharedState,
+) {
+    if let (Some(pool), true) = (cloud.clone(), auto) {
+        // Hard budget stop: refuse new spend once the
+        // ledgered month total reaches the cap. A ledger
+        // read failure also refuses (fail closed).
+        let spend = pool.month_spend();
+        let cap = state.read().await.cloud_spend_cap();
+        if !spend_within_cap(spend.clone(), cap) {
+            match spend {
+                Ok(usd) => eprintln!(
+                    "runner: budget stop: month spend ${usd:.2} reached cap ${cap:.2}; job {} waits",
+                    job.id
+                ),
+                Err(e) => eprintln!(
+                    "runner: budget stop: spend ledger unreadable ({e}); refusing cloud burst for job {} until fixed",
+                    job.id
+                ),
+            }
+            return;
+        }
+        // Track the cloud dispatch so later polls dedup
+        // against it. Cloud entries persist (remote jobs
+        // report no completion signal) and roll off via
+        // the tracked-jobs cap.
+        state
+            .write()
+            .await
+            .job_started("github", &job.id.to_string(), &job.name);
+        let state = state.clone();
+        let pool = pool.clone();
+        let job_id = job.id.to_string();
+        let run_id = job.run_id;
+        let numeric_id = job.id;
+        let provider = provider.to_string();
+        tokio::spawn(async move {
+            let name = format!("runner-ci-{run_id}-{numeric_id}");
+            match pool.provision(&provider, &name).await {
+                Ok(node) => {
+                    eprintln!("runner: cloud node {} up for job {numeric_id}", node.id);
+                    state.write().await.add_cloud_node(node);
+                }
+                Err(e) => {
+                    // Release the dedup record so the next
+                    // tick retries instead of deadlocking.
+                    eprintln!("runner: cloud burst failed: {e}");
+                    state.write().await.job_finished("github", &job_id);
+                }
+            }
+        });
     }
 }
 
@@ -696,7 +726,7 @@ mod tests {
             endpoint: None,
             max_cores: 4,
             max_ram_mb: 8192,
-            status: "online".to_string(),
+            status: "active".to_string(),
         };
         assert_eq!(
             route_job(1, &[], &HashMap::new(), None),
@@ -723,6 +753,41 @@ mod tests {
         assert_eq!(
             route_job(0, std::slice::from_ref(&peer), &drained, None),
             RouteDecision::Wait
+        );
+    }
+
+    #[test]
+    fn routing_fails_closed_on_non_active_peers() {
+        use std::collections::HashMap;
+        // `join` persists "joining"; only a completed handshake may
+        // flip a peer to "active". Unproven peers never take jobs:
+        // routing falls through to cloud, else waits.
+        let joining = runner_core::config::PeerRecord {
+            node_id: "n1".to_string(),
+            public_key: "k".to_string(),
+            endpoint: None,
+            max_cores: 4,
+            max_ram_mb: 8192,
+            status: "joining".to_string(),
+        };
+        let peers = std::slice::from_ref(&joining);
+        assert_eq!(
+            route_job(0, peers, &HashMap::new(), Some("digitalocean")),
+            RouteDecision::Cloud {
+                provider: "digitalocean".to_string()
+            }
+        );
+        assert_eq!(
+            route_job(0, peers, &HashMap::new(), None),
+            RouteDecision::Wait
+        );
+        // Peer-excluded recompute (the WAN fallback path) can never
+        // loop back to a peer.
+        assert_eq!(
+            route_job(0, &[], &HashMap::new(), Some("render")),
+            RouteDecision::Cloud {
+                provider: "render".to_string()
+            }
         );
     }
 

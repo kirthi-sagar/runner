@@ -1041,6 +1041,18 @@ async fn main() -> Result<()> {
                                 "runner: cache proxy on {} (advertised {base})",
                                 config.cache.listen
                             );
+                            // Background TTL sweep (creation-age eviction).
+                            if server_state
+                                .store
+                                .spawn_ttl_sweeper(config.cache.ttl_secs, config.cache.sweep_secs)
+                                .is_some()
+                            {
+                                eprintln!(
+                                    "runner: cache TTL sweep every {}s (ttl {}s)",
+                                    config.cache.sweep_secs.max(60),
+                                    config.cache.ttl_secs
+                                );
+                            }
                             // LAN federation: advertise cache capability via
                             // mDNS when bound beyond loopback.
                             if runner_core::mesh::discovery::listen_is_lan(&config.cache.listen) {
@@ -1112,8 +1124,27 @@ async fn main() -> Result<()> {
                 } else {
                     "AC"
                 };
+                // Prefer the daemon's live AFK latch; local read otherwise.
+                let (afk_boost, afk_mode) = match ipc_call(&resolve_sock_path(), "snapshot").await {
+                    Ok(resp) => (
+                        resp["result"]["afk_boosted"].as_bool().unwrap_or(false),
+                        resp["result"]["afk_mode"]
+                            .as_str()
+                            .unwrap_or("auto")
+                            .to_string(),
+                    ),
+                    _ => (
+                        report.concurrency.afk_boost,
+                        report.concurrency.afk_mode.clone(),
+                    ),
+                };
+                let afk = if afk_boost {
+                    format!("BOOSTED ({afk_mode})")
+                } else {
+                    afk_mode
+                };
                 println!(
-                    "runner {} | cores {}/{} | mem {}MB avail | cpu PSI {:.2}% ({:?}) | slots {} | weight {:?} | temp {} | power {}",
+                    "runner {} | cores {}/{} | mem {}MB avail | cpu PSI {:.2}% ({:?}) | slots {} | weight {:?} | temp {} | power {} | afk {}",
                     report.status,
                     report.host.total_cores,
                     report.host.physical_cores,
@@ -1124,6 +1155,7 @@ async fn main() -> Result<()> {
                     report.host.cgroup_weight,
                     temp,
                     power,
+                    afk,
                 );
             }
         }

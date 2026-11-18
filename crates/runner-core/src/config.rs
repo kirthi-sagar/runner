@@ -515,6 +515,14 @@ pub struct CacheConfig {
     /// Disk budget in GiB before LRU eviction (default 10).
     #[serde(default = "default_cache_max_size_gb")]
     pub max_size_gb: u64,
+    /// Entry age in seconds before the background sweep evicts it
+    /// (default 604800 = 7 days; 0 disables the sweep).
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Background TTL sweep cadence in seconds (default 3600,
+    /// clamped to a 60s floor).
+    #[serde(default = "default_cache_sweep_secs")]
+    pub sweep_secs: u64,
 }
 
 fn default_cache_listen() -> String {
@@ -525,12 +533,22 @@ fn default_cache_max_size_gb() -> u64 {
     10
 }
 
+fn default_cache_ttl_secs() -> u64 {
+    604_800
+}
+
+fn default_cache_sweep_secs() -> u64 {
+    3600
+}
+
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             listen: default_cache_listen(),
             dir: String::new(),
             max_size_gb: default_cache_max_size_gb(),
+            ttl_secs: default_cache_ttl_secs(),
+            sweep_secs: default_cache_sweep_secs(),
         }
     }
 }
@@ -557,6 +575,12 @@ pub struct GovernorConfig {
     /// Pressure above which the trickle throttle applies (default 40.0).
     #[serde(default = "default_crit_cpu_psi")]
     pub crit_cpu_psi: f64,
+    /// AFK boost mode: `auto`, `always`, or `never` (default `auto`).
+    #[serde(default = "default_afk_mode")]
+    pub afk_mode: String,
+    /// Desktop idle seconds before AFK boost engages (default 300).
+    #[serde(default = "default_afk_idle_seconds")]
+    pub afk_idle_seconds: u64,
 }
 
 fn default_warn_cpu_psi() -> f64 {
@@ -567,11 +591,21 @@ fn default_crit_cpu_psi() -> f64 {
     40.0
 }
 
+fn default_afk_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_afk_idle_seconds() -> u64 {
+    300
+}
+
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             warn_cpu_psi: default_warn_cpu_psi(),
             crit_cpu_psi: default_crit_cpu_psi(),
+            afk_mode: default_afk_mode(),
+            afk_idle_seconds: default_afk_idle_seconds(),
         }
     }
 }

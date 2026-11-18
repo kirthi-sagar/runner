@@ -369,6 +369,7 @@ async fn get_ci_status(ctx: &ToolContext) -> Result<serde_json::Value, ToolError
             "last_weight": state.last_weight,
             "last_slots": state.last_slots,
             "afk_boost": state.afk.boosted(),
+            "afk_mode": state.afk_mode.name(),
         },
         "reservations": state.reservations().iter().map(|r| serde_json::json!({
             "id": r.id, "cores": r.cores, "ram_mb": r.ram_mb, "reason": r.reason,

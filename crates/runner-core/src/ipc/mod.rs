@@ -72,6 +72,7 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                 "cloud_nodes": guard.cloud_nodes(),
                 "drained_nodes": guard.drained_nodes(),
                 "afk_boosted": guard.afk.boosted(),
+                "afk_mode": guard.afk_mode.name(),
                 "psi_warn": guard.psi_warn,
                 "psi_crit": guard.psi_crit,
             } })

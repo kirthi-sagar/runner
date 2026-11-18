@@ -54,6 +54,7 @@ pub struct ConcurrencyStatus {
     pub active_slots: u32,
     pub queued_github_jobs: u32,
     pub afk_boost: bool,
+    pub afk_mode: String,
 }
 
 /// Build a live status report from kernel interfaces, enriched with
@@ -62,6 +63,8 @@ pub struct ConcurrencyStatus {
 pub fn status_report_with_state(state: &SupervisorState) -> StatusReport {
     let mut report = status_report();
     report.forges = Some(state.forge_health());
+    report.concurrency.afk_boost = state.afk.boosted();
+    report.concurrency.afk_mode = state.afk_mode.name().to_string();
     report
 }
 
@@ -120,6 +123,7 @@ pub fn status_report() -> StatusReport {
             active_slots: 0,
             queued_github_jobs: 0,
             afk_boost: false,
+            afk_mode: "auto".to_string(),
         },
         active_jobs: Vec::new(),
         mesh_nodes: Vec::new(),

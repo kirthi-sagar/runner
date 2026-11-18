@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::{Notify, RwLock};
 
-use super::afk::AfkBoost;
+use super::afk::{poll_desktop_idle, AfkBoost, AfkMode, IdleState, PROBE_EVERY};
 use super::cgroup::{weight_for_cpu_psi_with, CgroupSlice};
 use super::psi::{PressureLevel, PsiPoller, PsiSnapshot};
 use super::topology::detect_slots;
@@ -84,6 +84,12 @@ fn now_unix_ms() -> u64 {
 #[derive(Debug)]
 pub struct SupervisorState {
     pub afk: AfkBoost,
+    /// AFK probing policy seeded from `[governor] afk_mode`.
+    pub afk_mode: AfkMode,
+    /// Idle seconds before boost engages in Auto mode.
+    pub afk_idle_secs: u64,
+    /// Wall time of the last desktop-idle probe (5s throttle).
+    pub afk_last_probe: Option<Instant>,
     reservations: HashMap<String, Reservation>,
     throttle: Option<ThrottleOverride>,
     drained: HashMap<String, String>,
@@ -117,6 +123,9 @@ impl SupervisorState {
     pub fn new() -> Self {
         Self {
             afk: AfkBoost::new(),
+            afk_mode: AfkMode::default(),
+            afk_idle_secs: 300,
+            afk_last_probe: None,
             reservations: HashMap::new(),
             throttle: None,
             drained: HashMap::new(),
@@ -182,6 +191,32 @@ impl SupervisorState {
         {
             self.psi_warn = config.governor.warn_cpu_psi;
             self.psi_crit = config.governor.crit_cpu_psi;
+        }
+        self.afk_mode = AfkMode::parse(&config.governor.afk_mode);
+        self.afk_idle_secs = config.governor.afk_idle_seconds;
+    }
+
+    /// Evaluate AFK boost for this tick. Always/Never modes bypass the
+    /// probe; Auto probes `loginctl` at most once per [`PROBE_EVERY`].
+    /// Idle engages the latch, presence restores it — the transition is
+    /// free (latch flip only) and restores within one tick (~250ms).
+    pub fn poll_afk(&mut self) {
+        match self.afk_mode {
+            AfkMode::Always => self.afk.on_idle_timeout(),
+            AfkMode::Never => self.afk.on_user_input(),
+            AfkMode::Auto => {
+                let due = self
+                    .afk_last_probe
+                    .is_none_or(|t| t.elapsed() >= PROBE_EVERY);
+                if !due {
+                    return;
+                }
+                self.afk_last_probe = Some(Instant::now());
+                match poll_desktop_idle(self.afk_idle_secs) {
+                    IdleState::Idle => self.afk.on_idle_timeout(),
+                    IdleState::Active => self.afk.on_user_input(),
+                }
+            }
         }
     }
 
@@ -503,6 +538,7 @@ pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
                 guard.prune_expired(now);
                 guard.last_snapshot = snapshot;
                 guard.poll_workstation_guards();
+                guard.poll_afk();
                 let weight = tick_weight(&guard, &snapshot, now);
                 guard.last_weight = Some(weight);
                 let base = detect_slots(guard.afk.boosted()).map(|r| r.slots).unwrap_or(1);
@@ -735,5 +771,36 @@ mod tests {
         state.reserve(1.0, 1024, Duration::from_secs(1), "t".into(), now);
         state.prune_expired(now + Duration::from_secs(2));
         assert!(state.reservations().is_empty());
+    }
+
+    #[test]
+    fn afk_seed_defaults_to_auto() {
+        let mut state = SupervisorState::new();
+        state.seed_from_config(&RunnerConfig::default());
+        assert_eq!(state.afk_mode, AfkMode::Auto);
+        assert_eq!(state.afk_idle_secs, 300);
+    }
+
+    #[test]
+    fn afk_always_never_bypass_probe() {
+        let mut state = SupervisorState::new();
+        state.afk_mode = AfkMode::Always;
+        state.poll_afk();
+        assert!(state.afk.boosted());
+        assert!(state.afk_last_probe.is_none());
+        state.afk_mode = AfkMode::Never;
+        state.poll_afk();
+        assert!(!state.afk.boosted());
+        assert!(state.afk_last_probe.is_none());
+    }
+
+    #[test]
+    fn afk_auto_throttles_within_window() {
+        let mut state = SupervisorState::new();
+        state.afk_mode = AfkMode::Auto;
+        state.afk_last_probe = Some(Instant::now());
+        // Recent probe: no subprocess spawned, latch untouched.
+        state.poll_afk();
+        assert!(!state.afk.boosted());
     }
 }

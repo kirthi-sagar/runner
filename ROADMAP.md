@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.6.0 and prior)
+## Shipped (v0.7.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -24,6 +24,12 @@ services or heavyweight frameworks.
 
 - mDNS P2P LAN cache sharing across machines on one network.
 - Thermal guard (CPU throttle past 85°C) + battery drain guard.
+
+## Shipped in v0.7.0: Workstation Autonomy, Background Cache TTL & Routing Hardening
+
+- AFK Boost: loginctl idle probing (auto/always/never) + status visibility.
+- Background cache TTL sweep (creation-age eviction, hourly).
+- WAN routing fail-closed with same-tick cloud fallback.
 
 ## Shipped in v0.5.1: MCP Cache Stats Patch
 

@@ -549,6 +549,66 @@ impl CacheStore {
         let _ = self.persist();
         (removed, freed)
     }
+
+    /// Evict entries older than `ttl_secs` by *creation* age (staleness,
+    /// not access idleness — contrast [`CacheStore::clear`]). Counters
+    /// are kept; the index persists only when something was removed.
+    /// Returns (removed entries, freed bytes).
+    pub fn evict_expired(&self, ttl_secs: u64) -> (usize, u64) {
+        let mut inner = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => return (0, 0),
+        };
+        let now = now_unix_secs();
+        let victims: Vec<u64> = inner
+            .entries
+            .values()
+            .filter(|e| e.created_unix_secs.saturating_add(ttl_secs) < now)
+            .map(|e| e.id)
+            .collect();
+        let mut freed = 0u64;
+        for id in &victims {
+            if let Some(entry) = inner.entries.remove(id) {
+                freed += entry.size;
+                let _ = std::fs::remove_file(self.dir.join(&entry.file));
+            }
+        }
+        let removed = victims.len();
+        drop(inner);
+        if removed > 0 {
+            let _ = self.persist();
+        }
+        (removed, freed)
+    }
+
+    /// Background TTL sweeper: evicts immediately on spawn, then every
+    /// `sweep_secs` (60s floor). Returns `None` when `ttl_secs` is 0
+    /// (sweep disabled); the daemon drops the handle (fire-and-forget).
+    pub fn spawn_ttl_sweeper(
+        &self,
+        ttl_secs: u64,
+        sweep_secs: u64,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if ttl_secs == 0 {
+            return None;
+        }
+        let store = self.clone();
+        let every = std::time::Duration::from_secs(sweep_secs.max(60));
+        Some(tokio::spawn(async move {
+            store.evict_expired(ttl_secs);
+            let mut ticker = tokio::time::interval(every);
+            // The spawn tick above already swept; skip the
+            // interval's immediate first tick to avoid a double.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let (removed, freed) = store.evict_expired(ttl_secs);
+                if removed > 0 {
+                    eprintln!("runner: cache TTL sweep evicted {removed} entries ({freed} bytes)");
+                }
+            }
+        }))
+    }
 }
 
 /// Outcome of [`CacheStore::reserve`].
@@ -801,5 +861,40 @@ mod tests {
         let reopened = CacheStore::open(&cache_dir, 1 << 30).unwrap();
         assert_eq!(reopened.stats().entries, 1);
         assert!(reopened.lookup("v", &["k".to_string()]).is_some());
+    }
+
+    #[test]
+    fn ttl_evicts_by_creation_age_not_access() {
+        let (_dir, store) = store(1 << 30);
+        commit_bytes(&store, "old", "v", b"0123456789");
+        // Fresh access must NOT rescue a creation-aged entry; the 2s
+        // sleep plus ttl=1 keeps the fresh commit safe even if the
+        // clock crosses a second boundary mid-test.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert!(store.lookup("v", &["old".to_string()]).is_some());
+        commit_bytes(&store, "new", "v", b"0123456789");
+        let (removed, freed) = store.evict_expired(1);
+        assert_eq!((removed, freed), (1, 10));
+        assert_eq!(store.stats().entries, 1);
+        assert!(store.lookup("v", &["new".to_string()]).is_some());
+        // Counters survive a TTL eviction (no reset like full clear).
+        assert!(store.stats().hits >= 1);
+    }
+
+    #[test]
+    fn ttl_sweep_disabled_when_zero() {
+        let (_dir, store) = store(1 << 30);
+        assert!(store.spawn_ttl_sweeper(0, 3600).is_none());
+    }
+
+    #[tokio::test]
+    async fn sweeper_evicts_on_spawn_tick() {
+        let (_dir, store) = store(1 << 30);
+        commit_bytes(&store, "stale", "v", b"0123456789");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let handle = store.spawn_ttl_sweeper(1, u64::MAX).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(store.stats().entries, 0);
+        handle.abort();
     }
 }

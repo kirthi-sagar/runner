@@ -6,6 +6,20 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v0.9.0 — 2026-11-18
+
+- Hermetic test isolation: `TempDir` paths carry a 64-bit random
+  nonce and stale directories are removed before creation.
+- New `runner auth status`: per-forge credential presence with
+  masked tokens (full values never printed).
+- Provider credential rejections now name the rotation command;
+  error classifiers covered by unit tests.
+- v1.0 schema freeze: `docs/mcp.md` documents all 12 tool
+  contracts, `docs/cli-json.md` documents the four JSON CLI
+  surfaces, and `tests/test_schema_freeze.rs` pins them.
+- ROADMAP carries Shipped v0.8.0, `Next: v0.9.0`, v1.0.0 GA
+  criteria, and the post-v1.0 WAN enterprise marking.
+
 ## v0.8.0 — 2026-11-18
 
 - `runner doctor` covers cache (proxy reachability, store

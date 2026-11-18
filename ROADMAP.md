@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.8.0 and prior)
+## Shipped (v0.9.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,15 +14,23 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 
-## Next: v0.8.0 Production Diagnostics & v1.0 GA Readiness
+## Next: v0.9.0 (v1.0 Release Candidate)
 
-- v0.8.0: `doctor` covers cache, workstation guards, and AFK;
-  installer/asset smoke tests; roadmap truth.
-- v1.0.0 GA criteria: doctor-clean fresh install on
-  Ubuntu/Debian/Arch/Fedora; release-asset smoke green on every
-  tag; zero known Fail-default doctor paths; WAN transport
-  shipped or documented out-of-scope; two-machine LAN
-  federation verified; `runner.*` API/error-shape freeze.
+- v0.9.0: hermetic test isolation (TempDir nonces), `auth status`
+  with masked tokens, provider rotation guidance, CLI/MCP JSON
+  schema freeze with contract tests.
+- v1.0.0 GA criteria (all must hold at tag time): schema-freeze
+  tests green with zero doc drift; asset smoke green on every
+  tag; doctor-clean fresh install on Ubuntu/Debian/Arch/Fedora;
+  zero known Fail-default doctor paths; two-machine LAN
+  federation verified; WAN peer WireGuard transport marked as a
+  post-v1.0 enterprise extension (see Later).
+
+## Shipped in v0.8.0: Production Diagnostics & GA Readiness
+
+- `doctor` covers cache, workstation guards, and AFK (Pass/Warn only).
+- Installer/asset smoke tests; MCP `diagnose` shares doctor output.
+- ROADMAP reverse-chronological order + v1.0 horizon draft.
 
 ## Shipped in v0.7.0: Workstation Autonomy, Background Cache TTL & Routing Hardening
 
@@ -94,6 +102,11 @@ services or heavyweight frameworks.
 
 - Per-repo isolation once the protocol can carry repo identity
   (standard clients send none).
+
+## Later: post-v1.0 enterprise extensions
+
+- WAN peer WireGuard execution transport (routing stays
+  fail-closed to cloud burst / wait until this ships).
 
 ## Explicit non-goals
 

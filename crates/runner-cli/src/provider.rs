@@ -97,7 +97,7 @@ pub fn scope_line(verdict: &ScopeVerdict) -> (bool, String) {
 /// Classify a GitLab client error: bad credentials vs connectivity.
 pub fn gitlab_err_kind(message: &str) -> &'static str {
     if message.contains("401") {
-        "bad runner token (401)"
+        "bad runner token (401; run `runner auth gitlab` to rotate)"
     } else {
         "connectivity/API failure"
     }
@@ -106,7 +106,7 @@ pub fn gitlab_err_kind(message: &str) -> &'static str {
 /// Classify a Bitbucket OAuth error: bad credentials vs connectivity.
 pub fn bitbucket_err_kind(message: &str) -> &'static str {
     if message.contains("400") || message.contains("401") {
-        "bad OAuth credentials"
+        "bad OAuth credentials (run `runner auth bitbucket` to rotate)"
     } else {
         "connectivity/API failure"
     }
@@ -130,7 +130,10 @@ async fn test_github() -> ProviderReport {
     match client.whoami().await {
         Ok(login) => lines.push(format!("authenticated as: {login}")),
         Err(e) if e.contains("401") => {
-            lines.push("credentials rejected (401 unauthorized)".to_string());
+            lines.push(
+                "credentials rejected (401 unauthorized; run `runner auth github` to rotate)"
+                    .to_string(),
+            );
             return ProviderReport::fail("github", lines);
         }
         Err(e) => {
@@ -295,9 +298,11 @@ mod tests {
 
     #[test]
     fn error_kinds_classify() {
+        // Credential rejections carry rotation guidance; connectivity
+        // failures stay terse (nothing to rotate).
         assert_eq!(
             gitlab_err_kind("gitlab jobs/request: HTTP 401 Unauthorized"),
-            "bad runner token (401)"
+            "bad runner token (401; run `runner auth gitlab` to rotate)"
         );
         assert_eq!(
             gitlab_err_kind("gitlab jobs/request failed: dns"),
@@ -305,7 +310,11 @@ mod tests {
         );
         assert_eq!(
             bitbucket_err_kind("bitbucket oauth: HTTP 400 Bad Request"),
-            "bad OAuth credentials"
+            "bad OAuth credentials (run `runner auth bitbucket` to rotate)"
+        );
+        assert_eq!(
+            bitbucket_err_kind("bitbucket oauth: HTTP 401 Unauthorized"),
+            "bad OAuth credentials (run `runner auth bitbucket` to rotate)"
         );
         assert_eq!(
             bitbucket_err_kind("bitbucket oauth failed: timeout"),

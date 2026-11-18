@@ -74,6 +74,22 @@ pub fn upsert_env_var(text: &str, key: &str, value: &str) -> String {
     rendered
 }
 
+/// Mask a secret for display: keep the scheme prefix through the
+/// first `_` or `-` (`ghp_`, `glpat-`, `bb_`), else the first two
+/// characters, then bullets. The full value never appears in output.
+pub fn mask_token(token: &str) -> String {
+    let token = token.trim();
+    if token.len() < 5 {
+        return "••••••".to_string();
+    }
+    let prefix_len = token
+        .find(['_', '-'])
+        .map(|i| i + 1)
+        .filter(|&n| n >= 3)
+        .unwrap_or_else(|| token.chars().take(2).map(char::len_utf8).sum());
+    format!("{}••••••", &token[..prefix_len])
+}
+
 /// Token store backed by one env file.
 #[derive(Debug, Clone)]
 pub struct TokenStore {
@@ -111,13 +127,17 @@ impl TokenStore {
 
     /// Whether a non-empty token is stored (value never exposed).
     pub fn has_token(&self, slot: ProviderSlot) -> bool {
-        std::fs::read_to_string(&self.path)
-            .map(|text| {
-                crate::config::parse_env_file(&text)
-                    .iter()
-                    .any(|(k, v)| k == slot.env_var() && !v.trim().is_empty())
-            })
-            .unwrap_or(false)
+        self.masked_token(slot).is_some()
+    }
+
+    /// Masked token for `auth status` display (`ghp_••••••`), or None
+    /// when the slot is empty. The full value never leaves this call.
+    pub fn masked_token(&self, slot: ProviderSlot) -> Option<String> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        crate::config::parse_env_file(&text)
+            .iter()
+            .find(|(k, v)| k == slot.env_var() && !v.trim().is_empty())
+            .map(|(_, v)| mask_token(v))
     }
 }
 
@@ -185,5 +205,38 @@ mod tests {
         assert!(text.contains("RUNNER_GITLAB_TOKEN=glpat_x"));
         assert!(text.contains("RUNNER_BITBUCKET_CLIENT_ID=bb-id"));
         assert!(text.contains("RUNNER_BITBUCKET_CLIENT_SECRET=bb-secret"));
+    }
+
+    #[test]
+    fn masking_keeps_scheme_prefix_only() {
+        assert_eq!(mask_token("ghp_deadbeef1234"), "ghp_••••••");
+        assert_eq!(mask_token("glpat-xyz789"), "glpat-••••••");
+        assert_eq!(mask_token("bb_secretvalue"), "bb_••••••");
+        // Opaque secrets fall back to two leading characters.
+        assert_eq!(mask_token("AbCdEfGh"), "Ab••••••");
+        // Short or blank values reveal nothing at all.
+        assert_eq!(mask_token("ab"), "••••••");
+        assert_eq!(mask_token(""), "••••••");
+        // Full values never survive masking.
+        for secret in ["ghp_deadbeef1234", "glpat-xyz789", "bb_secretvalue"] {
+            assert!(!mask_token(secret).contains(&secret[4..]));
+        }
+    }
+
+    #[test]
+    fn masked_token_reads_store_without_exposing_values() {
+        let dir = crate::test_support::TempDir::new("auth-masked").unwrap();
+        let store = TokenStore::new(dir.path().join("env"));
+        assert_eq!(store.masked_token(ProviderSlot::Github), None);
+        store
+            .set_token(ProviderSlot::Github, "ghp_livevalue")
+            .unwrap();
+        assert_eq!(
+            store.masked_token(ProviderSlot::Github).as_deref(),
+            Some("ghp_••••••")
+        );
+        // has_token keeps its contract through the shared reader.
+        assert!(store.has_token(ProviderSlot::Github));
+        assert!(!store.has_token(ProviderSlot::Gitlab));
     }
 }

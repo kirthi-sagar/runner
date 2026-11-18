@@ -4,7 +4,7 @@
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Shipped product (v0.8.x) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Shipped product (v0.9.x) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -154,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v0.8.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v0.9.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -191,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v0.8.0  (q quit, live cadence)
+runner top v0.9.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -303,7 +303,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "0.8.0", "governor": "normal",
+{"status": "healthy", "version": "0.9.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -472,6 +472,9 @@ runner mcp install --target cursor
 ```
 
 Full agent setup, tool catalog, and stdio examples: [`docs/mcp.md`](docs/mcp.md).
+Frozen machine-readable contracts: [`docs/mcp.md`](docs/mcp.md) (tool
+inputs/outputs) and [`docs/cli-json.md`](docs/cli-json.md) (`status`,
+`doctor`, `cache stats`, `cloud list` JSON shapes).
 
 Lifecycle: `initialize` → `notifications/initialized` → `tools/list` →
 `tools/call`. MCP-compatible clients (Claude Code, Cursor, Antigravity,

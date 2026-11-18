@@ -66,3 +66,75 @@ printf '%s\n' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
   | runner mcp
 ```
+
+## Frozen tool contracts (v1.0)
+
+Input schemas are served verbatim by `tools/list`; results render as
+JSON into the text content block. Errors use JSON-RPC codes:
+`-32601` unknown tool, `-32602` invalid params, `-32603` internal.
+`tests/test_schema_freeze.rs` pins every name and input schema —
+changes must update this doc and that test together.
+
+`get_ci_status` — input `{}`. Output: `status`, `version`, `host`
+(same shape as `runner status`), `concurrency`, `governor`
+(`last_weight`, `last_slots`, `afk_boost`, `afk_mode`),
+`reservations` (`id`, `cores`, `ram_mb`, `reason`), `drained_nodes`,
+`forges` (per-forge poll health).
+
+`get_fleet_topology` — input `{}`. Output: `local`
+(`total_cores`, `physical_cores`, `available_memory_bytes`,
+`max_slots`, `cpu_level`), `wan_peers`, `cloud_nodes`,
+`drained_nodes`.
+
+`reserve_host_resources` — input: `cores` (number, required, finite
+\> 0), `ram_gb` (number, required, finite \> 0),
+`duration_minutes` (integer, required, \> 0), `reason` (string,
+optional). Output: `reservation_id`, `cores`, `ram_mb`, `reason`.
+
+`release_host_resources` — input: `reservation_id` (string,
+required). Output: `released`. Unknown id → `-32602`.
+
+`throttle_runner` — input: `level` (required, `warning`|`critical`),
+`duration_minutes` (integer, required, \> 0). Output: `level`,
+`cpu_weight` (25 or 1), `duration_minutes`. Never freezes.
+
+`request_cloud_capacity` — input: `provider` (required,
+`digitalocean`|`render`), `max_instances` (integer, required, \> 0),
+`duration_hours` (number, required, finite \> 0), `reason` (string,
+required). Output when denied: `approved: false`, `reason` (zero
+spend cap or missing provider token). Output when approved:
+`approved: true`, `provider`, `node_id`, `node_status`,
+`max_instances`, `duration_hours`, `budget_cap_usd`. One instance
+per call; nodes self-terminate after 5 idle minutes.
+
+`drain_node` — input: `node_id` (string, required, non-empty),
+`reason` (string, required). Output: `drained`.
+
+`diagnose_system` — input: `egress` (boolean, optional),
+`enterprise` (boolean, optional). Output: the `runner doctor --format
+json` report (`checks` with `name`/`status`/`detail`, plus `ok`) with
+a `forges` health map merged in.
+
+`test_provider` — input: `provider` (required,
+`github`|`gitlab`|`bitbucket`|`local`). Output: `provider`, `ok`
+(boolean), `lines` (human-readable diagnostics, including rotation
+guidance on credential rejection).
+
+`exec_command` — input: `command` (string array, required,
+non-empty), `timeout_secs` (integer, optional, default 60, ≥ 1),
+`env` (object, optional). Output on completion: `code`, `stdout`,
+`stderr`, `elapsed_secs`, `timeout: false`. Output on timeout:
+`timeout: true`, `elapsed_secs` (data, not an RPC error).
+
+`manage_cloud_capacity` — input: `action` (required,
+`list`|`terminate`|`purge`), `instance_id` (string, required for
+`terminate`). Output for `list`: `action`, `active_nodes`, `nodes`,
+`providers`, `spend_usd`, `max_monthly_spend_usd`, `spend_tracked`.
+`terminate`/`purge` return the daemon result object. Requires a
+running daemon.
+
+`get_cache_stats` — input `{}`. Output when the proxy runs:
+`enabled: true` plus `entries`, `size_bytes`, `hits`, `misses`,
+`hit_ratio`, `bytes_served`, `bytes_uploaded`, `remote_hits`,
+`remote_bytes_imported`, `remote_bytes_served`. Output otherwise:
+`enabled: false`. Requires a running daemon.

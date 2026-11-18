@@ -237,6 +237,8 @@ enum AuthCommands {
         #[arg(long)]
         client_secret: Option<String>,
     },
+    /// Show credential presence per forge (tokens masked, never printed)
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -647,6 +649,31 @@ fn cmd_auth_gitlab(token: Option<String>) -> Result<()> {
         "gitlab token stored in {} (0600); restart the daemon to apply",
         path.display()
     );
+    Ok(())
+}
+
+fn cmd_auth_status() -> Result<()> {
+    use runner_core::auth::{ProviderSlot, TokenStore};
+
+    let Some(store) = TokenStore::default_store() else {
+        println!("no HOME for secrets file; no credentials configured");
+        return Ok(());
+    };
+    println!("credentials: {}", store.path().display());
+    for (label, slot) in [
+        ("github", ProviderSlot::Github),
+        ("gitlab", ProviderSlot::Gitlab),
+        ("bitbucket client id", ProviderSlot::BitbucketClientId),
+        (
+            "bitbucket client secret",
+            ProviderSlot::BitbucketClientSecret,
+        ),
+    ] {
+        match store.masked_token(slot) {
+            Some(masked) => println!("  {label:<24} {masked}"),
+            None => println!("  {label:<24} not configured"),
+        }
+    }
     Ok(())
 }
 
@@ -1243,6 +1270,7 @@ async fn main() -> Result<()> {
                 client_id,
                 client_secret,
             } => cmd_auth_bitbucket(client_id, client_secret)?,
+            AuthCommands::Status => cmd_auth_status()?,
         },
         Commands::Audit { command } => match command {
             AuditCommands::Verify { file } => cmd_audit_verify(file)?,

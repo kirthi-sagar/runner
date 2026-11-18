@@ -18,7 +18,7 @@ fn call(id: u64, method: &str, params: serde_json::Value) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn tools_list_returns_all_eleven_tools() {
+async fn tools_list_returns_all_twelve_tools() {
     let server = server();
     let res = server
         .handle_value(call(1, "tools/list", serde_json::json!({})))

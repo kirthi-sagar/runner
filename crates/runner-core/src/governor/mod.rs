@@ -5,4 +5,5 @@ pub mod afk;
 pub mod cgroup;
 pub mod psi;
 pub mod supervisor;
+pub mod thermal;
 pub mod topology;

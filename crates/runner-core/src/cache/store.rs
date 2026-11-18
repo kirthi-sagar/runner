@@ -33,13 +33,23 @@ pub struct CacheEntryMeta {
     pub hits: u64,
 }
 
-/// Aggregate counters (persisted with the index).
+/// Aggregate counters (persisted with the index). New fields must
+/// stay `#[serde(default)]` so pre-existing indexes keep parsing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CacheStatsData {
     pub hits: u64,
     pub misses: u64,
     pub bytes_served: u64,
     pub bytes_uploaded: u64,
+    /// Peer hits served via federation fallback.
+    #[serde(default)]
+    pub remote_hits: u64,
+    /// Archive bytes pulled in from LAN peers.
+    #[serde(default)]
+    pub remote_bytes_imported: u64,
+    /// Archive bytes served to LAN peers (non-loopback downloads).
+    #[serde(default)]
+    pub remote_bytes_served: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +70,9 @@ pub struct CacheStatsSnapshot {
     pub hit_ratio: f64,
     pub bytes_served: u64,
     pub bytes_uploaded: u64,
+    pub remote_hits: u64,
+    pub remote_bytes_imported: u64,
+    pub remote_bytes_served: u64,
 }
 
 #[derive(Debug)]
@@ -76,6 +89,7 @@ struct StoreInner {
 pub enum StoreError {
     UnknownUpload(u64),
     SizeMismatch { id: u64, staged: u64, declared: u64 },
+    TooLarge { id: u64, size: u64, max: u64 },
     Io(String),
 }
 
@@ -90,6 +104,10 @@ impl std::fmt::Display for StoreError {
             } => write!(
                 f,
                 "size mismatch for upload {id}: staged {staged} != declared {declared}"
+            ),
+            Self::TooLarge { id, size, max } => write!(
+                f,
+                "upload {id} too large: {size} bytes exceeds {max} byte ceiling"
             ),
             Self::Io(e) => write!(f, "{e}"),
         }
@@ -324,6 +342,16 @@ impl CacheStore {
             .ok()
     }
 
+    /// Abandon a pending upload: drop the reservation and delete staged
+    /// bytes. Idempotent; unknown ids only skip the map removal (the
+    /// staging file is still swept when present).
+    pub fn abort_upload(&self, id: u64) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.pending.remove(&id);
+        }
+        let _ = std::fs::remove_file(self.dir.join(format!("{id}.tmp")));
+    }
+
     /// Commit a staged upload: verify total size, atomically move into the
     /// store, evict LRU over budget. Returns the committed entry.
     pub fn commit(&self, id: u64, size: u64) -> Result<CacheEntryMeta, StoreError> {
@@ -339,11 +367,24 @@ impl CacheStore {
         };
         let tmp = self.dir.join(format!("{id}.tmp"));
         let staged = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        // Rejected commits sweep their staging files: a refused upload
+        // must not linger on disk until the next restart.
         if staged != size {
+            let _ = std::fs::remove_file(&tmp);
             return Err(StoreError::SizeMismatch {
                 id,
                 staged,
                 declared: size,
+            });
+        }
+        // Per-archive ceiling: no single archive may exceed the whole
+        // store budget (a peer or worker must not evict everything).
+        if size > self.max_bytes {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(StoreError::TooLarge {
+                id,
+                size,
+                max: self.max_bytes,
             });
         }
         let file = entry_filename(&version, &key);
@@ -395,6 +436,11 @@ impl CacheStore {
         drop(inner);
         self.persist().map_err(StoreError::Io)?;
         entry.ok_or(StoreError::UnknownUpload(id))
+    }
+
+    /// Store disk budget in bytes (also the per-archive ceiling).
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
     }
 
     /// Total archive bytes for an entry without reading it (HEAD support).
@@ -449,7 +495,27 @@ impl CacheStore {
             },
             bytes_served: stats.bytes_served,
             bytes_uploaded: stats.bytes_uploaded,
+            remote_hits: stats.remote_hits,
+            remote_bytes_imported: stats.remote_bytes_imported,
+            remote_bytes_served: stats.remote_bytes_served,
         }
+    }
+
+    /// Record a federated hit: peer served us `imported` bytes.
+    pub fn record_remote_hit(&self, imported_bytes: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.stats.remote_hits += 1;
+        inner.stats.remote_bytes_imported += imported_bytes;
+    }
+
+    /// Record archive bytes served to a LAN peer download.
+    pub fn record_remote_served(&self, bytes: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.stats.remote_bytes_served += bytes;
     }
 
     /// Purge archives: all, or entries unaccessed for `older_than_days`.
@@ -641,6 +707,82 @@ mod tests {
         drop(store);
         let reopened = CacheStore::open(&cache_dir, 1 << 30).unwrap();
         assert_eq!((reopened.stats().hits, reopened.stats().misses), (1, 1));
+    }
+
+    #[test]
+    fn commit_rejects_archives_past_store_budget() {
+        let (dir, store) = store(16);
+        let ReserveOutcome::Created(id) = store.reserve("big", "v").unwrap() else {
+            panic!("expected created");
+        };
+        store.write_chunk(id, 0, &[0u8; 20]).unwrap();
+        assert_eq!(
+            store.commit(id, 20).unwrap_err(),
+            StoreError::TooLarge {
+                id,
+                size: 20,
+                max: 16
+            }
+        );
+        // Rejected staging is swept, reservation consumed.
+        assert!(store.staged_len(id).is_none());
+        assert!(!dir.path().join("cache").join(format!("{id}.tmp")).exists());
+    }
+
+    #[test]
+    fn legacy_index_without_remote_counters_still_parses() {
+        let dir = TempDir::new("cache-legacy").unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(
+            cache_dir.join("index.json"),
+            r#"{"version":1,"next_id":1,"entries":[],"stats":{"hits":7,"misses":3,"bytes_served":100,"bytes_uploaded":50}}"#,
+        )
+        .unwrap();
+        let store = CacheStore::open(&cache_dir, 1 << 30).unwrap();
+        let stats = store.stats();
+        assert_eq!((stats.hits, stats.misses), (7, 3));
+        assert_eq!(
+            (
+                stats.remote_hits,
+                stats.remote_bytes_imported,
+                stats.remote_bytes_served
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn remote_counters_record_and_snapshot() {
+        let (_dir, store) = store(1 << 30);
+        store.record_remote_hit(100);
+        store.record_remote_hit(50);
+        store.record_remote_served(100);
+        let stats = store.stats();
+        assert_eq!(stats.remote_hits, 2);
+        assert_eq!(stats.remote_bytes_imported, 150);
+        assert_eq!(stats.remote_bytes_served, 100);
+    }
+
+    #[test]
+    fn abort_upload_drops_reservation_and_staged_bytes() {
+        let (dir, store) = store(1 << 30);
+        let ReserveOutcome::Created(id) = store.reserve("k", "v").unwrap() else {
+            panic!("expected created");
+        };
+        store.write_chunk(id, 0, b"partial").unwrap();
+        let tmp = dir.path().join("cache").join(format!("{id}.tmp"));
+        assert!(tmp.is_file());
+        store.abort_upload(id);
+        assert!(!tmp.exists());
+        // Idempotent; unknown ids silent.
+        store.abort_upload(id);
+        store.abort_upload(424242);
+        // Reservation released: re-reserve yields a fresh id.
+        assert!(matches!(
+            store.reserve("k", "v").unwrap(),
+            ReserveOutcome::Created(_)
+        ));
     }
 
     #[test]

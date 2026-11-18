@@ -18,6 +18,7 @@ use super::afk::AfkBoost;
 use super::cgroup::{weight_for_cpu_psi_with, CgroupSlice};
 use super::psi::{PressureLevel, PsiPoller, PsiSnapshot};
 use super::topology::detect_slots;
+use crate::cache::server::CacheServerState;
 use crate::cache::CacheStore;
 use crate::config::{PeerRecord, RunnerConfig};
 use crate::mesh::cloud::{CloudNode, CloudPool};
@@ -90,7 +91,7 @@ pub struct SupervisorState {
     cloud_nodes: Vec<CloudNode>,
     cloud_pool: Option<CloudPool>,
     cloud_spend_cap: f64,
-    cache: Option<(CacheStore, String)>,
+    cache: Option<CacheServerState>,
     donor_caps: Option<(u32, u64)>,
     next_reservation: u64,
     in_flight: u32,
@@ -104,6 +105,12 @@ pub struct SupervisorState {
     /// Operator CPU PSI thresholds (warn/crit) seeded from config.
     pub psi_warn: f64,
     pub psi_crit: f64,
+    /// Last package temp reading (°C, None when unsensed).
+    pub temp_c: Option<f64>,
+    /// Latched thermal throttle (85°C engage, 78°C release).
+    pub thermal_throttled: bool,
+    /// On battery power: halt new job intake.
+    pub discharging: bool,
 }
 
 impl SupervisorState {
@@ -130,7 +137,36 @@ impl SupervisorState {
             last_slots: 1,
             psi_warn: super::psi::CPU_WARN,
             psi_crit: super::psi::CPU_CRIT,
+            temp_c: None,
+            thermal_throttled: false,
+            discharging: false,
         }
+    }
+
+    /// Refresh workstation guards from live sensors, applying the
+    /// 85°C-engage / 78°C-release hysteresis band.
+    pub fn poll_workstation_guards(&mut self) {
+        let temp = super::thermal::package_temp_c();
+        self.temp_c = temp;
+        match (self.thermal_throttled, temp) {
+            (false, Some(t)) if t >= super::thermal::THERMAL_THROTTLE_C => {
+                eprintln!("runner: thermal throttle engaged at {t:.1}°C");
+                self.thermal_throttled = true;
+            }
+            (true, Some(t)) if t < super::thermal::THERMAL_RELEASE_C => {
+                eprintln!("runner: thermal throttle released at {t:.1}°C");
+                self.thermal_throttled = false;
+            }
+            (true, None) => self.thermal_throttled = false,
+            _ => {}
+        }
+        let discharging = super::thermal::power_state() == super::thermal::PowerState::Discharging;
+        if discharging && !self.discharging {
+            eprintln!("runner: on battery power; halting new job intake");
+        } else if !discharging && self.discharging {
+            eprintln!("runner: AC power restored; resuming job intake");
+        }
+        self.discharging = discharging;
     }
 
     /// Seed WAN peers, donor caps, and governor thresholds from config.
@@ -242,19 +278,24 @@ impl SupervisorState {
         self.cloud_pool.clone()
     }
 
-    /// Attach the LAN cache store + advertised base URL (once, at daemon
-    /// startup after the proxy binds). Absent when binding failed.
-    pub fn set_cache(&mut self, store: CacheStore, base_url: String) {
-        self.cache = Some((store, base_url));
+    /// Attach the LAN cache server state (once, at daemon startup
+    /// after the proxy binds). Absent when binding failed.
+    pub fn set_cache(&mut self, state: CacheServerState) {
+        self.cache = Some(state);
     }
 
     pub fn cache_store(&self) -> Option<CacheStore> {
-        self.cache.as_ref().map(|(store, _)| store.clone())
+        self.cache.as_ref().map(|s| s.store.clone())
     }
 
     /// Base URL workers use for `ACTIONS_CACHE_URL` (None = disabled).
     pub fn cache_base_url(&self) -> Option<String> {
-        self.cache.as_ref().map(|(_, url)| url.clone())
+        self.cache.as_ref().map(|s| s.public_base.clone())
+    }
+
+    /// Per-boot bearer token injected as `ACTIONS_RUNTIME_TOKEN`.
+    pub fn cache_token(&self) -> Option<String> {
+        self.cache.as_ref().map(|s| s.token.clone())
     }
 
     pub fn cloud_spend_cap(&self) -> f64 {
@@ -388,9 +429,26 @@ pub fn effective_slots(base: u32, snapshot: &PsiSnapshot) -> u32 {
 pub fn tick_weight(state: &SupervisorState, snapshot: &PsiSnapshot, now: Instant) -> u32 {
     let pressure =
         weight_for_cpu_psi_with(snapshot.cpu_some_avg10(), state.psi_warn, state.psi_crit);
-    state
+    let weight = state
         .throttle_weight(now)
-        .map_or(pressure, |o| o.min(pressure))
+        .map_or(pressure, |o| o.min(pressure));
+    if state.thermal_throttled {
+        weight.min(super::cgroup::WEIGHT_TRICKLE)
+    } else {
+        weight
+    }
+}
+
+/// Apply workstation guards to computed slots (pure policy): battery
+/// halts all intake, thermal throttle halves to at least one.
+pub fn apply_workstation_guards(slots: u32, throttled: bool, discharging: bool) -> u32 {
+    if discharging {
+        return 0;
+    }
+    if throttled {
+        return slots.max(1) / 2 + slots.max(1) % 2;
+    }
+    slots
 }
 
 /// Wait for SIGINT or SIGTERM.
@@ -444,10 +502,13 @@ pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
                 let mut guard = state.write().await;
                 guard.prune_expired(now);
                 guard.last_snapshot = snapshot;
+                guard.poll_workstation_guards();
                 let weight = tick_weight(&guard, &snapshot, now);
                 guard.last_weight = Some(weight);
                 let base = detect_slots(guard.afk.boosted()).map(|r| r.slots).unwrap_or(1);
-                guard.last_slots = guard.clamp_slots(effective_slots(base, &snapshot));
+                let slots = guard.clamp_slots(effective_slots(base, &snapshot));
+                guard.last_slots =
+                    apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging);
                 drop(guard);
                 if writable {
                     if let Err(e) = slice.set_weight(weight) {
@@ -615,7 +676,26 @@ mod tests {
         );
         assert_eq!(tick_weight(&state, &snapshot_with(80.0, 1.0, 1.0), now), 25);
         assert_eq!(tick_weight(&state, &snapshot_with(95.0, 1.0, 1.0), now), 1);
+        // Thermal latch overrides even idle pressure with a trickle.
+        state.thermal_throttled = true;
+        assert_eq!(tick_weight(&state, &snapshot_with(1.0, 1.0, 1.0), now), 1);
+    }
 
+    #[test]
+    fn workstation_guards_gate_slots() {
+        // Battery halts all intake regardless of throttling.
+        assert_eq!(apply_workstation_guards(4, false, true), 0);
+        assert_eq!(apply_workstation_guards(4, true, true), 0);
+        // Thermal throttle halves, rounding up, minimum one.
+        assert_eq!(apply_workstation_guards(4, true, false), 2);
+        assert_eq!(apply_workstation_guards(3, true, false), 2);
+        assert_eq!(apply_workstation_guards(1, true, false), 1);
+        // No guards: passthrough.
+        assert_eq!(apply_workstation_guards(4, false, false), 4);
+    }
+
+    #[test]
+    fn degenerate_config_keeps_safe_defaults() {
         // Degenerate config keeps safe defaults.
         let mut bad = RunnerConfig::default();
         bad.governor.warn_cpu_psi = 90.0;

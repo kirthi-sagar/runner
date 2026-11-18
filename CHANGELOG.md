@@ -6,6 +6,19 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v0.6.0 — 2026-11-17
+
+- Workstation guards: thermal throttle at 85°C (trickle weight +
+  halved slots, 78°C release) and battery halt (zero slots while
+  discharging), with temp/power in status surfaces.
+- Cache auth hardening: per-boot random bearer token and
+  HMAC-signed download URLs (401 on missing/tampered).
+- mDNS LAN advertisement of cache capability with heartbeats.
+- Peer fallback ingestion: local misses federate to LAN peers
+  (streamed import, graceful 204 fallback).
+- Abuse caps (32 MiB chunks, per-archive ceiling) and per-peer
+  attribution counters across IPC/CLI/MCP.
+
 ## v0.5.2 — 2026-11-17
 
 - Bounded CI output capture: 10 MiB ring per stream, tail wins on

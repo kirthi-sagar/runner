@@ -222,6 +222,8 @@ pub struct DispatchContext {
     pub timeout: Duration,
     /// LAN cache proxy base URL (None when the proxy failed to bind).
     pub cache_url: Option<String>,
+    /// Per-boot cache bearer token (paired with `cache_url`).
+    pub cache_token: Option<String>,
 }
 
 /// Dispatch one job locally: mint JIT → cache worker → sandbox → supervise.
@@ -255,8 +257,8 @@ pub async fn dispatch_local(
     }
     // Transparent LAN cache: no cache_url means the proxy failed to
     // bind at boot, and the worker falls back to upstream caching.
-    if let Some(url) = ctx.cache_url.as_deref() {
-        for (key, value) in runner_core::cache::server::worker_env(url) {
+    if let (Some(url), Some(token)) = (ctx.cache_url.as_deref(), ctx.cache_token.as_deref()) {
+        for (key, value) in runner_core::cache::server::worker_env(url, token) {
             launch = launch.env(key, value);
         }
     }

@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v0.5.2 and prior)
+## Shipped (v0.6.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -20,7 +20,7 @@ services or heavyweight frameworks.
 - Index persistence optimization + shutdown flush.
 - README truth synchronization.
 
-## Next: v0.6.0 Mesh Cache Federation & Workstation Safety
+## Shipped in v0.6.0: Mesh Cache Federation & Workstation Safety
 
 - mDNS P2P LAN cache sharing across machines on one network.
 - Thermal guard (CPU throttle past 85°C) + battery drain guard.

@@ -243,8 +243,11 @@ async fn spawn_github(
             repo: coord.repo_name.clone().unwrap_or_default(),
         },
     };
-    // Cache endpoint when the proxy bound successfully at boot.
-    let cache_url = state.read().await.cache_base_url();
+    // Cache endpoint + token when the proxy bound successfully at boot.
+    let (cache_url, cache_token) = {
+        let guard = state.read().await;
+        (guard.cache_base_url(), guard.cache_token())
+    };
     let dispatch = coord.auto_dispatch.then(|| DispatchContext {
         github,
         scope,
@@ -253,6 +256,7 @@ async fn spawn_github(
         sandboxed,
         timeout: std::time::Duration::from_secs(coord.job_timeout_mins * 60),
         cache_url,
+        cache_token,
     });
     tokio::spawn(run_coordinator(
         poller,

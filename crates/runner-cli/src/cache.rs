@@ -11,6 +11,9 @@ pub struct CacheStats {
     pub hit_ratio: f64,
     pub bytes_served: u64,
     pub bytes_uploaded: u64,
+    pub remote_hits: u64,
+    pub remote_bytes_imported: u64,
+    pub remote_bytes_served: u64,
 }
 
 /// Parse the `result` object of a `cache_stats` IPC response.
@@ -30,6 +33,9 @@ pub fn parse_stats(result: &serde_json::Value) -> CacheStats {
         }),
         bytes_served: result["bytes_served"].as_u64().unwrap_or(0),
         bytes_uploaded: result["bytes_uploaded"].as_u64().unwrap_or(0),
+        remote_hits: result["remote_hits"].as_u64().unwrap_or(0),
+        remote_bytes_imported: result["remote_bytes_imported"].as_u64().unwrap_or(0),
+        remote_bytes_served: result["remote_bytes_served"].as_u64().unwrap_or(0),
     }
 }
 
@@ -52,7 +58,7 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Render `cache stats` text output.
 pub fn render_stats_text(stats: &CacheStats) -> String {
     format!(
-        "cache entries: {} ({})\nhits: {}  misses: {}  hit ratio: {:.1}%\nbandwidth saved: {} served, {} uploaded\n",
+        "cache entries: {} ({})\nhits: {}  misses: {}  hit ratio: {:.1}%\nbandwidth saved: {} served, {} uploaded\nmesh: {} peer hits, {} imported, {} served to peers\n",
         stats.entries,
         format_bytes(stats.size_bytes),
         stats.hits,
@@ -60,6 +66,9 @@ pub fn render_stats_text(stats: &CacheStats) -> String {
         stats.hit_ratio * 100.0,
         format_bytes(stats.bytes_served),
         format_bytes(stats.bytes_uploaded),
+        stats.remote_hits,
+        format_bytes(stats.remote_bytes_imported),
+        format_bytes(stats.remote_bytes_served),
     )
 }
 
@@ -73,6 +82,9 @@ pub fn render_stats_json(stats: &CacheStats) -> String {
         "hit_ratio": stats.hit_ratio,
         "bytes_served": stats.bytes_served,
         "bytes_uploaded": stats.bytes_uploaded,
+        "remote_hits": stats.remote_hits,
+        "remote_bytes_imported": stats.remote_bytes_imported,
+        "remote_bytes_served": stats.remote_bytes_served,
     }))
     .unwrap_or_else(|_| "{}".to_string())
 }
@@ -91,14 +103,20 @@ mod tests {
             "hit_ratio": 0.9,
             "bytes_served": 3072,
             "bytes_uploaded": 2048,
+            "remote_hits": 2,
+            "remote_bytes_imported": 1024,
+            "remote_bytes_served": 512,
         }));
         assert_eq!(stats.entries, 3);
+        assert_eq!(stats.remote_hits, 2);
         let text = render_stats_text(&stats);
         assert!(text.contains("cache entries: 3 (2.0 KB)"), "got: {text}");
         assert!(text.contains("hit ratio: 90.0%"), "got: {text}");
         assert!(text.contains("3.0 KB served"), "got: {text}");
+        assert!(text.contains("2 peer hits"), "got: {text}");
         let json: serde_json::Value = serde_json::from_str(&render_stats_json(&stats)).unwrap();
         assert_eq!(json["hit_ratio"], 0.9);
+        assert_eq!(json["remote_bytes_imported"], 1024);
         // Missing keys default to a zero snapshot.
         let empty = parse_stats(&serde_json::json!({}));
         assert_eq!((empty.entries, empty.hits, empty.misses), (0, 0, 0));

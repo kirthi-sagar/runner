@@ -36,6 +36,8 @@ pub struct HostStatus {
     pub available_memory_bytes: u64,
     pub psi_pressure: PsiStatus,
     pub cgroup_weight: Option<u32>,
+    pub temperature_c: Option<f64>,
+    pub discharging: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +92,9 @@ pub fn status_report() -> StatusReport {
     };
     let cgroup_weight = CgroupSlice::system_default().weight().ok();
     let reserved = default_reserved_cores(topology.logical);
+    let temperature_c = crate::governor::thermal::package_temp_c();
+    let discharging = crate::governor::thermal::power_state()
+        == crate::governor::thermal::PowerState::Discharging;
 
     StatusReport {
         status: "healthy",
@@ -107,6 +112,8 @@ pub fn status_report() -> StatusReport {
                 cpu_level: snapshot.cpu_pressure(),
             },
             cgroup_weight,
+            temperature_c,
+            discharging,
         },
         concurrency: ConcurrencyStatus {
             max_slots,

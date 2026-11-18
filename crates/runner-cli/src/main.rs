@@ -446,6 +446,9 @@ async fn cmd_mesh_list(format: &str, lan: bool) -> Result<()> {
                             "addrs": n.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                             "metrics": n.metrics.as_ref().map(|m| serde_json::json!({
                                 "cores": m.cores, "ram_mb": m.ram_mb, "slots": m.slots,
+                                "cache_port": m.cache_port,
+                                "cache_enabled": m.cache_enabled,
+                                "node_id": m.node_id,
                             })),
                         }))
                         .collect::<Vec<_>>()
@@ -1032,17 +1035,35 @@ async fn main() -> Result<()> {
                         Ok(listener) => {
                             let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
                             let base = public_base_url(&config.cache.listen, port);
-                            state.write().await.set_cache(store.clone(), base.clone());
+                            let server_state = CacheServerState::new(store, base.clone());
+                            state.write().await.set_cache(server_state.clone());
                             eprintln!(
                                 "runner: cache proxy on {} (advertised {base})",
                                 config.cache.listen
                             );
+                            // LAN federation: advertise cache capability via
+                            // mDNS when bound beyond loopback.
+                            if runner_core::mesh::discovery::listen_is_lan(&config.cache.listen) {
+                                match runner_core::mesh::discovery::primary_lan_ip() {
+                                    Some(ip) => {
+                                        let node_id =
+                                            runner_core::mesh::discovery::generate_node_id();
+                                        let token = server_state.token.clone();
+                                        let state = state.clone();
+                                        tokio::spawn(async move {
+                                            runner_core::mesh::discovery::LanDiscovery::advertise_loop(
+                                                state, node_id, ip, port, token,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    None => eprintln!(
+                                        "runner: no LAN address; skipping mDNS advertisement"
+                                    ),
+                                }
+                            }
                             tokio::spawn(async move {
-                                let state = CacheServerState {
-                                    store,
-                                    public_base: base,
-                                };
-                                if let Err(e) = serve_on(listener, state).await {
+                                if let Err(e) = serve_on(listener, server_state).await {
                                     eprintln!("runner: cache proxy exited: {e}");
                                 }
                             });
@@ -1081,8 +1102,18 @@ async fn main() -> Result<()> {
                     _ => println!("{}", serde_json::to_string_pretty(&report)?),
                 }
             } else {
+                let temp = report
+                    .host
+                    .temperature_c
+                    .map(|t| format!("{t:.1}°C"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let power = if report.host.discharging {
+                    "battery"
+                } else {
+                    "AC"
+                };
                 println!(
-                    "runner {} | cores {}/{} | mem {}MB avail | cpu PSI {:.2}% ({:?}) | slots {} | weight {:?}",
+                    "runner {} | cores {}/{} | mem {}MB avail | cpu PSI {:.2}% ({:?}) | slots {} | weight {:?} | temp {} | power {}",
                     report.status,
                     report.host.total_cores,
                     report.host.physical_cores,
@@ -1091,6 +1122,8 @@ async fn main() -> Result<()> {
                     report.host.psi_pressure.cpu_level,
                     report.concurrency.max_slots,
                     report.host.cgroup_weight,
+                    temp,
+                    power,
                 );
             }
         }

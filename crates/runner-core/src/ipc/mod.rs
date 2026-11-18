@@ -117,6 +117,9 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                         "hit_ratio": stats.hit_ratio,
                         "bytes_served": stats.bytes_served,
                         "bytes_uploaded": stats.bytes_uploaded,
+                        "remote_hits": stats.remote_hits,
+                        "remote_bytes_imported": stats.remote_bytes_imported,
+                        "remote_bytes_served": stats.remote_bytes_served,
                     } })
                 }
                 None => serde_json::json!({ "jsonrpc": "2.0", "id": id,
@@ -408,7 +411,10 @@ mod tests {
         state
             .write()
             .await
-            .set_cache(store, "http://127.0.0.1:8787".to_string());
+            .set_cache(crate::cache::server::CacheServerState::new(
+                store,
+                "http://127.0.0.1:8787".to_string(),
+            ));
         assert_eq!(
             state.read().await.cache_base_url().as_deref(),
             Some("http://127.0.0.1:8787")

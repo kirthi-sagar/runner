@@ -4,10 +4,12 @@
 //! `@actions/cache`'s `cacheHttpClient`/`downloadUtils`): lookup with
 //! restore-key fallbacks, numeric-id reserve/chunk/commit upload, and
 //! archive download with HEAD + Range support. Loopback-only by
-//! default; Bearer auth enforced everywhere except the artifact
-//! download (the client's downloader sends no credentials).
+//! default; Bearer auth uses a per-boot random token, and artifact
+//! downloads carry HMAC-signed capability URLs (the client's
+//! downloader sends no credentials, so the signed query token is the
+//! gate).
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
@@ -15,9 +17,6 @@ use std::collections::HashMap;
 
 use super::store::{CacheStore, ReserveOutcome, StoreError};
 
-/// Fixed loopback token the daemon injects into workers as
-/// `ACTIONS_RUNTIME_TOKEN`.
-pub const CACHE_RUNTIME_TOKEN: &str = "local-runner-cache-token";
 /// Worker-facing cache endpoint variable.
 pub const ACTIONS_CACHE_URL_ENV: &str = "ACTIONS_CACHE_URL";
 /// Worker-facing cache credential variable.
@@ -26,16 +25,13 @@ pub const ACTIONS_RUNTIME_TOKEN_ENV: &str = "ACTIONS_RUNTIME_TOKEN";
 /// Env pairs injected into GitHub workers when the proxy is up. The
 /// URL carries exactly one trailing slash (the client appends
 /// `_apis/artifactcache/...` directly).
-pub fn worker_env(base_url: &str) -> Vec<(String, String)> {
+pub fn worker_env(base_url: &str, token: &str) -> Vec<(String, String)> {
     vec![
         (
             ACTIONS_CACHE_URL_ENV.to_string(),
             format!("{}/", base_url.trim_end_matches('/')),
         ),
-        (
-            ACTIONS_RUNTIME_TOKEN_ENV.to_string(),
-            CACHE_RUNTIME_TOKEN.to_string(),
-        ),
+        (ACTIONS_RUNTIME_TOKEN_ENV.to_string(), token.to_string()),
     ]
 }
 
@@ -45,14 +41,144 @@ pub struct CacheServerState {
     pub store: CacheStore,
     /// Public base URL advertised in `archiveLocation` (loopback).
     pub public_base: String,
+    /// Per-boot bearer token injected into workers (never a constant:
+    /// any fixed string would be identical on every host).
+    pub token: String,
+    /// Per-boot HMAC secret for signed download URLs (never leaves us).
+    pub download_secret: [u8; 32],
+    /// Outbound HTTP client for peer federation fetches.
+    pub http: reqwest::Client,
+    /// Peer discovery (mDNS in production, static in tests).
+    pub peers: std::sync::Arc<dyn PeerResolver>,
 }
 
-fn authorized(headers: &HeaderMap) -> bool {
+impl std::fmt::Debug for CacheServerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheServerState")
+            .field("store", &self.store)
+            .field("public_base", &self.public_base)
+            .field("token", &"<redacted>")
+            .field("download_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl CacheServerState {
+    /// Build state with fresh per-boot credentials from the OS RNG.
+    pub fn new(store: CacheStore, public_base: String) -> Self {
+        use rand::RngCore;
+        let mut secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let mut token_bytes = [0u8; 24];
+        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        Self {
+            store,
+            public_base,
+            token: base64_url_no_pad(&token_bytes),
+            download_secret: secret,
+            http: reqwest::Client::new(),
+            peers: std::sync::Arc::new(MdnsPeerResolver),
+        }
+    }
+}
+
+/// One LAN peer's cache endpoint (resolved from mDNS TXT + addrs).
+#[derive(Debug, Clone)]
+pub struct CachePeer {
+    pub node_id: String,
+    pub base_url: String,
+    pub token: String,
+}
+
+/// Peer discovery seam: production browses mDNS, tests inject statics.
+#[async_trait::async_trait]
+pub trait PeerResolver: Send + Sync {
+    async fn cache_peers(&self) -> Vec<CachePeer>;
+}
+
+/// Production resolver: one short mDNS browse per call (off the async
+/// runtime; multicast is blocking by nature).
+pub struct MdnsPeerResolver;
+
+#[async_trait::async_trait]
+impl PeerResolver for MdnsPeerResolver {
+    async fn cache_peers(&self) -> Vec<CachePeer> {
+        let nodes = tokio::task::spawn_blocking(|| {
+            crate::mesh::discovery::LanDiscovery::browse_only(std::time::Duration::from_millis(300))
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+        nodes
+            .into_iter()
+            .filter_map(|n| {
+                let metrics = n.metrics?;
+                if !metrics.cache_enabled {
+                    return None;
+                }
+                let port = metrics.cache_port?;
+                if metrics.cache_token.is_empty() {
+                    return None;
+                }
+                let ip = n
+                    .addrs
+                    .iter()
+                    .find(|a| !a.is_loopback() && !a.is_unspecified())?;
+                Some(CachePeer {
+                    node_id: if metrics.node_id.is_empty() {
+                        n.instance.clone()
+                    } else {
+                        metrics.node_id.clone()
+                    },
+                    base_url: format!("http://{ip}:{port}"),
+                    token: metrics.cache_token.clone(),
+                })
+            })
+            .take(MAX_FEDERATION_PEERS)
+            .collect()
+    }
+}
+
+/// Cap on peers queried per local miss (bounds spoof-amplified fan-out).
+pub const MAX_FEDERATION_PEERS: usize = 8;
+/// Per-peer lookup timeout: federation must never stall a lookup.
+pub const PEER_LOOKUP_TIMEOUT_MS: u64 = 150;
+
+fn base64_url_no_pad(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Sign an archive id into a download capability token.
+pub fn sign_download_token(secret: &[u8; 32], id: u64) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac =
+        Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(&id.to_be_bytes());
+    base64_url_no_pad(&mac.finalize().into_bytes())
+}
+
+/// Verify a download capability token (constant-time comparison).
+pub fn verify_download_token(secret: &[u8; 32], id: u64, token: &str) -> bool {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    let Ok(sig) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<sha2::Sha256>::new_from_slice(secret) else {
+        return false;
+    };
+    mac.update(&id.to_be_bytes());
+    mac.verify_slice(&sig).is_ok()
+}
+
+fn authorized(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|token| token == CACHE_RUNTIME_TOKEN)
+        .is_some_and(|token| token == expected)
 }
 
 fn unauthorized() -> axum::response::Response {
@@ -69,7 +195,7 @@ async fn lookup_cache(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> axum::response::Response {
-    if !authorized(&headers) {
+    if !authorized(&headers, &state.token) {
         return unauthorized();
     }
     let keys: Vec<String> = params
@@ -85,15 +211,122 @@ async fn lookup_cache(
             .into_response();
     }
     match state.store.lookup(&version, &keys) {
-        Some(entry) => Json(serde_json::json!({
-            "cacheKey": entry.key,
-            "archiveLocation": format!(
-                "{}/_apis/artifactcache/artifacts/{}",
-                state.public_base, entry.id
-            ),
-        }))
-        .into_response(),
-        None => StatusCode::NO_CONTENT.into_response(),
+        Some(entry) => lookup_hit(&state, &entry).into_response(),
+        None => match federate_lookup(&state, &version, &keys).await {
+            // Imported from a peer: re-resolve locally so the response
+            // carries our own signed URL and a consistent hit record.
+            Some(_) => match state.store.lookup(&version, &keys) {
+                Some(entry) => lookup_hit(&state, &entry).into_response(),
+                None => StatusCode::NO_CONTENT.into_response(),
+            },
+            None => StatusCode::NO_CONTENT.into_response(),
+        },
+    }
+}
+
+fn lookup_hit(
+    state: &CacheServerState,
+    entry: &super::store::CacheEntryMeta,
+) -> axum::Json<serde_json::Value> {
+    let token = sign_download_token(&state.download_secret, entry.id);
+    axum::Json(serde_json::json!({
+        "cacheKey": entry.key,
+        "archiveLocation": format!(
+            "{}/_apis/artifactcache/artifacts/{}?token={}",
+            state.public_base, entry.id, token
+        ),
+    }))
+}
+
+/// LAN fallback for a local miss: query discovered cache peers in
+/// order, streaming the first hit into the local store. Every failure
+/// mode (timeout, HTTP error, short stream, commit mismatch) falls
+/// through to the next peer and finally to a local 204. Returns the
+/// imported entry's key on success.
+async fn federate_lookup(
+    state: &CacheServerState,
+    version: &str,
+    keys: &[String],
+) -> Option<String> {
+    for peer in state.peers.cache_peers().await {
+        if let Some(key) = fetch_from_peer(state, &peer, version, keys).await {
+            return Some(key);
+        }
+    }
+    None
+}
+
+async fn fetch_from_peer(
+    state: &CacheServerState,
+    peer: &CachePeer,
+    version: &str,
+    keys: &[String],
+) -> Option<String> {
+    let lookup_url = format!("{}/_apis/artifactcache/cache", peer.base_url);
+    let mut request = state
+        .http
+        .get(&lookup_url)
+        .header("authorization", format!("Bearer {}", peer.token))
+        .timeout(std::time::Duration::from_millis(PEER_LOOKUP_TIMEOUT_MS));
+    request = request.query(&[("keys", keys.join(",")), ("version", version.to_string())]);
+    let hit: serde_json::Value = request.send().await.ok()?.json().await.ok()?;
+    let (key, location) = (
+        hit.get("cacheKey")?.as_str()?.to_string(),
+        hit.get("archiveLocation")?.as_str()?.to_string(),
+    );
+    let mut download = state.http.get(&location).send().await.ok()?;
+    if !download.status().is_success() {
+        return None;
+    }
+    // Lengthless responses are refused: the commit must verify an
+    // exact size, never trust a truncated stream.
+    let expected: u64 = download
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())?;
+    let id = match state.store.reserve(&key, version) {
+        Ok(ReserveOutcome::Created(id)) => id,
+        // Raced locally while fetching: already have it.
+        Ok(ReserveOutcome::Exists(_)) => return Some(key),
+        Err(_) => return None,
+    };
+    // Refuse peer archives that cannot fit before streaming a byte.
+    if expected > state.store.max_bytes() {
+        state.store.abort_upload(id);
+        return None;
+    }
+    let mut offset = 0u64;
+    loop {
+        match download.chunk().await {
+            Ok(Some(bytes)) => {
+                // Running guard: a lying Content-Length must not fill disk.
+                if offset + bytes.len() as u64 > state.store.max_bytes() {
+                    state.store.abort_upload(id);
+                    return None;
+                }
+                if state.store.write_chunk(id, offset, &bytes).is_err() {
+                    state.store.abort_upload(id);
+                    return None;
+                }
+                offset += bytes.len() as u64;
+            }
+            Ok(None) => break,
+            Err(_) => {
+                state.store.abort_upload(id);
+                return None;
+            }
+        }
+    }
+    match state.store.commit(id, expected) {
+        Ok(entry) => {
+            state.store.record_remote_hit(entry.size);
+            Some(key)
+        }
+        Err(_) => {
+            state.store.abort_upload(id);
+            None
+        }
     }
 }
 
@@ -103,7 +336,7 @@ async fn reserve_cache(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    if !authorized(&headers) {
+    if !authorized(&headers, &state.token) {
         return unauthorized();
     }
     let (Some(key), Some(version)) = (
@@ -144,8 +377,12 @@ fn parse_content_range(value: &str) -> Option<(u64, u64)> {
     (start <= end).then_some((start, end))
 }
 
+/// Max bytes accepted in one PATCH chunk (real clients send ≤8 MiB;
+/// 4x headroom, then 413).
+pub const MAX_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
+
 /// `PATCH caches/{id}` chunk upload (explicit offsets; out-of-order safe).
-/// The body streams straight to disk: no size cap, no full buffering.
+/// The body streams straight to disk, capped per chunk and in total.
 async fn upload_chunk(
     State(state): State<CacheServerState>,
     headers: HeaderMap,
@@ -154,7 +391,7 @@ async fn upload_chunk(
 ) -> axum::response::Response {
     use futures_util::TryStreamExt;
 
-    if !authorized(&headers) {
+    if !authorized(&headers, &state.token) {
         return unauthorized();
     }
     let Some((start, end)) = headers
@@ -168,6 +405,15 @@ async fn upload_chunk(
         )
             .into_response();
     };
+    // Fast reject: a declared body past the chunk cap never streams.
+    if headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|len| len > MAX_CHUNK_BYTES)
+    {
+        return payload_too_large("chunk exceeds 32 MiB cap");
+    }
     let mut stream = body.into_data_stream();
     let mut offset = start;
     let mut received = 0u64;
@@ -183,11 +429,16 @@ async fn upload_chunk(
                     .into_response();
             }
         };
+        received += chunk.len() as u64;
+        // Running guard for chunked bodies that lie about (or omit) length.
+        if received > MAX_CHUNK_BYTES {
+            state.store.abort_upload(id);
+            return payload_too_large("chunk exceeds 32 MiB cap");
+        }
         if let Err(e) = state.store.write_chunk(id, offset, &chunk) {
             return store_upload_error(id, e);
         }
         offset += chunk.len() as u64;
-        received += chunk.len() as u64;
     }
     if received != end - start + 1 {
         return (
@@ -202,6 +453,14 @@ async fn upload_chunk(
     }
 }
 
+fn payload_too_large(msg: &str) -> axum::response::Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({ "error": msg })),
+    )
+        .into_response()
+}
+
 fn store_upload_error(id: u64, e: StoreError) -> axum::response::Response {
     match e {
         StoreError::UnknownUpload(_) => (
@@ -214,6 +473,7 @@ fn store_upload_error(id: u64, e: StoreError) -> axum::response::Response {
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response(),
+        StoreError::TooLarge { .. } => payload_too_large(&e.to_string()),
         StoreError::Io(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -229,7 +489,7 @@ async fn commit_cache(
     Path(id): Path<u64>,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    if !authorized(&headers) {
+    if !authorized(&headers, &state.token) {
         return unauthorized();
     }
     let Some(size) = body.get("size").and_then(|v| v.as_u64()) else {
@@ -259,6 +519,7 @@ async fn commit_cache(
             })),
         )
             .into_response(),
+        Err(StoreError::TooLarge { .. }) => payload_too_large("archive exceeds store budget"),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -284,10 +545,21 @@ fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
 /// credentials (verified against `downloadUtils.ts`).
 async fn download_artifact(
     State(state): State<CacheServerState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<u64>,
     method: Method,
     headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
 ) -> axum::response::Response {
+    // The client sends no credentials here, so the signed capability
+    // token minted at lookup time is the only gate. Missing, malformed,
+    // or tampered tokens are indistinguishable: all 401.
+    let authed = params
+        .get("token")
+        .is_some_and(|t| verify_download_token(&state.download_secret, id, t));
+    if !authed {
+        return unauthorized();
+    }
     if method == Method::HEAD {
         return match state.store.entry_size(id) {
             Some(total) => (
@@ -338,6 +610,10 @@ async fn download_artifact(
     }
     let stream = tokio_util::io::ReaderStream::new(file.take(len));
     state.store.record_served(id, len);
+    // Non-loopback downloads are LAN peers, not local workers.
+    if !peer.ip().is_loopback() {
+        state.store.record_remote_served(len);
+    }
     let end = start + len.saturating_sub(1);
     if range.is_some() {
         (
@@ -394,7 +670,11 @@ pub async fn serve_on(
     listener: tokio::net::TcpListener,
     state: CacheServerState,
 ) -> anyhow::Result<()> {
-    axum::serve(listener, router(state)).await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -437,18 +717,37 @@ mod tests {
 
     #[test]
     fn worker_env_has_single_trailing_slash() {
-        let env = worker_env("http://127.0.0.1:8787");
+        let env = worker_env("http://127.0.0.1:8787", "tok");
         assert_eq!(env[0].0, "ACTIONS_CACHE_URL");
         assert_eq!(env[0].1, "http://127.0.0.1:8787/");
         assert_eq!(
             env[1],
-            (
-                "ACTIONS_RUNTIME_TOKEN".to_string(),
-                CACHE_RUNTIME_TOKEN.to_string()
-            )
+            ("ACTIONS_RUNTIME_TOKEN".to_string(), "tok".to_string())
         );
-        let env = worker_env("http://127.0.0.1:8787/");
+        let env = worker_env("http://127.0.0.1:8787/", "tok");
         assert_eq!(env[0].1, "http://127.0.0.1:8787/");
+    }
+
+    #[test]
+    fn download_tokens_verify_and_reject_tampering() {
+        let secret = [7u8; 32];
+        let token = sign_download_token(&secret, 42);
+        assert!(verify_download_token(&secret, 42, &token));
+        assert!(!verify_download_token(&secret, 43, &token));
+        assert!(!verify_download_token(&[8u8; 32], 42, &token));
+        assert!(!verify_download_token(&secret, 42, "not-base64!!!"));
+        assert!(!verify_download_token(&secret, 42, ""));
+    }
+
+    #[test]
+    fn server_state_mints_fresh_credentials() {
+        let dir = crate::test_support::TempDir::new("cache-creds").unwrap();
+        let store = crate::cache::store::CacheStore::open(&dir.path().join("c"), 1).unwrap();
+        let a = CacheServerState::new(store.clone(), "http://x".to_string());
+        let b = CacheServerState::new(store, "http://x".to_string());
+        assert_ne!(a.token, b.token);
+        assert_ne!(a.download_secret, b.download_secret);
+        assert!(!a.token.is_empty());
     }
 
     #[test]

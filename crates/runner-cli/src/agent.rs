@@ -14,14 +14,57 @@ use crate::doctor::{render_json, run_all};
 use crate::provider::{test_provider, ProviderName};
 
 /// Agent tools backed by the real doctor/provider/exec implementations.
+/// Daemon-backed tools go over IPC; [`with_sock_path`](Self::with_sock_path)
+/// redirects them at an isolated socket for tests.
 #[derive(Debug)]
 pub struct CliAgentTools {
     config: RunnerConfig,
+    sock_path: Option<std::path::PathBuf>,
 }
 
 impl CliAgentTools {
     pub fn new(config: RunnerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            sock_path: None,
+        }
+    }
+
+    pub fn with_sock_path(mut self, path: std::path::PathBuf) -> Self {
+        self.sock_path = Some(path);
+        self
+    }
+
+    fn sock(&self) -> std::path::PathBuf {
+        self.sock_path.clone().unwrap_or_else(resolve_sock_path)
+    }
+
+    /// Call one daemon method. Transport failure maps to
+    /// [`ToolError::offline`] (the dispatcher falls back to local
+    /// state); daemon error payloads map to params/internal errors
+    /// and never fall back.
+    async fn daemon(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, ToolError> {
+        let sock = self.sock();
+        let res = ipc_call_with(&sock, method, params).await.map_err(|_| {
+            ToolError::offline(format!("daemon not reachable at {}", sock.display()))
+        })?;
+        if let Some(err) = res.get("error") {
+            let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32603);
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown daemon error")
+                .to_string();
+            if code == -32602 {
+                return Err(ToolError::invalid_params(message));
+            }
+            return Err(ToolError::internal(format!("daemon error: {message}")));
+        }
+        Ok(res["result"].clone())
     }
 }
 
@@ -161,5 +204,100 @@ impl AgentTools for CliAgentTools {
         let mut out = serde_json::Value::Object(result.clone());
         out["enabled"] = serde_json::Value::Bool(true);
         Ok(out)
+    }
+
+    async fn reserve(
+        &self,
+        cores: f64,
+        ram_gb: f64,
+        duration_minutes: u64,
+        reason: String,
+    ) -> Result<serde_json::Value, ToolError> {
+        let out = self
+            .daemon(
+                "reserve",
+                Some(serde_json::json!({
+                    "cores": cores,
+                    "ram_gb": ram_gb,
+                    "duration_minutes": duration_minutes,
+                    "reason": reason.clone(),
+                })),
+            )
+            .await?;
+        // Adapt the IPC shape to the frozen MCP shape (lossless: the
+        // daemon echoes our inputs; ram_mb re-derives identically).
+        Ok(serde_json::json!({
+            "reservation_id": out["reservation_id"],
+            "cores": out["cores"],
+            "ram_mb": (ram_gb * 1024.0) as u64,
+            "reason": reason,
+        }))
+    }
+
+    async fn release(&self, reservation_id: &str) -> Result<serde_json::Value, ToolError> {
+        let out = self
+            .daemon(
+                "release",
+                Some(serde_json::json!({ "reservation_id": reservation_id })),
+            )
+            .await?;
+        if out["found"].as_bool().unwrap_or(false) {
+            Ok(serde_json::json!({ "released": reservation_id }))
+        } else {
+            Err(ToolError::invalid_params(format!(
+                "unknown reservation_id: {reservation_id}"
+            )))
+        }
+    }
+
+    async fn throttle(
+        &self,
+        level: &str,
+        duration_minutes: u64,
+    ) -> Result<serde_json::Value, ToolError> {
+        self.daemon(
+            "throttle_set",
+            Some(serde_json::json!({
+                "level": level,
+                "duration_minutes": duration_minutes,
+            })),
+        )
+        .await
+    }
+
+    async fn drain(&self, node_id: &str, reason: &str) -> Result<serde_json::Value, ToolError> {
+        self.daemon(
+            "drain",
+            Some(serde_json::json!({ "node_id": node_id, "reason": reason })),
+        )
+        .await
+        .map(|out| serde_json::json!({ "drained": out["node_id"] }))
+    }
+
+    async fn request_cloud(
+        &self,
+        provider: &str,
+        max_instances: u32,
+        duration_hours: f64,
+        reason: &str,
+    ) -> Result<serde_json::Value, ToolError> {
+        self.daemon(
+            "cloud_capacity",
+            Some(serde_json::json!({
+                "provider": provider,
+                "max_instances": max_instances,
+                "duration_hours": duration_hours,
+                "reason": reason,
+            })),
+        )
+        .await
+    }
+
+    async fn ci_status(&self) -> Result<serde_json::Value, ToolError> {
+        self.daemon("ci_status", None).await
+    }
+
+    async fn fleet_topology(&self) -> Result<serde_json::Value, ToolError> {
+        self.daemon("fleet_topology", None).await
     }
 }

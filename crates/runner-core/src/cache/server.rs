@@ -150,13 +150,15 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// Sign an archive id into a download capability token.
-pub fn sign_download_token(secret: &[u8; 32], id: u64) -> String {
+/// Sign an archive id into a download capability token. `Result`
+/// instead of `expect`: HMAC accepts any key length in practice, but
+/// a failure must 500 the lookup, never abort the daemon.
+pub fn sign_download_token(secret: &[u8; 32], id: u64) -> Result<String, String> {
     use hmac::{Hmac, Mac};
-    let mut mac =
-        Hmac::<sha2::Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret)
+        .map_err(|e| format!("HMAC init failed: {e}"))?;
     mac.update(&id.to_be_bytes());
-    base64_url_no_pad(&mac.finalize().into_bytes())
+    Ok(base64_url_no_pad(&mac.finalize().into_bytes()))
 }
 
 /// Verify a download capability token (constant-time comparison).
@@ -227,8 +229,15 @@ async fn lookup_cache(
 fn lookup_hit(
     state: &CacheServerState,
     entry: &super::store::CacheEntryMeta,
-) -> axum::Json<serde_json::Value> {
-    let token = sign_download_token(&state.download_secret, entry.id);
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let token = match sign_download_token(&state.download_secret, entry.id) {
+        Ok(token) => token,
+        Err(e) => {
+            eprintln!("runner: cache token signing failed ({e}); failing lookup");
+            return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     axum::Json(serde_json::json!({
         "cacheKey": entry.key,
         "archiveLocation": format!(
@@ -236,6 +245,7 @@ fn lookup_hit(
             state.public_base, entry.id, token
         ),
     }))
+    .into_response()
 }
 
 /// LAN fallback for a local miss: query discovered cache peers in
@@ -731,7 +741,7 @@ mod tests {
     #[test]
     fn download_tokens_verify_and_reject_tampering() {
         let secret = [7u8; 32];
-        let token = sign_download_token(&secret, 42);
+        let token = sign_download_token(&secret, 42).unwrap();
         assert!(verify_download_token(&secret, 42, &token));
         assert!(!verify_download_token(&secret, 43, &token));
         assert!(!verify_download_token(&[8u8; 32], 42, &token));

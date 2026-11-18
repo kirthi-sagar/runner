@@ -64,8 +64,10 @@ impl AuditLog {
         Ok(log)
     }
 
-    /// Append an event, chaining it to its predecessor.
-    pub fn append(&mut self, level: LogLevel, source: &str, message: &str) -> &AuditEntry {
+    /// Append an event, chaining it to its predecessor. Returns the
+    /// owned entry: no `expect`/`Option` dereference anywhere, so this
+    /// can never abort the daemon under `panic = "abort"`.
+    pub fn append(&mut self, level: LogLevel, source: &str, message: &str) -> AuditEntry {
         let seq = self.entries.len() as u64;
         let prev_hash = self
             .entries
@@ -74,14 +76,13 @@ impl AuditLog {
             .unwrap_or_else(|| "genesis".to_string());
         let event = LogEvent::now(level, source, message);
         let hash = entry_hash(seq, &prev_hash, &event.to_json());
-        self.entries.push(AuditEntry {
+        let entry = AuditEntry {
             seq,
             prev_hash,
             event,
             hash,
-        });
-        let entry = self.entries.last().expect("just pushed");
-        if let Ok(json) = serde_json::to_string(entry) {
+        };
+        if let Ok(json) = serde_json::to_string(&entry) {
             use std::io::Write;
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
@@ -91,7 +92,8 @@ impl AuditLog {
                 let _ = writeln!(file, "{json}");
             }
         }
-        self.entries.last().expect("just pushed")
+        self.entries.push(entry.clone());
+        entry
     }
 
     /// Recompute the full chain; false on any gap, reorder, or edit.

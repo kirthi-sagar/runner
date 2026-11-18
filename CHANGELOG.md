@@ -6,6 +6,21 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.1.0 — 2026-11-18
+
+- MCP-over-daemon-IPC convergence: state-changing tools and both
+  status queries execute against live daemon state over new IPC
+  methods (`reserve`, `release`, `drain`, `cloud_capacity`,
+  `ci_status`, `fleet_topology`, plus existing `throttle_set`),
+  falling back to local state only when the daemon is
+  unreachable. Schemas unchanged (freeze holds).
+- Zero production panic paths: HMAC signing returns `Result`,
+  provider claim/bearer paths bail instead of `expect`, audit
+  append returns owned entries, and all three signal sites share
+  an `Option`-based wait helper with no `unreachable!`.
+- Docs record the single-laptop federation posture (loopback
+  seam tests authoritative) and the MCP convergence model.
+
 ## v1.0.0 — 2026-11-18
 
 - General Availability. Release workflow executes the built

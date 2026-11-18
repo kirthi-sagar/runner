@@ -25,6 +25,19 @@ paste the generic snippet into `.mcp.json`, or run
 `claude mcp add runner -- <path-to-runner> mcp`. Restart the agent
 client after installing.
 
+## Daemon convergence (v1.1.0)
+
+State-changing tools (`reserve_host_resources`,
+`release_host_resources`, `throttle_runner`, `drain_node`,
+`request_cloud_capacity`) and both status queries execute against
+the LIVE daemon over the IPC socket — the same state `runner
+status`, `runner throttle`, and the coordinator loop see. When the
+daemon is unreachable, the server transparently falls back to local
+in-process state (today's standalone behavior) and notes it on
+stderr; stdio JSON-RPC is never polluted. Tool input/output
+schemas are unchanged by this routing (see the frozen contracts
+below and `tests/test_schema_freeze.rs`).
+
 ## What agents can do
 
 The server speaks newline-delimited JSON-RPC on stdio

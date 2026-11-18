@@ -530,25 +530,14 @@ async fn listen_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     // Registration can fail in restricted containers; degrade to
     // "no signal handling" (SIGKILL still works) instead of aborting.
-    let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("runner: SIGINT handler unavailable ({e}); signals ignored");
-            std::future::pending::<()>().await;
-            unreachable!("pending never resolves");
-        }
-    };
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("runner: SIGTERM handler unavailable ({e}); signals ignored");
-            std::future::pending::<()>().await;
-            unreachable!("pending never resolves");
-        }
-    };
+    let sigint = signal(SignalKind::interrupt()).ok();
+    let sigterm = signal(SignalKind::terminate()).ok();
+    if sigint.is_none() || sigterm.is_none() {
+        eprintln!("runner: signal registration failed; signals ignored (SIGKILL still works)");
+    }
     tokio::select! {
-        _ = sigint.recv() => {},
-        _ = sigterm.recv() => {},
+        _ = runner_core::governor::supervisor::wait_for_signal(sigint) => {},
+        _ = runner_core::governor::supervisor::wait_for_signal(sigterm) => {},
     }
 }
 

@@ -486,30 +486,32 @@ pub fn apply_workstation_guards(slots: u32, throttled: bool, discharging: bool) 
     slots
 }
 
+/// Wait for one optional signal stream. `None` (registration failed
+/// in a restricted container) pends forever inside its `select!` arm:
+/// the loop keeps its own cadence and SIGKILL still works. Shared by
+/// the daemon, `runner listen`, and `runner top` — no panicking path.
+pub async fn wait_for_signal(stream: Option<tokio::signal::unix::Signal>) {
+    match stream {
+        Some(mut s) => {
+            s.recv().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Wait for SIGINT or SIGTERM. Registration can fail in restricted
 /// containers; that degrades to "no signal handling" (the loop keeps
 /// its own cadence; SIGKILL still works) instead of aborting startup.
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
-    let mut sigint = match signal(SignalKind::interrupt()) {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("runner: SIGINT handler unavailable ({e}); signals ignored");
-            std::future::pending::<()>().await;
-            unreachable!("pending never resolves");
-        }
-    };
-    let mut sigterm = match signal(SignalKind::terminate()) {
-        Ok(stream) => stream,
-        Err(e) => {
-            eprintln!("runner: SIGTERM handler unavailable ({e}); signals ignored");
-            std::future::pending::<()>().await;
-            unreachable!("pending never resolves");
-        }
-    };
+    let sigint = signal(SignalKind::interrupt()).ok();
+    let sigterm = signal(SignalKind::terminate()).ok();
+    if sigint.is_none() || sigterm.is_none() {
+        eprintln!("runner: signal registration failed; signals ignored (SIGKILL still works)");
+    }
     tokio::select! {
-        _ = sigint.recv() => {},
-        _ = sigterm.recv() => {},
+        _ = wait_for_signal(sigint) => {},
+        _ = wait_for_signal(sigterm) => {},
     }
 }
 

@@ -353,7 +353,10 @@ impl ProviderAdapter for GitlabProvider {
         if !matches {
             anyhow::bail!("no pending gitlab claim for job {job_id}");
         }
-        let job = pending.take().expect("checked above");
+        let Some(job) = pending.take() else {
+            drop(pending);
+            anyhow::bail!("no pending gitlab claim for job {job_id}");
+        };
         drop(pending);
         match &self.client {
             Some(client) => {

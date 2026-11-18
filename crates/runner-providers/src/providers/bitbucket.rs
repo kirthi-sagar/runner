@@ -247,7 +247,10 @@ impl BitbucketClient {
         if needs {
             *guard = Some(self.refresh_token().await?);
         }
-        Ok(guard.as_ref().expect("just refreshed").0.clone())
+        guard
+            .as_ref()
+            .map(|cached| cached.0.clone())
+            .ok_or_else(|| anyhow::anyhow!("bitbucket token missing after refresh"))
     }
 
     /// Poll one queued step for the runner (`None` = empty queue).
@@ -480,7 +483,10 @@ impl ProviderAdapter for BitbucketProvider {
         if !matches {
             anyhow::bail!("no pending bitbucket claim for job {job_id}");
         }
-        let step = pending.take().expect("checked above");
+        let Some(step) = pending.take() else {
+            drop(pending);
+            anyhow::bail!("no pending bitbucket claim for job {job_id}");
+        };
         drop(pending);
         match &self.client {
             Some(client) => {

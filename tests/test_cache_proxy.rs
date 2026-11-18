@@ -153,14 +153,14 @@ async fn full_roundtrip_serves_identical_bytes() {
         .await
         .unwrap();
     assert_eq!(res.status().as_u16(), 401);
-    let foreign = sign_download_token(&[9u8; 32], id);
+    let foreign = sign_download_token(&[9u8; 32], id).unwrap();
     let res = http
         .get(format!("{bare}?token={foreign}"))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status().as_u16(), 401);
-    let swapped = sign_download_token(&state.download_secret, id + 1000);
+    let swapped = sign_download_token(&state.download_secret, id + 1000).unwrap();
     let res = http
         .get(format!("{bare}?token={swapped}"))
         .send()
@@ -306,7 +306,7 @@ async fn misses_restore_prefixes_auth_and_size_mismatch() {
     .await
     .unwrap();
     assert_eq!(res.status().as_u16(), 404);
-    let signed = sign_download_token(&state.download_secret, 424242);
+    let signed = sign_download_token(&state.download_secret, 424242).unwrap();
     let res = http
         .get(format!(
             "{base}/_apis/artifactcache/artifacts/424242?token={signed}"
@@ -361,7 +361,7 @@ async fn large_archive_streams_end_to_end() {
     .await
     .unwrap();
     assert_eq!(res.status().as_u16(), 200);
-    let signed = sign_download_token(&state.download_secret, id);
+    let signed = sign_download_token(&state.download_secret, id).unwrap();
 
     // Full streamed download is byte-identical.
     let res = http

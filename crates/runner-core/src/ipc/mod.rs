@@ -261,6 +261,119 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                 "duration_minutes": minutes,
             } })
         }
+        "reserve" => {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let cores = params.get("cores").and_then(Value::as_f64).unwrap_or(0.0);
+            let ram_gb = params.get("ram_gb").and_then(Value::as_f64).unwrap_or(0.0);
+            let mins = params
+                .get("duration_minutes")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let reason = params
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let (cores, ram_mb, mins) =
+                match crate::mcp::tools::validate_reserve(cores, ram_gb, mins) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                        "error": { "code": -32602, "message": e } })
+                    }
+                };
+            let r = crate::mcp::tools::reserve_on(state, cores, ram_mb, mins, reason).await;
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "reservation_id": r.id,
+                "cores": r.cores,
+                "ram_gb": ram_gb,
+                "duration_minutes": mins,
+            } })
+        }
+        "release" => {
+            let id_param = value
+                .get("params")
+                .and_then(|p| p.get("reservation_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if id_param.trim().is_empty() {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "reservation_id must not be empty" } });
+            }
+            let found = crate::mcp::tools::release_on(state, &id_param).await;
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "released": id_param,
+                "found": found,
+            } })
+        }
+        "drain" => {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let node_id = params
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let reason = params
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if node_id.trim().is_empty() {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "node_id must not be empty" } });
+            }
+            crate::mcp::tools::drain_on(state, node_id.clone(), reason).await;
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "node_id": node_id,
+                "drained": true,
+            } })
+        }
+        "cloud_capacity" => {
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let provider = params
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let max = params
+                .get("max_instances")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let hours = params
+                .get("duration_hours")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            if let Err(e) = crate::mcp::tools::validate_cloud_request(&provider, max, hours) {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": e } });
+            }
+            let (pool, cap) = {
+                let guard = state.read().await;
+                (guard.cloud_pool(), guard.cloud_spend_cap())
+            };
+            let Some(pool) = pool else {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                    "approved": false,
+                    "reason": "cloud pool not initialized on the daemon",
+                } });
+            };
+            match crate::mcp::tools::request_cloud_with(&pool, cap, state, &provider, max, hours)
+                .await
+            {
+                Ok(v) => serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": v }),
+                Err(e) => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": e } }),
+            }
+        }
+        "ci_status" => {
+            let v = crate::mcp::tools::ci_status_value(state).await;
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": v })
+        }
+        "fleet_topology" => {
+            let v = crate::mcp::tools::fleet_topology_value(state).await;
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": v })
+        }
         _ => serde_json::json!({ "jsonrpc": "2.0", "id": id,
             "error": { "code": -32601, "message": format!("method not found: {method}") } }),
     }

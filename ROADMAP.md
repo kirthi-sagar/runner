@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.0.0 and prior)
+## Shipped (v1.1.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,7 +14,19 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 
-## v1.0.0 GA (this release)
+## Current: v1.1.0 (Daemon IPC Convergence & Zero-Panic Hardening)
+
+- MCP tools converge onto live daemon state over IPC, with local
+  fallback when the daemon is unreachable.
+- Zero production panic paths under `panic = "abort"` (audited).
+- Federation posture: the operator runs a single laptop plus
+  GitHub Codespaces (cloud WAN); RFC 6762 mDNS does not cross
+  WAN boundaries, so the loopback two-proxy seam tests in
+  `tests/test_mesh_cache_federation.rs` are the authoritative
+  federation gate in CI and development — physical multi-PC
+  testing never blocks a release.
+
+## v1.0.0 GA (shipped)
 
 - Schema-freeze tests green with zero doc drift; asset smoke
   green on every tag (plus release-binary execution smoke).

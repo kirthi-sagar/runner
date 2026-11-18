@@ -151,6 +151,39 @@ pub trait AgentTools: Send + Sync + std::fmt::Debug {
     /// Report LAN cache counters. Goes through daemon IPC: the cache
     /// store lives in the daemon, not the MCP server process.
     async fn cache_stats(&self) -> Result<serde_json::Value, ToolError>;
+    /// Reserve headroom on the live daemon (reservation inputs are
+    /// pre-validated by shape; semantic checks run daemon-side).
+    /// Returns [`ToolError::offline`] when the daemon is unreachable.
+    async fn reserve(
+        &self,
+        cores: f64,
+        ram_gb: f64,
+        duration_minutes: u64,
+        reason: String,
+    ) -> Result<serde_json::Value, ToolError>;
+    /// Release a daemon reservation by id.
+    async fn release(&self, reservation_id: &str) -> Result<serde_json::Value, ToolError>;
+    /// Engage a timed daemon throttle (`level` pre-validated to the
+    /// frozen MCP enum by the dispatcher).
+    async fn throttle(
+        &self,
+        level: &str,
+        duration_minutes: u64,
+    ) -> Result<serde_json::Value, ToolError>;
+    /// Drain a node on the live daemon.
+    async fn drain(&self, node_id: &str, reason: &str) -> Result<serde_json::Value, ToolError>;
+    /// Request cloud burst from the live daemon (inputs pre-validated).
+    async fn request_cloud(
+        &self,
+        provider: &str,
+        max_instances: u32,
+        duration_hours: f64,
+        reason: &str,
+    ) -> Result<serde_json::Value, ToolError>;
+    /// Live daemon CI status (same shape as the local report).
+    async fn ci_status(&self) -> Result<serde_json::Value, ToolError>;
+    /// Live daemon fleet topology (same shape as the local report).
+    async fn fleet_topology(&self) -> Result<serde_json::Value, ToolError>;
 }
 
 /// Placeholder impl used until the host wires the real agent tools.
@@ -190,6 +223,52 @@ impl AgentTools for StubAgentTools {
 
     async fn cache_stats(&self) -> Result<serde_json::Value, ToolError> {
         Err(ToolError::internal("agent tools not configured"))
+    }
+
+    // Daemon-backed tools: the stub always reports offline so the
+    // dispatcher deterministically uses local state (hermetic tests).
+    async fn reserve(
+        &self,
+        _cores: f64,
+        _ram_gb: f64,
+        _duration_minutes: u64,
+        _reason: String,
+    ) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::offline("agent tools not configured"))
+    }
+
+    async fn release(&self, _reservation_id: &str) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::offline("agent tools not configured"))
+    }
+
+    async fn throttle(
+        &self,
+        _level: &str,
+        _duration_minutes: u64,
+    ) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::offline("agent tools not configured"))
+    }
+
+    async fn drain(&self, _node_id: &str, _reason: &str) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::offline("agent tools not configured"))
+    }
+
+    async fn request_cloud(
+        &self,
+        _provider: &str,
+        _max_instances: u32,
+        _duration_hours: f64,
+        _reason: &str,
+    ) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::offline("agent tools not configured"))
+    }
+
+    async fn ci_status(&self) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::offline("agent tools not configured"))
+    }
+
+    async fn fleet_topology(&self) -> Result<serde_json::Value, ToolError> {
+        Err(ToolError::offline("agent tools not configured"))
     }
 }
 
@@ -241,6 +320,20 @@ impl ToolError {
             message: message.into(),
         }
     }
+
+    /// Daemon unreachable over IPC. Internal control flow only:
+    /// [`execute_tool`] converts it into a local-state attempt, so it
+    /// never surfaces to MCP clients.
+    pub fn offline(message: impl Into<String>) -> Self {
+        Self {
+            code: -32000,
+            message: message.into(),
+        }
+    }
+
+    pub fn is_offline(&self) -> bool {
+        self.code == -32000
+    }
 }
 
 impl std::fmt::Display for ToolError {
@@ -258,6 +351,175 @@ fn parse_args<T: for<'de> Deserialize<'de>>(
     serde_json::from_value(args).map_err(|e| ToolError::invalid_params(e.to_string()))
 }
 
+/// Shared validators + state operations used by BOTH the local MCP
+/// path and the daemon IPC arms (`reserve`, `release`, `drain`,
+/// `cloud_capacity`, `ci_status`, `fleet_topology`), so verdicts,
+/// messages, and shapes stay identical whichever path executes.
+/// `String` errors are caller-mapped (`invalid_params` locally,
+/// `-32602` over IPC); provision failures map to internal errors.
+pub(crate) fn validate_reserve(
+    cores: f64,
+    ram_gb: f64,
+    mins: u64,
+) -> Result<(f64, u64, u64), String> {
+    if !cores.is_finite() || cores <= 0.0 {
+        return Err("cores must be a finite value > 0".to_string());
+    }
+    if !ram_gb.is_finite() || ram_gb <= 0.0 {
+        return Err("ram_gb must be a finite value > 0".to_string());
+    }
+    if mins == 0 {
+        return Err("duration_minutes must be > 0".to_string());
+    }
+    Ok((cores, (ram_gb * 1024.0) as u64, mins))
+}
+
+pub(crate) async fn reserve_on(
+    state: &SharedState,
+    cores: f64,
+    ram_mb: u64,
+    mins: u64,
+    reason: String,
+) -> crate::governor::supervisor::Reservation {
+    let now = Instant::now();
+    let mut guard = state.write().await;
+    guard.prune_expired(now);
+    guard.reserve(cores, ram_mb, Duration::from_secs(mins * 60), reason, now)
+}
+
+pub(crate) async fn release_on(state: &SharedState, id: &str) -> bool {
+    state.write().await.release(id)
+}
+
+pub(crate) async fn drain_on(state: &SharedState, node_id: String, reason: String) {
+    state.write().await.drain_node(node_id, reason);
+}
+
+pub(crate) fn validate_cloud_request(
+    provider: &str,
+    max_instances: u32,
+    duration_hours: f64,
+) -> Result<(), String> {
+    if provider != "digitalocean" && provider != "render" {
+        return Err(format!(
+            "provider must be \"digitalocean\" or \"render\", got {provider:?}"
+        ));
+    }
+    if max_instances == 0 {
+        return Err("max_instances must be > 0".to_string());
+    }
+    if !duration_hours.is_finite() || duration_hours <= 0.0 {
+        return Err("duration_hours must be a finite value > 0".to_string());
+    }
+    Ok(())
+}
+
+/// Shared provision flow over an explicit pool + spend cap. The local
+/// path passes `ctx.cloud` + the config ceiling; the daemon arm passes
+/// the state's pool + ledgered cap. `Err` is provision failure only
+/// (callers map it to internal errors); denials are `Ok` values.
+pub(crate) async fn request_cloud_with(
+    pool: &CloudPool,
+    cap_usd: f64,
+    state: &SharedState,
+    provider: &str,
+    max_instances: u32,
+    duration_hours: f64,
+) -> Result<serde_json::Value, String> {
+    // Dual-tier governance: agents can never exceed the Super Admin ceiling.
+    // A zero ceiling means no cloud spend is pre-approved.
+    if cap_usd <= 0.0 {
+        return Ok(serde_json::json!({
+            "approved": false,
+            "reason": "no cloud spend pre-approved: Super Admin must set cloud.max_monthly_spend > 0",
+        }));
+    }
+    if !pool.has_provider(provider) {
+        return Ok(serde_json::json!({
+            "approved": false,
+            "reason": format!(
+                "provider {provider:?} has no token in config.toml; Super Admin must approve credentials"
+            ),
+        }));
+    }
+    // Provision live within budget, one instance per call. The
+    // caller repeats the call (bounded by max_instances) as the backlog
+    // persists; each node self-terminates after 5 idle minutes.
+    let name = format!("runner-ci-{}", now_millis());
+    let node = pool
+        .provision(provider, &name)
+        .await
+        .map_err(|e| e.to_string())?;
+    state.write().await.add_cloud_node(node.clone());
+    Ok(serde_json::json!({
+        "approved": true,
+        "provider": provider,
+        "node_id": node.id,
+        "node_status": node.status,
+        "max_instances": max_instances,
+        "duration_hours": duration_hours,
+        "budget_cap_usd": cap_usd,
+    }))
+}
+
+pub(crate) async fn ci_status_value(state: &SharedState) -> serde_json::Value {
+    let report = crate::status::status_report();
+    let guard = state.read().await;
+    serde_json::json!({
+        "status": report.status,
+        "version": report.version,
+        "host": report.host,
+        "concurrency": report.concurrency,
+        "governor": {
+            "last_weight": guard.last_weight,
+            "last_slots": guard.last_slots,
+            "afk_boost": guard.afk.boosted(),
+            "afk_mode": guard.afk_mode.name(),
+        },
+        "reservations": guard.reservations().iter().map(|r| serde_json::json!({
+            "id": r.id, "cores": r.cores, "ram_mb": r.ram_mb, "reason": r.reason,
+        })).collect::<Vec<_>>(),
+        "drained_nodes": guard.drained_nodes(),
+        "forges": guard.forge_health(),
+    })
+}
+
+pub(crate) async fn fleet_topology_value(state: &SharedState) -> serde_json::Value {
+    let report = crate::status::status_report();
+    let guard = state.read().await;
+    serde_json::json!({
+        "local": {
+            "total_cores": report.host.total_cores,
+            "physical_cores": report.host.physical_cores,
+            "available_memory_bytes": report.host.available_memory_bytes,
+            "max_slots": report.concurrency.max_slots,
+            "cpu_level": report.host.psi_pressure.cpu_level,
+        },
+        "wan_peers": guard.peers(),
+        "cloud_nodes": guard.cloud_nodes(),
+        "drained_nodes": guard.drained_nodes(),
+    })
+}
+
+/// Run an agent call, falling back to the local-state attempt when the
+/// agent reports the daemon offline. The local future is lazy: it is
+/// constructed here but polled only on the fallback path.
+async fn with_daemon_fallback(
+    tool: &str,
+    agent_result: Result<serde_json::Value, ToolError>,
+    local: impl std::future::Future<Output = Result<serde_json::Value, ToolError>>,
+) -> Result<serde_json::Value, ToolError> {
+    match agent_result {
+        Ok(value) => Ok(value),
+        Err(e) if e.is_offline() => {
+            // stderr is a safe side-channel (stdio carries JSON-RPC).
+            eprintln!("runner: mcp {tool}: daemon unreachable, using local state");
+            local.await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Dispatch one `tools/call` by name. Returns the JSON value rendered into
 /// the text content block.
 pub async fn execute_tool(
@@ -266,28 +528,89 @@ pub async fn execute_tool(
     ctx: &ToolContext,
 ) -> Result<serde_json::Value, ToolError> {
     match name {
-        TOOL_GET_CI_STATUS => get_ci_status(ctx).await,
+        TOOL_GET_CI_STATUS => {
+            with_daemon_fallback(
+                TOOL_GET_CI_STATUS,
+                ctx.agent.ci_status().await,
+                get_ci_status(ctx),
+            )
+            .await
+        }
         TOOL_GET_CACHE_STATS => ctx.agent.cache_stats().await,
-        TOOL_GET_FLEET_TOPOLOGY => get_fleet_topology(ctx).await,
+        TOOL_GET_FLEET_TOPOLOGY => {
+            with_daemon_fallback(
+                TOOL_GET_FLEET_TOPOLOGY,
+                ctx.agent.fleet_topology().await,
+                get_fleet_topology(ctx),
+            )
+            .await
+        }
         TOOL_RESERVE_HOST_RESOURCES => {
             let args: ReserveHostResourcesArgs = parse_args(args)?;
-            reserve_host_resources(&args, ctx).await
+            with_daemon_fallback(
+                TOOL_RESERVE_HOST_RESOURCES,
+                ctx.agent
+                    .reserve(
+                        args.cores,
+                        args.ram_gb,
+                        args.duration_minutes,
+                        args.reason.clone(),
+                    )
+                    .await,
+                reserve_host_resources(&args, ctx),
+            )
+            .await
         }
         TOOL_RELEASE_HOST_RESOURCES => {
             let args: ReleaseHostResourcesArgs = parse_args(args)?;
-            release_host_resources(&args, ctx).await
+            with_daemon_fallback(
+                TOOL_RELEASE_HOST_RESOURCES,
+                ctx.agent.release(&args.reservation_id).await,
+                release_host_resources(&args, ctx),
+            )
+            .await
         }
         TOOL_THROTTLE_RUNNER => {
             let args: ThrottleRunnerArgs = parse_args(args)?;
-            throttle_runner(&args, ctx).await
+            // Frozen MCP contract: only warning|critical (the CLI/IPC
+            // surface additionally accepts `high`; see `throttle_set`).
+            if args.level != "warning" && args.level != "critical" {
+                return Err(ToolError::invalid_params(format!(
+                    "level must be \"warning\" or \"critical\", got {:?}",
+                    args.level
+                )));
+            }
+            with_daemon_fallback(
+                TOOL_THROTTLE_RUNNER,
+                ctx.agent.throttle(&args.level, args.duration_minutes).await,
+                throttle_runner(&args, ctx),
+            )
+            .await
         }
         TOOL_REQUEST_CLOUD_CAPACITY => {
             let args: RequestCloudCapacityArgs = parse_args(args)?;
-            request_cloud_capacity(&args, ctx).await
+            with_daemon_fallback(
+                TOOL_REQUEST_CLOUD_CAPACITY,
+                ctx.agent
+                    .request_cloud(
+                        &args.provider,
+                        args.max_instances,
+                        args.duration_hours,
+                        &args.reason,
+                    )
+                    .await,
+                request_cloud_capacity(&args, ctx),
+            )
+            .await
         }
         TOOL_DRAIN_NODE => {
             let args: DrainNodeArgs = parse_args(args)?;
-            drain_node(&args, ctx).await
+            with_daemon_fallback(
+                TOOL_DRAIN_NODE,
+                ctx.agent.drain(&args.node_id, &args.reason).await,
+                drain_node(&args, ctx),
+            )
+            .await
         }
         TOOL_DIAGNOSE_SYSTEM => {
             // All flags optional: omitted arguments mean all-defaults.
@@ -358,71 +681,20 @@ pub async fn execute_tool(
 }
 
 async fn get_ci_status(ctx: &ToolContext) -> Result<serde_json::Value, ToolError> {
-    let report = crate::status::status_report();
-    let state = ctx.state.read().await;
-    Ok(serde_json::json!({
-        "status": report.status,
-        "version": report.version,
-        "host": report.host,
-        "concurrency": report.concurrency,
-        "governor": {
-            "last_weight": state.last_weight,
-            "last_slots": state.last_slots,
-            "afk_boost": state.afk.boosted(),
-            "afk_mode": state.afk_mode.name(),
-        },
-        "reservations": state.reservations().iter().map(|r| serde_json::json!({
-            "id": r.id, "cores": r.cores, "ram_mb": r.ram_mb, "reason": r.reason,
-        })).collect::<Vec<_>>(),
-        "drained_nodes": state.drained_nodes(),
-        "forges": state.forge_health(),
-    }))
+    Ok(ci_status_value(&ctx.state).await)
 }
 
 async fn get_fleet_topology(ctx: &ToolContext) -> Result<serde_json::Value, ToolError> {
-    let report = crate::status::status_report();
-    let state = ctx.state.read().await;
-    Ok(serde_json::json!({
-        "local": {
-            "total_cores": report.host.total_cores,
-            "physical_cores": report.host.physical_cores,
-            "available_memory_bytes": report.host.available_memory_bytes,
-            "max_slots": report.concurrency.max_slots,
-            "cpu_level": report.host.psi_pressure.cpu_level,
-        },
-        "wan_peers": state.peers(),
-        "cloud_nodes": state.cloud_nodes(),
-        "drained_nodes": state.drained_nodes(),
-    }))
+    Ok(fleet_topology_value(&ctx.state).await)
 }
 
 async fn reserve_host_resources(
     args: &ReserveHostResourcesArgs,
     ctx: &ToolContext,
 ) -> Result<serde_json::Value, ToolError> {
-    if !args.cores.is_finite() || args.cores <= 0.0 {
-        return Err(ToolError::invalid_params(
-            "cores must be a finite value > 0",
-        ));
-    }
-    if !args.ram_gb.is_finite() || args.ram_gb <= 0.0 {
-        return Err(ToolError::invalid_params(
-            "ram_gb must be a finite value > 0",
-        ));
-    }
-    if args.duration_minutes == 0 {
-        return Err(ToolError::invalid_params("duration_minutes must be > 0"));
-    }
-    let now = Instant::now();
-    let mut state = ctx.state.write().await;
-    state.prune_expired(now);
-    let reservation = state.reserve(
-        args.cores,
-        (args.ram_gb * 1024.0) as u64,
-        Duration::from_secs(args.duration_minutes * 60),
-        args.reason.clone(),
-        now,
-    );
+    let (cores, ram_mb, mins) = validate_reserve(args.cores, args.ram_gb, args.duration_minutes)
+        .map_err(ToolError::invalid_params)?;
+    let reservation = reserve_on(&ctx.state, cores, ram_mb, mins, args.reason.clone()).await;
     Ok(serde_json::json!({
         "reservation_id": reservation.id,
         "cores": reservation.cores,
@@ -435,8 +707,7 @@ async fn release_host_resources(
     args: &ReleaseHostResourcesArgs,
     ctx: &ToolContext,
 ) -> Result<serde_json::Value, ToolError> {
-    let mut state = ctx.state.write().await;
-    if state.release(&args.reservation_id) {
+    if release_on(&ctx.state, &args.reservation_id).await {
         Ok(serde_json::json!({ "released": args.reservation_id }))
     } else {
         Err(ToolError::invalid_params(format!(
@@ -479,56 +750,18 @@ async fn request_cloud_capacity(
     args: &RequestCloudCapacityArgs,
     ctx: &ToolContext,
 ) -> Result<serde_json::Value, ToolError> {
-    if args.provider != "digitalocean" && args.provider != "render" {
-        return Err(ToolError::invalid_params(format!(
-            "provider must be \"digitalocean\" or \"render\", got {:?}",
-            args.provider
-        )));
-    }
-    if args.max_instances == 0 {
-        return Err(ToolError::invalid_params("max_instances must be > 0"));
-    }
-    if !args.duration_hours.is_finite() || args.duration_hours <= 0.0 {
-        return Err(ToolError::invalid_params(
-            "duration_hours must be a finite value > 0",
-        ));
-    }
-    // Dual-tier governance: agents can never exceed the Super Admin ceiling.
-    // A zero ceiling means no cloud spend is pre-approved.
-    if ctx.config.cloud.max_monthly_spend <= 0.0 {
-        return Ok(serde_json::json!({
-            "approved": false,
-            "reason": "no cloud spend pre-approved: Super Admin must set cloud.max_monthly_spend > 0",
-        }));
-    }
-    if !ctx.cloud.has_provider(&args.provider) {
-        return Ok(serde_json::json!({
-            "approved": false,
-            "reason": format!(
-                "provider {:?} has no token in config.toml; Super Admin must approve credentials",
-                args.provider
-            ),
-        }));
-    }
-    // Phase 3: provision live within budget, one instance per call. The
-    // caller repeats the call (bounded by max_instances) as the backlog
-    // persists; each node self-terminates after 5 idle minutes.
-    let name = format!("runner-ci-{}", now_millis());
-    let node = ctx
-        .cloud
-        .provision(&args.provider, &name)
-        .await
-        .map_err(ToolError::internal)?;
-    ctx.state.write().await.add_cloud_node(node.clone());
-    Ok(serde_json::json!({
-        "approved": true,
-        "provider": args.provider,
-        "node_id": node.id,
-        "node_status": node.status,
-        "max_instances": args.max_instances,
-        "duration_hours": args.duration_hours,
-        "budget_cap_usd": ctx.config.cloud.max_monthly_spend,
-    }))
+    validate_cloud_request(&args.provider, args.max_instances, args.duration_hours)
+        .map_err(ToolError::invalid_params)?;
+    request_cloud_with(
+        &ctx.cloud,
+        ctx.config.cloud.max_monthly_spend,
+        &ctx.state,
+        &args.provider,
+        args.max_instances,
+        args.duration_hours,
+    )
+    .await
+    .map_err(ToolError::internal)
 }
 
 fn now_millis() -> u128 {
@@ -545,10 +778,7 @@ async fn drain_node(
     if args.node_id.trim().is_empty() {
         return Err(ToolError::invalid_params("node_id must not be empty"));
     }
-    ctx.state
-        .write()
-        .await
-        .drain_node(args.node_id.clone(), args.reason.clone());
+    drain_on(&ctx.state, args.node_id.clone(), args.reason.clone()).await;
     Ok(serde_json::json!({ "drained": args.node_id }))
 }
 
@@ -777,6 +1007,48 @@ mod tests {
 
         async fn cache_stats(&self) -> Result<serde_json::Value, ToolError> {
             Ok(serde_json::json!({ "enabled": true, "entries": 3 }))
+        }
+
+        // Daemon-backed tools report offline so dispatch tests exercise
+        // the local fallback deterministically.
+        async fn reserve(
+            &self,
+            _cores: f64,
+            _ram_gb: f64,
+            _duration_minutes: u64,
+            _reason: String,
+        ) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::offline("scripted offline"))
+        }
+
+        async fn release(&self, _id: &str) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::offline("scripted offline"))
+        }
+
+        async fn throttle(&self, _level: &str, _mins: u64) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::offline("scripted offline"))
+        }
+
+        async fn drain(&self, _id: &str, _reason: &str) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::offline("scripted offline"))
+        }
+
+        async fn request_cloud(
+            &self,
+            _provider: &str,
+            _max: u32,
+            _hours: f64,
+            _reason: &str,
+        ) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::offline("scripted offline"))
+        }
+
+        async fn ci_status(&self) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::offline("scripted offline"))
+        }
+
+        async fn fleet_topology(&self) -> Result<serde_json::Value, ToolError> {
+            Err(ToolError::offline("scripted offline"))
         }
     }
 

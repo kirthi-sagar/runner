@@ -476,7 +476,33 @@ async fn cmd_join(token: &str, coordinator: &str, coordinator_pubkey: &str) -> R
     println!("public key: {}", keys.public_b64);
     println!("private key stored in ~/.config/runner/config.toml (0600, never printed again)");
     println!("announcing to coordinator at {host}:{port} within 60s (or restart the daemon)");
+    report_nat_diagnostic(&config).await;
     Ok(())
+}
+
+/// One-shot NAT diagnostic for `runner join`: prints this host's
+/// reflexive mapping when STUN answers (first server only, so a silent
+/// network costs at most ~3s). The daemon re-discovers on its own
+/// socket at announce time; this never fails the join.
+async fn report_nat_diagnostic(config: &RunnerConfig) {
+    use runner_core::mesh::stun::{
+        discover_reflexive_addr, resolve_stun_servers, stun_servers, STUN_TIMEOUT,
+    };
+    let servers = resolve_stun_servers(&stun_servers(&config.mesh)).await;
+    let Some(server) = servers.first() else {
+        return;
+    };
+    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+        Ok(socket) => socket,
+        Err(e) => {
+            eprintln!("NAT diagnostic skipped (no UDP socket: {e})");
+            return;
+        }
+    };
+    match discover_reflexive_addr(&socket, *server, STUN_TIMEOUT).await {
+        Ok(reflexive) => println!("NAT diagnostic: this host's public mapping is {reflexive}"),
+        Err(e) => eprintln!("NAT diagnostic: STUN silent ({e}); the daemon announces anyway"),
+    }
 }
 
 async fn cmd_mesh_list(format: &str, lan: bool) -> Result<()> {

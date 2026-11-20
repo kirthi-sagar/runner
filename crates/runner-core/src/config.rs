@@ -68,6 +68,12 @@ pub struct MeshConfig {
     /// 0600 file). Expires per its TTL; re-join afterwards.
     #[serde(default)]
     pub join_token: Option<String>,
+    /// STUN `host:port` servers for NAT reflexive discovery. `None`
+    /// (default) uses the built-in Google + Cloudflare pair; an
+    /// explicit empty list disables STUN (observed-source routing
+    /// still works; same-subnet dialing still works).
+    #[serde(default)]
+    pub stun_servers: Option<Vec<String>>,
 }
 
 /// Donor caps applied when this host serves foreign jobs.
@@ -896,5 +902,31 @@ mod tests {
             Some(v) => std::env::set_var(fresh_key, v),
             None => std::env::remove_var(fresh_key),
         }
+    }
+
+    #[test]
+    fn stun_servers_default_override_and_disable() {
+        use crate::mesh::stun::{stun_servers, DEFAULT_STUN_SERVERS};
+
+        // Unset: built-in Google + Cloudflare pair.
+        let unset = MeshConfig::default();
+        assert_eq!(unset.stun_servers, None);
+        let effective = stun_servers(&unset);
+        assert_eq!(effective.len(), DEFAULT_STUN_SERVERS.len());
+        assert!(effective.iter().any(|s| s.contains("google")));
+        assert!(effective.iter().any(|s| s.contains("cloudflare")));
+
+        // Explicit override wins.
+        let custom: RunnerConfig =
+            toml::from_str("[mesh]\nstun_servers = [\"stun.example.com:3478\"]\n").unwrap();
+        assert_eq!(
+            stun_servers(&custom.mesh),
+            vec!["stun.example.com:3478".to_string()]
+        );
+
+        // Explicit empty list disables STUN.
+        let off: RunnerConfig = toml::from_str("[mesh]\nstun_servers = []\n").unwrap();
+        assert_eq!(off.mesh.stun_servers, Some(vec![]));
+        assert!(stun_servers(&off.mesh).is_empty());
     }
 }

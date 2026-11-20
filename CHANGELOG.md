@@ -6,6 +6,24 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.6.0 — 2026-11-20
+
+- NAT traversal for WAN peers: friends-and-family donors behind home
+  routers federate with no public IPs or port forwarding. The
+  coordinator routes via the observed announce source (the NAT binding
+  the announce itself opened — valid through symmetric NAT), prefers
+  same-subnet LAN candidates, and hole-punches with the WireGuard
+  handshake itself; a new encrypted `JoinAccept` confirms acceptance.
+- Zero-dependency RFC 5389 STUN client (`mesh::stun`): reflexive
+  discovery over the shared transport socket (pump intercepts
+  responses by shape + transaction id), `[mesh] stun_servers`
+  (default Google + Cloudflare, empty list disables), a log-only
+  symmetric heuristic, and a one-shot `runner join` NAT diagnostic.
+- Wire compat is one-directional: v1.6.0 coordinators serve older
+  peers, but older coordinators reject v1.6.0 announces — upgrade
+  coordinators first. Hermetic `test_mesh_stun` (mock STUN + cone /
+  symmetric NAT simulation) is the CI gate.
+
 ## v1.5.0 — 2026-11-20
 
 - macOS Apple Silicon port (spec §3.5): the workspace compiles for

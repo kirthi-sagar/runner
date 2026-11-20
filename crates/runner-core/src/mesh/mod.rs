@@ -6,4 +6,5 @@ pub mod invite;
 pub mod peer;
 pub mod proto;
 pub mod roles;
+pub mod stun;
 pub mod transport;

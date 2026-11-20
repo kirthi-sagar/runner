@@ -14,7 +14,10 @@ use tokio::sync::Mutex;
 
 use super::invite::{InviteAuthority, InvitePayload};
 use super::peer::parse_job_minimums;
-use super::proto::{JobAccept, JobOffer, JobResult, JoinAnnounce, PeerMessage, PROTO_TAG};
+use super::proto::{
+    JobAccept, JobOffer, JobResult, JoinAccept, JoinAnnounce, PeerMessage, PROTO_TAG,
+};
+use super::stun::{local_addr_for, select_endpoint};
 use super::transport::{PeerHandler, PeerTransport};
 use crate::config::{PeerRecord, RunnerConfig};
 use crate::governor::supervisor::SharedState;
@@ -35,6 +38,9 @@ pub struct CoordinatorRole {
     /// Consumed invitation nonces → token expiry (pruned, so the set
     /// stays bounded by the live TTL window, not history).
     used_nonces: Mutex<HashMap<String, u64>>,
+    /// This coordinator's STUN-discovered reflexive address, published
+    /// in JoinAccept replies (`None` until daemon self-discovery runs).
+    reflexive: Mutex<Option<String>>,
 }
 
 impl CoordinatorRole {
@@ -48,7 +54,13 @@ impl CoordinatorRole {
             state,
             persist_path,
             used_nonces: Mutex::new(HashMap::new()),
+            reflexive: Mutex::new(None),
         }
+    }
+
+    /// Record this coordinator's reflexive address for JoinAccept replies.
+    pub async fn set_reflexive(&self, addr: std::net::SocketAddr) {
+        *self.reflexive.lock().await = Some(addr.to_string());
     }
 
     /// Verify an announce: token signature + TTL always; nonce
@@ -59,6 +71,15 @@ impl CoordinatorRole {
         let payload = self.authority.verify(&announce.token)?;
         if payload.max_cores != announce.max_cores || payload.max_ram_mb != announce.max_ram_mb {
             return Err("announced caps differ from invitation".to_string());
+        }
+        if let Some(reflexive) = &announce.reflexive {
+            reflexive
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| "announced reflexive is not a socket address".to_string())?;
+        }
+        if let Some(lan) = &announce.lan {
+            lan.parse::<std::net::SocketAddr>()
+                .map_err(|_| "announced lan is not a socket address".to_string())?;
         }
         let known = self
             .state
@@ -122,10 +143,19 @@ impl PeerHandler for CoordinatorRole {
                     return;
                 }
             };
-            // Endpoint = observed source IP + advertised listen port
-            // (the source port itself is ephemeral). Direct/LAN peers
-            // only; NAT hole-punching is out of scope.
-            let endpoint = std::net::SocketAddr::new(src.ip(), announce.listen_port);
+            // Endpoint selection: the joiner's LAN address when it
+            // shares our subnet (direct dial, no NAT in the way), else
+            // the observed source — the NAT binding the announce itself
+            // opened, valid through every NAT type including symmetric.
+            // The advertised reflexive address is diagnostic context
+            // only: behind symmetric NAT it names a mapping that does
+            // not reach us.
+            let local_ip = local_addr_for(src).unwrap_or_else(|| src.ip());
+            let (endpoint, via) = select_endpoint(src, &announce, local_ip);
+            eprintln!(
+                "runner: join-announce from {} at {src} (reflexive {:?}, route via {via} to {endpoint})",
+                announce.node_id, announce.reflexive
+            );
             let record = PeerRecord {
                 node_id: announce.node_id.clone(),
                 public_key: announce.pubkey_b64.clone(),
@@ -152,7 +182,7 @@ impl PeerHandler for CoordinatorRole {
 
     fn on_established<'a>(
         &'a self,
-        _tx: &'a PeerTransport,
+        tx: &'a PeerTransport,
         node_id: &'a str,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         let node_id = node_id.to_string();
@@ -164,6 +194,18 @@ impl PeerHandler for CoordinatorRole {
                     guard.add_peer(record);
                     eprintln!("runner: peer {node_id} active");
                 }
+            }
+            drop(guard);
+            // Acceptance notice + our reflexive address (diagnostics for
+            // the joiner; idempotent across re-establishment).
+            let accept = PeerMessage::JoinAccept(JoinAccept {
+                proto: PROTO_TAG.to_string(),
+                accepted: true,
+                reason: String::new(),
+                reflexive: self.reflexive.lock().await.clone(),
+            });
+            if let Err(e) = tx.send(&node_id, accept).await {
+                eprintln!("runner: join-accept to {node_id} failed: {e}");
             }
         })
     }
@@ -254,6 +296,12 @@ impl PeerHandler for PeerRole {
         let node_id = node_id.to_string();
         Box::pin(async move {
             let PeerMessage::JobOffer(offer) = msg else {
+                if let PeerMessage::JoinAccept(accept) = msg {
+                    eprintln!(
+                        "runner: join accepted by {node_id} (coordinator reflexive {:?})",
+                        accept.reflexive
+                    );
+                }
                 return;
             };
             let id = offer.job_id.to_string();

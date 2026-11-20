@@ -190,6 +190,7 @@ pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState) {
         CoordinatorRole::new(authority, state.clone(), RunnerConfig::default_path()),
         PeerRole::new(executor, state.clone()),
     ));
+    let discover_roles = roles.clone();
     let tx = match PeerTransport::spawn(
         TransportConfig {
             listen: std::net::SocketAddr::from(([0, 0, 0, 0], port)),
@@ -207,6 +208,31 @@ pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState) {
     };
     state.write().await.set_peer_transport(tx.clone());
     eprintln!("runner: WAN peer transport on 0.0.0.0:{port}");
+    let stun_servers = runner_core::mesh::stun::resolve_stun_servers(
+        &runner_core::mesh::stun::stun_servers(&config.mesh),
+    )
+    .await;
+    // Self-discovery for JoinAccept replies (detached: accepts carry no
+    // reflexive until it lands, and the mesh routes fine without it).
+    if !stun_servers.is_empty() {
+        let (discover_tx, discover_servers) = (tx.clone(), stun_servers.clone());
+        tokio::spawn(async move {
+            use runner_core::mesh::stun::discover_via_transport;
+            match discover_via_transport(&discover_tx, &discover_servers).await {
+                Ok(found) => {
+                    discover_roles
+                        .coordinator
+                        .set_reflexive(found.reflexive)
+                        .await;
+                    eprintln!(
+                        "runner: coordinator reflexive address is {}",
+                        found.reflexive
+                    );
+                }
+                Err(e) => eprintln!("runner: coordinator STUN discovery failed ({e})"),
+            }
+        });
+    }
     if let (Some(coordinator), Some(pubkey), Some(token)) = (
         config.mesh.coordinator.clone(),
         config.mesh.coordinator_pubkey.clone(),
@@ -226,7 +252,14 @@ pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState) {
                     max_ram_mb: record.max_ram_mb,
                     listen_port: port,
                 };
-                tokio::spawn(announce_loop(tx.clone(), coordinator, pubkey, token, join));
+                tokio::spawn(announce_loop(
+                    tx.clone(),
+                    coordinator,
+                    pubkey,
+                    token,
+                    join,
+                    stun_servers.clone(),
+                ));
             }
             None => eprintln!(
                 "runner: no join record matching this identity; run `runner join` to federate"
@@ -244,6 +277,41 @@ struct AnnounceIdentity {
     listen_port: u16,
 }
 
+/// NAT-traversal candidates for one announce: the STUN-discovered
+/// reflexive address (best effort; `None` when STUN is disabled or
+/// silent, in which case observed-source routing still works) plus the
+/// LAN source address toward the coordinator.
+async fn join_candidates(
+    tx: &runner_core::mesh::transport::PeerTransport,
+    stun_servers: &[std::net::SocketAddr],
+    coordinator: std::net::SocketAddr,
+    listen_port: u16,
+) -> (Option<String>, Option<String>) {
+    use runner_core::mesh::stun::{discover_via_transport, local_addr_for};
+    let reflexive = if stun_servers.is_empty() {
+        None
+    } else {
+        match discover_via_transport(tx, stun_servers).await {
+            Ok(found) => {
+                if let Some(nat) = found.nat {
+                    eprintln!(
+                        "runner: NAT mapping looks {nat:?}; reflexive is {}",
+                        found.reflexive
+                    );
+                }
+                Some(found.reflexive.to_string())
+            }
+            Err(e) => {
+                eprintln!("runner: STUN discovery failed ({e}); announcing without reflexive");
+                None
+            }
+        }
+    };
+    let lan = local_addr_for(coordinator)
+        .map(|ip| std::net::SocketAddr::new(ip, listen_port).to_string());
+    (reflexive, lan)
+}
+
 /// Announce this joiner to its coordinator immediately, then every
 /// [`ANNOUNCE_INTERVAL_SECS`] (heals coordinator restarts and NAT
 /// rebinding; the coordinator dedups known nodes by pubkey).
@@ -253,6 +321,7 @@ async fn announce_loop(
     pubkey: String,
     token: String,
     me: AnnounceIdentity,
+    stun_servers: Vec<std::net::SocketAddr>,
 ) {
     use runner_core::mesh::proto::JoinAnnounce;
     use tokio::net::lookup_host;
@@ -284,6 +353,7 @@ async fn announce_loop(
             }
             last_addr = Some(addr);
         }
+        let (reflexive, lan) = join_candidates(&tx, &stun_servers, addr, me.listen_port).await;
         let announce = JoinAnnounce {
             proto: runner_core::mesh::proto::PROTO_TAG.to_string(),
             node_id: me.node_id.clone(),
@@ -292,6 +362,8 @@ async fn announce_loop(
             listen_port: me.listen_port,
             max_cores: me.max_cores,
             max_ram_mb: me.max_ram_mb,
+            reflexive,
+            lan,
         };
         if let Err(e) = tx.announce(addr, announce).await {
             eprintln!("runner: join-announce to {coordinator} failed ({e}); retrying");

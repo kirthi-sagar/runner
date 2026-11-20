@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.5.0 and prior)
+## Shipped (v1.6.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -18,8 +18,15 @@ services or heavyweight frameworks.
 - Zero-flake spawn retry, zero doc warnings, opt-in live-KVM harness.
 - WAN peer WireGuard execution transport (loopback-gated, direct peers).
 - macOS Apple Silicon port (Darwin QoS pinning, launchd, CI matrix).
+- NAT traversal for WAN peers (STUN reflexive discovery, observed-source
+  routing through cone + symmetric NAT, JoinAccept).
 
-## Current: v1.5.0 (macOS Apple Silicon & Darwin QoS Portability)
+## Current: v1.6.0 (NAT Traversal for WAN Peers via STUN)
+
+- Zero-dependency RFC 5389 client; hole-punching via the WG handshake.
+- Hermetic NAT simulation gates (cone + symmetric) in CI.
+
+## Shipped in v1.5.0: macOS Apple Silicon & Darwin QoS Portability
 
 - Workspace compiles for both Apple targets; QoS pins CI to E-cores.
 - launchd installer, macOS CI + release assets, hermetic QoS tests.
@@ -164,11 +171,6 @@ services or heavyweight frameworks.
 
 - Per-repo isolation once the protocol can carry repo identity
   (standard clients send none).
-
-## Later: post-v1.4 enterprise extensions
-
-- NAT traversal for WAN peers (STUN/ICE/DERP hole-punching; direct
-  endpoints only today).
 
 ## Explicit non-goals
 

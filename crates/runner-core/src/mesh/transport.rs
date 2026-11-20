@@ -11,11 +11,15 @@
 //! which are dropped unless the sender is already known. Initiations
 //! are structurally accepted by any session by Noise design, so
 //! trialing them would misattribute peers; unknown nodes must announce
-//! first (plaintext, token-verified), which is also the NAT story:
-//! roaming re-adopts on data, and a 60s re-announce loop heals the
-//! rest. Trusted small meshes only; boringtun's internal rate limiter
-//! is the DoS backstop, and there is deliberately no TUN — the daemon
-//! stays unprivileged.
+//! first (plaintext, token-verified). STUN Binding Responses share the
+//! socket (only the mapped source port sees the reply), so the pump
+//! intercepts them by shape + transaction id before WireGuard routing:
+//! a response's leading `0x01` would otherwise read as a handshake
+//! initiation. Reflexive discovery is diagnostic/candidate input only;
+//! the return path is always the observed source. Roaming re-adopts on
+//! data, and a 60s re-announce loop heals the rest. Trusted small
+//! meshes only; boringtun's internal rate limiter is the DoS backstop,
+//! and there is deliberately no TUN — the daemon stays unprivileged.
 //!
 //! Delivery is at-least-once with dedup windows, mirroring the cloud
 //! burst path (which likewise gets no completion signal): offers await
@@ -36,6 +40,10 @@ use super::peer::{Keypair, SessionEvent, WireGuardSession, DEFAULT_KEEPALIVE_SEC
 use super::proto::{
     decode_message, decode_plaintext, encode_message, encode_plaintext, JobAccept, JoinAnnounce,
     PeerMessage,
+};
+use super::stun::{
+    build_binding_request, looks_like_stun_response, parse_binding_response, random_txid,
+    STUN_HEADER_LEN,
 };
 
 /// Role callbacks for inbound traffic. Manual futures (no async-trait
@@ -73,6 +81,9 @@ pub struct TransportConfig {
 const PUMP_TICK: Duration = Duration::from_secs(1);
 /// Max inbound UDP datagram (plaintext announces stay far below).
 const MAX_DATAGRAM: usize = 64 * 1024;
+/// Backstop lifetime for pump-routed STUN transactions (callers time
+/// out sooner; this only bounds leaks when a caller vanishes).
+const STUN_PENDING_TTL: Duration = Duration::from_secs(5);
 
 enum Cmd {
     AddSession {
@@ -101,6 +112,10 @@ enum Cmd {
         node_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    DiscoverStun {
+        server: SocketAddr,
+        reply: oneshot::Sender<Result<SocketAddr, String>>,
+    },
 }
 
 struct SessionEntry {
@@ -111,6 +126,13 @@ struct SessionEntry {
 
 struct Waiter {
     reply: Option<oneshot::Sender<Result<JobAccept, String>>>,
+    deadline: Instant,
+}
+
+/// One in-flight STUN transaction (matched by transaction id).
+struct StunPending {
+    txid: [u8; super::stun::STUN_TXID_LEN],
+    reply: Option<oneshot::Sender<Result<SocketAddr, String>>>,
     deadline: Instant,
 }
 
@@ -148,6 +170,7 @@ impl PeerTransport {
             sessions: BTreeMap::new(),
             addr_to_node: HashMap::new(),
             waiters: HashMap::new(),
+            stun_pending: Vec::new(),
         }));
         Ok(this)
     }
@@ -235,6 +258,13 @@ impl PeerTransport {
         let node_id = node_id.to_string();
         Self::roundtrip(&self.cmd, |reply| Cmd::Initiate { node_id, reply }).await
     }
+
+    /// One STUN Binding transaction over the shared socket (single
+    /// attempt; callers retry with timeout bounds, e.g. via
+    /// [`super::stun::discover_via_transport`]).
+    pub async fn discover_stun(&self, server: SocketAddr) -> Result<SocketAddr, String> {
+        Self::roundtrip(&self.cmd, |reply| Cmd::DiscoverStun { server, reply }).await
+    }
 }
 
 struct Pump {
@@ -246,6 +276,7 @@ struct Pump {
     sessions: BTreeMap<String, SessionEntry>,
     addr_to_node: HashMap<SocketAddr, String>,
     waiters: HashMap<u64, Waiter>,
+    stun_pending: Vec<StunPending>,
 }
 
 async fn pump(mut p: Pump) {
@@ -384,6 +415,16 @@ impl Pump {
                 };
                 let _ = reply.send(result);
             }
+            Cmd::DiscoverStun { server, reply } => {
+                let txid = random_txid();
+                let request = build_binding_request(&txid);
+                self.stun_pending.push(StunPending {
+                    txid,
+                    reply: Some(reply),
+                    deadline: Instant::now() + STUN_PENDING_TTL,
+                });
+                self.transmit(server, &request).await;
+            }
         }
     }
 
@@ -402,6 +443,12 @@ impl Pump {
     }
 
     async fn on_datagram(&mut self, src: SocketAddr, bytes: &[u8]) {
+        // STUN responses ride the same socket: intercept first, before
+        // the leading-`0x01` initiation guard below can eat them.
+        if looks_like_stun_response(bytes) {
+            self.on_stun_response(bytes);
+            return;
+        }
         // Plaintext path: join-announces only (leading `{` can never be
         // a WireGuard datagram, whose first byte is 1-4).
         if bytes.first() == Some(&b'{') {
@@ -435,6 +482,22 @@ impl Pump {
             }
         }
         // Undecryptable by every session: drop silently (probing noise).
+    }
+
+    /// Route a STUN response to its pending transaction (matched by
+    /// transaction id; stray or late replies are dropped silently).
+    fn on_stun_response(&mut self, bytes: &[u8]) {
+        let pos = self
+            .stun_pending
+            .iter()
+            .position(|pending| bytes.len() >= STUN_HEADER_LEN && bytes[8..20] == pending.txid);
+        let Some(pos) = pos else {
+            return;
+        };
+        let pending = self.stun_pending.remove(pos);
+        if let Some(reply) = pending.reply {
+            let _ = reply.send(parse_binding_response(bytes, &pending.txid));
+        }
     }
 
     /// Feed one datagram to a session; returns true when accepted.
@@ -536,9 +599,21 @@ impl Pump {
             }
             self.flush(&node_id).await;
         }
+        // Expire STUN transactions whose caller vanished (live
+        // callers time out sooner and retry with a fresh id).
+        let now = Instant::now();
+        self.stun_pending.retain_mut(|pending| {
+            if pending.deadline <= now {
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(Err("STUN discovery timed out".to_string()));
+                }
+                false
+            } else {
+                true
+            }
+        });
         // Expire offer waiters (the handle side also times out; the
         // second completion is silently dropped by the oneshot).
-        let now = Instant::now();
         let mut expired = Vec::new();
         self.waiters.retain(|job_id, waiter| {
             if waiter.deadline <= now {
@@ -654,6 +729,8 @@ mod tests {
             listen_port: 40001,
             max_cores: 4,
             max_ram_mb: 8192,
+            reflexive: None,
+            lan: None,
         };
         tx.announce(addr, announce.clone()).await.unwrap();
         for _ in 0..100 {

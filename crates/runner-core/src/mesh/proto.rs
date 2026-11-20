@@ -24,6 +24,10 @@ pub const FRAME_HEADER_LEN: usize = 20;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 /// Join request (plaintext UDP): proves invitation, publishes identity.
+/// `reflexive` (STUN-discovered public mapping) and `lan` (reachable
+/// LAN address) are v1.6.0 NAT-traversal candidates, optional so older
+/// peers still parse; older coordinators reject v1.6.0 announces
+/// (`deny_unknown_fields`), so wire compat is one-directional by design.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JoinAnnounce {
@@ -34,6 +38,23 @@ pub struct JoinAnnounce {
     pub listen_port: u16,
     pub max_cores: u32,
     pub max_ram_mb: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lan: Option<String>,
+}
+
+/// Join acceptance (encrypted, coordinator → peer, sent once per
+/// session establishment): proves liveness and publishes the
+/// coordinator's own reflexive address for diagnostics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JoinAccept {
+    pub proto: String,
+    pub accepted: bool,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflexive: Option<String>,
 }
 
 /// One job offered for remote execution (encrypted).
@@ -78,6 +99,7 @@ pub struct JobResult {
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum PeerMessage {
     JoinAnnounce(JoinAnnounce),
+    JoinAccept(JoinAccept),
     JobOffer(JobOffer),
     JobAccept(JobAccept),
     JobResult(JobResult),
@@ -226,15 +248,52 @@ mod tests {
             listen_port: 40001,
             max_cores: 4,
             max_ram_mb: 8192,
+            reflexive: Some("198.51.100.7:45001".to_string()),
+            lan: Some("192.168.1.10:40001".to_string()),
         });
         let plain = encode_plaintext(&announce).unwrap();
         assert_eq!(plain[0], b'{');
-        assert_eq!(decode_plaintext(&plain).unwrap().node_id, "bob");
+        let decoded = decode_plaintext(&plain).unwrap();
+        assert_eq!(decoded.node_id, "bob");
+        assert_eq!(decoded.reflexive.as_deref(), Some("198.51.100.7:45001"));
+        assert_eq!(decoded.lan.as_deref(), Some("192.168.1.10:40001"));
 
         // Unknown fields and wrong plaintext kinds fail loudly.
         assert!(decode_plaintext(b"{\"kind\":\"JobOffer\"}").is_err());
         assert!(encode_plaintext(&msg).is_err());
         assert!(decode_plaintext(b"not json").is_err());
+    }
+
+    #[test]
+    fn v14_announce_without_candidates_still_parses() {
+        // A pre-v1.6.0 announce (no reflexive/lan keys) must parse with
+        // both candidates defaulting to None.
+        let old = br#"{"kind":"JoinAnnounce","proto":"wan1","node_id":"bob","pubkey_b64":"KEY","token":"runner1.e30.sig","listen_port":40001,"max_cores":4,"max_ram_mb":8192}"#;
+        let decoded = decode_plaintext(old).unwrap();
+        assert_eq!(decoded.node_id, "bob");
+        assert_eq!(decoded.reflexive, None);
+        assert_eq!(decoded.lan, None);
+
+        // Serializing without candidates omits the keys entirely (old
+        // coordinators accept these announces byte-for-byte).
+        let plain = encode_plaintext(&PeerMessage::JoinAnnounce(decoded)).unwrap();
+        let text = String::from_utf8(plain).unwrap();
+        assert!(!text.contains("reflexive"), "{text}");
+        assert!(!text.contains("\"lan\""), "{text}");
+    }
+
+    #[test]
+    fn join_accept_round_trips_encrypted_only() {
+        let accept = PeerMessage::JoinAccept(JoinAccept {
+            proto: PROTO_TAG.to_string(),
+            accepted: true,
+            reason: String::new(),
+            reflexive: Some("203.0.113.9:40000".to_string()),
+        });
+        let frame = encode_message(&accept).unwrap();
+        assert_eq!(decode_message(&frame).unwrap(), accept);
+        // Never plaintext: only JoinAnnounce may skip the session.
+        assert!(encode_plaintext(&accept).is_err());
     }
 
     #[test]

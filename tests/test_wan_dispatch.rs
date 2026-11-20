@@ -177,6 +177,8 @@ async fn loopback_join_offer_accept_and_result() {
                 listen_port: peer_addr.port(),
                 max_cores: 4,
                 max_ram_mb: 8192,
+                reflexive: None,
+                lan: None,
             },
         )
         .await
@@ -232,6 +234,8 @@ async fn loopback_rejects_bad_token_and_replayed_nonce() {
             listen_port: 40001,
             max_cores: 4,
             max_ram_mb: 8192,
+            reflexive: None,
+            lan: None,
         })
     };
 
@@ -297,6 +301,8 @@ async fn join_bob(
                 listen_port: peer_addr.port(),
                 max_cores: 4,
                 max_ram_mb: 8192,
+                reflexive: None,
+                lan: None,
             },
         )
         .await
@@ -372,6 +378,8 @@ async fn loopback_peer_rejects_without_caps_or_slots() {
                 listen_port: zed_addr.port(),
                 max_cores: 4,
                 max_ram_mb: 8192,
+                reflexive: None,
+                lan: None,
             },
         )
         .await
@@ -517,6 +525,8 @@ async fn loopback_coordinator_loop_dispatches_to_peer() {
                 listen_port: peer_addr.port(),
                 max_cores: 4,
                 max_ram_mb: 8192,
+                reflexive: None,
+                lan: None,
             },
         )
         .await

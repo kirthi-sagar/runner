@@ -184,7 +184,7 @@ pub struct SlotReport {
 pub fn detect_slots(afk_boost: bool) -> io::Result<SlotReport> {
     #[cfg(target_os = "macos")]
     {
-        return mac_slots(afk_boost);
+        mac_slots(afk_boost)
     }
     #[cfg(not(target_os = "macos"))]
     {

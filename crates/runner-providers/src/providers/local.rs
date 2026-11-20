@@ -15,6 +15,7 @@ use tokio::process::Command as TokioCommand;
 
 use super::{JobPayload, ProviderAdapter, ProviderJob};
 use runner_core::governor::cgroup::CgroupSlice;
+#[cfg(unix)]
 use runner_core::governor::psi::PsiPoller;
 use runner_sandbox::mounts::{probe_userns, sanitize_job_id, Workspace};
 
@@ -46,6 +47,7 @@ fn next_job_id() -> String {
 }
 
 /// Drive slice weights from live PSI until cancelled (250ms cadence).
+#[cfg(unix)]
 async fn govern_slice_while_running(slice: CgroupSlice) {
     let poller = PsiPoller::spawn();
     let mut rx = poller.subscribe();
@@ -61,6 +63,14 @@ async fn govern_slice_while_running(slice: CgroupSlice) {
             }
         }
     }
+}
+
+/// No governor on Windows: log once and pend until the caller aborts
+/// the task (same lifecycle contract as the unix loop).
+#[cfg(windows)]
+async fn govern_slice_while_running(_slice: CgroupSlice) {
+    eprintln!("governor disabled: Windows Tier-3 mode");
+    std::future::pending::<()>().await;
 }
 
 /// Execute a command under zero-freeze governance, returning its exit code.

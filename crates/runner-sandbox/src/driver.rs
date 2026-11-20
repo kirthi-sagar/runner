@@ -178,6 +178,8 @@ async fn execute_process(
     if command.is_empty() {
         return Err("no command to execute".to_string());
     }
+    #[cfg(windows)]
+    eprintln!("governor disabled: Windows Tier-3 mode");
     let workspace = Workspace::create(&sanitize_job_id(&next_engine_job_id()))
         .map_err(|e| format!("workspace setup failed: {e}"))?;
     let sandboxed = probe_userns();

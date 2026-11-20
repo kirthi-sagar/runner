@@ -12,6 +12,7 @@
 //! ~0.5% CPU while yielding >99% throughput to foreground apps.
 
 use std::env;
+#[cfg(unix)]
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -79,11 +80,24 @@ impl CgroupSlice {
     }
 
     /// Create the slice if missing. Does not touch weights.
+    #[cfg(unix)]
     pub fn ensure(&self) -> io::Result<()> {
         fs::create_dir_all(&self.path)
     }
 
+    /// Windows has no cgroups; every mutating/querying method fails
+    /// loudly and callers degrade (best-effort `.ok()` / fallbacks).
+    #[cfg(windows)]
+    pub fn ensure(&self) -> io::Result<()> {
+        eprintln!("cgroups unavailable on Windows");
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroups unavailable on Windows",
+        ))
+    }
+
     /// Read the current `cpu.weight` value.
+    #[cfg(unix)]
     pub fn weight(&self) -> io::Result<u32> {
         let raw = fs::read_to_string(self.path.join("cpu.weight"))?;
         raw.trim()
@@ -91,7 +105,17 @@ impl CgroupSlice {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    #[cfg(windows)]
+    pub fn weight(&self) -> io::Result<u32> {
+        eprintln!("cgroups unavailable on Windows");
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroups unavailable on Windows",
+        ))
+    }
+
     /// Write a `cpu.weight` value (kernel range 1-10000).
+    #[cfg(unix)]
     pub fn set_weight(&self, weight: u32) -> io::Result<()> {
         if !(WEIGHT_MIN..=WEIGHT_MAX).contains(&weight) {
             return Err(io::Error::new(
@@ -102,24 +126,54 @@ impl CgroupSlice {
         fs::write(self.path.join("cpu.weight"), weight.to_string())
     }
 
+    #[cfg(windows)]
+    pub fn set_weight(&self, _weight: u32) -> io::Result<()> {
+        eprintln!("cgroups unavailable on Windows");
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroups unavailable on Windows",
+        ))
+    }
+
     /// Ensure the slice exists and reset it to the baseline weight.
+    #[cfg(unix)]
     pub fn ensure_baseline(&self) -> io::Result<()> {
         self.ensure()?;
         self.set_weight(WEIGHT_NORMAL)
     }
 
+    #[cfg(windows)]
+    pub fn ensure_baseline(&self) -> io::Result<()> {
+        eprintln!("cgroups unavailable on Windows");
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroups unavailable on Windows",
+        ))
+    }
+
     /// Apply the pressure-driven weight for a CPU PSI `some avg10` reading.
     /// Returns the weight that was written.
+    #[cfg(unix)]
     pub fn apply_pressure(&self, cpu_some_avg10: f64) -> io::Result<u32> {
         let weight = weight_for_cpu_psi(cpu_some_avg10);
         self.set_weight(weight)?;
         Ok(weight)
+    }
+
+    #[cfg(windows)]
+    pub fn apply_pressure(&self, _cpu_some_avg10: f64) -> io::Result<u32> {
+        eprintln!("cgroups unavailable on Windows");
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroups unavailable on Windows",
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn weight_ladder_matches_spec() {

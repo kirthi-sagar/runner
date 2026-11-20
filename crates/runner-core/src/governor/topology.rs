@@ -186,7 +186,11 @@ pub fn detect_slots(afk_boost: bool) -> io::Result<SlotReport> {
     {
         mac_slots(afk_boost)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        windows_slots(afk_boost)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let topology = detect_topology()?;
         let (mem_total_mb, mem_avail_mb) = read_meminfo_mb()?;
@@ -197,6 +201,23 @@ pub fn detect_slots(afk_boost: bool) -> io::Result<SlotReport> {
             afk_boost,
         ))
     }
+}
+
+/// Windows has no sysfs/NUMA topology wired; report a static
+/// single-core topology so slot math still resolves. Tier-3 needs no
+/// real slots; the governor never runs here.
+#[cfg(windows)]
+fn windows_slots(afk_boost: bool) -> io::Result<SlotReport> {
+    eprintln!("NUMA topology unavailable on Windows");
+    Ok(slots_from_counts(
+        CpuTopology {
+            logical: 1,
+            physical: 1,
+        },
+        4096,
+        4096,
+        afk_boost,
+    ))
 }
 
 /// Assemble a slot report from explicit counts (shared by the Linux

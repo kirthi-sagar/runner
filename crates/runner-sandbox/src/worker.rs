@@ -17,18 +17,46 @@ use runner_core::governor::darwin::QosBackend;
 /// Privileged root for pre-cached official worker packages.
 pub const WORKER_CACHE_ROOT: &str = "/var/cache/runner";
 /// Launcher script inside the extracted worker package.
+#[cfg(unix)]
 pub const RUN_SCRIPT: &str = "./run.sh";
+/// Launcher script inside the extracted worker package.
+#[cfg(windows)]
+pub const RUN_SCRIPT: &str = "run.cmd";
+
+/// Launcher file name for presence checks (`RUN_SCRIPT` without `./`).
+#[cfg(unix)]
+fn launcher_file_name() -> &'static str {
+    "run.sh"
+}
+/// Launcher file name for presence checks.
+#[cfg(windows)]
+fn launcher_file_name() -> &'static str {
+    "run.cmd"
+}
 /// Default worker version (verified `actions/runner` release tag).
 pub const DEFAULT_WORKER_VERSION: &str = "2.338.2";
 
-/// Unprivileged cache root (`~/.runner/cache/worker/`).
+/// Unprivileged cache root (`~/.runner/cache/worker/`,
+/// `%APPDATA%\runner\cache\worker` on Windows).
 pub fn user_cache_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".runner")
-            .join("cache")
-            .join("worker")
-    })
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join(".runner")
+                .join("cache")
+                .join("worker")
+        })
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|dir| {
+            PathBuf::from(dir)
+                .join("runner")
+                .join("cache")
+                .join("worker")
+        })
+    }
 }
 
 /// Pick the privileged cache root when writable, else the user cache.
@@ -51,9 +79,18 @@ pub fn cache_dir_in(root: &Path, version: &str) -> PathBuf {
     root.join(format!("worker-{version}"))
 }
 
-/// Release tarball name, e.g. `actions-runner-linux-x64-2.338.2.tar.gz`.
+/// Release tarball name, e.g. `actions-runner-linux-x64-2.338.2.tar.gz`
+/// (`actions-runner-win-x64-*.zip` on Windows, verified against the
+/// `actions/runner` release assets).
+#[cfg(unix)]
 pub fn tarball_name(version: &str, arch: &str) -> String {
     format!("actions-runner-linux-{arch}-{version}.tar.gz")
+}
+
+/// Release archive name, e.g. `actions-runner-win-x64-2.338.2.zip`.
+#[cfg(windows)]
+pub fn tarball_name(version: &str, arch: &str) -> String {
+    format!("actions-runner-win-{arch}-{version}.zip")
 }
 
 /// Download URL for a release tarball.
@@ -62,6 +99,28 @@ pub fn release_url(version: &str, arch: &str) -> String {
         "https://github.com/actions/runner/releases/download/v{version}/{}",
         tarball_name(version, arch)
     )
+}
+
+/// Unpack a downloaded worker archive: gzip-tarball on unix, zip on
+/// Windows (the `actions/runner` Windows assets ship as `.zip`).
+#[cfg(unix)]
+fn extract_archive(bytes: &[u8], dir: &Path) -> Result<(), String> {
+    let tar = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(tar);
+    archive
+        .unpack(dir)
+        .map_err(|e| format!("worker extract: {e}"))
+}
+
+/// Unpack a downloaded worker archive: gzip-tarball on unix, zip on
+/// Windows (the `actions/runner` Windows assets ship as `.zip`).
+#[cfg(windows)]
+fn extract_archive(bytes: &[u8], dir: &Path) -> Result<(), String> {
+    let cursor = std::io::Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("worker extract: {e}"))?;
+    archive
+        .extract(dir)
+        .map_err(|e| format!("worker extract: {e}"))
 }
 
 /// Host architecture label matching release assets.
@@ -87,7 +146,7 @@ pub async fn ensure_cached(version: &str) -> Result<PathBuf, String> {
 /// still hits the network only on cache miss).
 pub async fn ensure_cached_in(root: &Path, version: &str, arch: &str) -> Result<PathBuf, String> {
     let dir = cache_dir_in(root, version);
-    if dir.join("run.sh").exists() {
+    if dir.join(launcher_file_name()).exists() {
         return Ok(dir);
     }
     let url = release_url(version, arch);
@@ -101,13 +160,10 @@ pub async fn ensure_cached_in(root: &Path, version: &str, arch: &str) -> Result<
         .await
         .map_err(|e| format!("worker download body: {e}"))?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("worker cache: {e}"))?;
-    let tar = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut archive = tar::Archive::new(tar);
-    archive
-        .unpack(&dir)
-        .map_err(|e| format!("worker extract: {e}"))?;
-    if !dir.join("run.sh").exists() {
-        return Err("worker package missing run.sh after extract".to_string());
+    extract_archive(&bytes[..], &dir)?;
+    let launcher = launcher_file_name();
+    if !dir.join(launcher).exists() {
+        return Err(format!("worker package missing {launcher} after extract"));
     }
     Ok(dir)
 }
@@ -181,12 +237,18 @@ pub struct WorkerOutcome {
 }
 
 /// Attach a pid to the supervisor slice (best-effort: logs, never fails).
+#[cfg(unix)]
 fn attach_to_slice(slice: &runner_core::governor::cgroup::CgroupSlice, pid: u32) {
     let procs = slice.path().join("cgroup.procs");
     if let Err(e) = std::fs::write(&procs, pid.to_string()) {
         eprintln!("runner: cgroup attach of pid {pid} failed ({e}); unsliced");
     }
 }
+
+/// No cgroup slices on Windows; silently skipped (the governor-disabled
+/// notice is emitted once by the dispatch path, not per spawn).
+#[cfg(windows)]
+fn attach_to_slice(_slice: &runner_core::governor::cgroup::CgroupSlice, _pid: u32) {}
 
 /// Spawn the worker, attach it to the cgroup slice, and supervise it to
 /// Spawn with `ETXTBSY` tolerance: under parallel load the kernel may

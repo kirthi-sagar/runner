@@ -162,8 +162,20 @@ pub fn read_psi_file(dir: &Path, resource: &str) -> io::Result<PsiFile> {
 }
 
 /// Read a live snapshot from `/proc/pressure`.
+#[cfg(unix)]
 pub fn read_snapshot() -> io::Result<PsiSnapshot> {
     read_snapshot_from(Path::new("/proc/pressure"))
+}
+
+/// Windows has no PSI; callers already degrade on `Err`
+/// (`unwrap_or_default` / `.ok()` yield zero snapshots).
+#[cfg(windows)]
+pub fn read_snapshot() -> io::Result<PsiSnapshot> {
+    eprintln!("PSI unavailable on Windows");
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "PSI unavailable on Windows",
+    ))
 }
 
 /// Read a snapshot from an alternate pressure directory (tests).

@@ -107,7 +107,7 @@ jobs:
         shell: pwsh
         run: |
           $wslPath = '/mnt/' + $env:GITHUB_WORKSPACE.Substring(0,1).ToLower() + $env:GITHUB_WORKSPACE.Substring(2).Replace('\','/')
-          wsl -d Ubuntu -u root bash -c "export PATH=/root/.cargo/bin:`$PATH && rm -rf /root/runner && cp -r '$wslPath' /root/runner && cd /root/runner && chmod +x ./install.sh && ./install.sh"
+          wsl -d Ubuntu -u root bash -c "export PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && rm -rf /root/runner && cp -r '$wslPath' /root/runner && cd /root/runner && chmod +x ./install.sh && ./install.sh"
 
       - name: Assert doctor wsl check passes
         shell: pwsh

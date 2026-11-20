@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.1.0 and prior)
+## Shipped (v1.2.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -13,8 +13,15 @@ services or heavyweight frameworks.
 - eBPF egress, microVM tier, audit/policy, hooks, doctor.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
+- Real `runner init` onboarding (config merge, token store, layout seed).
 
-## Current: v1.1.0 (Daemon IPC Convergence & Zero-Panic Hardening)
+## Current: v1.2.0 (Real `runner init` Onboarding)
+
+- `runner init` writes `config.toml`, merges idempotently, stores
+  `--token` in the 0600 env file, and prints next steps.
+- Unparsable configs fail closed; report text never contains secrets.
+
+## Shipped in v1.1.0: Daemon IPC Convergence & Zero-Panic Hardening
 
 - MCP tools converge onto live daemon state over IPC, with local
   fallback when the daemon is unreachable.

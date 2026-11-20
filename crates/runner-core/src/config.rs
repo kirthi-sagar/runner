@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -710,25 +710,60 @@ impl RunnerConfig {
         config
     }
 
-    /// Persist to the default path with `0600` permissions.
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::default_path().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no HOME for config path")
-        })?;
+    /// Load from an explicit path (used by `init`; hermetic, no `$HOME`).
+    pub fn load_from(path: &Path) -> Result<Self, String> {
+        let text = fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+
+    /// Persist to an explicit path with `0600` permissions.
+    pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let text = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        fs::write(&path, text)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        fs::write(path, text)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(())
+    }
+
+    /// Persist to the default path with `0600` permissions.
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::default_path().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no HOME for config path")
+        })?;
+        self.save_to(&path)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_to_round_trip_is_private() {
+        let dir = crate::test_support::TempDir::new("config-save").unwrap();
+        let path = dir.path().join("sub").join("config.toml");
+        let mut config = RunnerConfig {
+            org: Some("acme".to_string()),
+            ..RunnerConfig::default()
+        };
+        config.save_to(&path).unwrap();
+        let loaded = RunnerConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.org.as_deref(), Some("acme"));
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // Re-saving over the file keeps working (the `init` merge path).
+        config.coordinator.repo_name = Some("web".to_string());
+        config.save_to(&path).unwrap();
+        let reloaded = RunnerConfig::load_from(&path).unwrap();
+        assert_eq!(reloaded.coordinator.repo_name.as_deref(), Some("web"));
+        assert_eq!(reloaded.org.as_deref(), Some("acme"));
+    }
 
     #[test]
     fn server_listen_port_defaults_off() {

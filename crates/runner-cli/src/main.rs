@@ -35,10 +35,16 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Initialize host configuration
+    /// Initialize host configuration (writes config, seeds layout)
     Init {
         #[arg(long)]
         org: Option<String>,
+        /// Repository slug (`owner/name`) for coordinator queue polling
+        #[arg(long)]
+        repo: Option<String>,
+        /// GitHub token: stored in the 0600 env file, never printed
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Start the coordinator daemon (governor loop + IPC socket)
     Start {
@@ -612,6 +618,30 @@ fn cmd_stop(force: bool) -> Result<()> {
 /// `runner auth github`: store the GitHub token in the 0600 secrets
 /// file (created/updated in place, never logged). The daemon picks it up
 /// on restart via env auto-load — no unit editing required.
+fn cmd_init(
+    config: &RunnerConfig,
+    org: Option<String>,
+    repo: Option<String>,
+    token: Option<String>,
+) -> Result<()> {
+    use runner_cli::init::{run_init, InitOptions};
+    use runner_core::config::{default_env_path, resolve_cache_dir};
+
+    let config_path = RunnerConfig::default_path().context("no HOME for config path")?;
+    let env_path = default_env_path().context("no HOME for env path")?;
+    let report = run_init(&InitOptions {
+        org,
+        repo,
+        token,
+        config_path,
+        env_path,
+        cache_dir: resolve_cache_dir(&config.cache),
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
+    print!("{}", runner_cli::init::render_report(&report));
+    Ok(())
+}
+
 fn cmd_auth_github(token: Option<String>) -> Result<()> {
     use runner_core::auth::{ProviderSlot, TokenStore};
 
@@ -1064,8 +1094,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = RunnerConfig::load_or_default();
     match cli.command {
-        Commands::Init { org } => {
-            println!("runner init: org={org:?} (prints only, no writes yet)");
+        Commands::Init { org, repo, token } => {
+            cmd_init(&config, org, repo, token)?;
         }
         Commands::Start { daemon } => {
             if daemon {

@@ -19,7 +19,7 @@
 //! * Wrap the official `actions/runner` worker via single-use JIT configs.
 //! * Never mount `/home/*` into job sandboxes; block RFC 1918 egress.
 
-pub use runner_cli::service;
+pub use runner_cli::{init, service};
 pub use runner_core::{
     auth, cache, config, governor, ipc, mcp, mesh, pidfile, status, test_support,
 };

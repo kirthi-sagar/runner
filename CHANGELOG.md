@@ -6,6 +6,17 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.2.0 — 2026-11-20
+
+- Real `runner init` onboarding: writes `~/.config/runner/config.toml`
+  (0600), merging `--org` / `--repo owner/name` into existing configs
+  without touching other sections; stores `--token` via the 0600 env
+  store (never printed); seeds the cache dir; prints next steps.
+- Fail-closed: unparsable configs and malformed slugs are refused
+  before any write; re-runs are idempotent ("already up to date").
+- New `RunnerConfig::load_from` / `save_to` path-explicit helpers and
+  `tests/test_init.rs` (merge, perms, secrecy, idempotency).
+
 ## v1.1.0 — 2026-11-18
 
 - MCP-over-daemon-IPC convergence: state-changing tools and both

@@ -123,3 +123,21 @@ jobs:
             exit 1
           }
           exit 0
+
+  windows-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW cross-toolchain
+        run: sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Add Windows target
+        run: rustup target add x86_64-pc-windows-gnu
+      - name: Build (cross-compile, --locked)
+        run: cargo build --release --target x86_64-pc-windows-gnu --locked -p runner-cli
+      - name: Clippy (Windows target)
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-windows-x86_64
+          path: target/x86_64-pc-windows-gnu/release/runner.exe

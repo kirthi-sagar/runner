@@ -9,6 +9,7 @@
 //! * [`runner_telemetry`] — ring-buffer capture and structured JSON logs.
 //! * [`runner_enterprise`] — governance: control plane, audit, fleet policy, SSO.
 //! * [`runner_cli`] — unified binary entrypoint (`service` helpers).
+//! * [`runner_guest_agent`] — Tier-1 in-guest exec agent over vsock.
 //!
 //! Binding design authority: `README.md` and
 //! `AI_AGENT_RUNNER_SPECIFICATION.md` in the repository root.
@@ -24,6 +25,7 @@ pub use runner_core::{
     auth, cache, config, governor, ipc, mcp, mesh, pidfile, status, test_support,
 };
 pub use runner_enterprise::{audit, control_plane, policy, sso, webhook};
+pub use runner_guest_agent as guest_agent;
 pub use runner_providers::{github, providers};
 pub use runner_sandbox as sandbox;
 pub use runner_telemetry as telemetry;

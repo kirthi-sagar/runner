@@ -16,3 +16,5 @@ rand.workspace = true
 tar.workspace = true
 flate2.workspace = true
 runner-core.workspace = true
+runner-guest-agent.workspace = true
+base64.workspace = true

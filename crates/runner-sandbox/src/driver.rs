@@ -5,9 +5,9 @@
 //! * [`SandboxDriver::Process`] — unprivileged user + mount namespaces with
 //!   an ephemeral tmpfs workspace (falls back to a plain governed spawn
 //!   where user namespaces are unavailable).
-//! * [`SandboxDriver::MicroVm`] — Firecracker microVM boot/shutdown
-//!   lifecycle. Guest workload dispatch over vsock is operator-integrated;
-//!   the engine guarantees the hardware isolation boundary and fails
+//! * [`SandboxDriver::MicroVm`] — Firecracker microVM with vsock guest
+//!   dispatch: the engine boots the guest, runs the command via the
+//!   in-guest agent, streams its stdio, and tears the VM down. It fails
 //!   closed (clean errors, never silent host execution) without KVM,
 //!   the Firecracker binary, or kernel/rootfs images.
 
@@ -82,30 +82,44 @@ impl SandboxEngine {
     ///
     /// Process tier: tmpfs user-namespace sandbox (or governed direct
     /// spawn where namespaces are unavailable), stdio inherited, timeout
-    /// kills the child. MicroVM tier: verifies the hardware isolation
-    /// lifecycle (boot + teardown); guest workload dispatch is a clean
-    /// error until a vsock guest agent is integrated.
+    /// kills the child. MicroVM tier: boots the guest, dispatches the
+    /// command over vsock to the in-guest agent, streams its stdio, and
+    /// tears the VM down.
     pub async fn execute(&self, command: &[String], timeout: Duration) -> Result<i32, String> {
         match self.driver {
             SandboxDriver::Process => execute_process(command, timeout).await,
-            SandboxDriver::MicroVm => self.execute_microvm().await,
+            SandboxDriver::MicroVm => self.execute_microvm(command, timeout).await,
         }
     }
 
-    async fn execute_microvm(&self) -> Result<i32, String> {
+    async fn execute_microvm(&self, command: &[String], timeout: Duration) -> Result<i32, String> {
+        if command.is_empty() {
+            return Err("no command to execute".to_string());
+        }
         if !probe_kvm() {
             return Err("/dev/kvm unavailable: Tier-1 microVMs need KVM".to_string());
         }
         let config = self.microvm.clone().ok_or_else(|| {
             "microvm tier needs kernel/rootfs images (see sandbox config)".to_string()
         })?;
-        let mut supervisor = MicroVmSupervisor::new(config);
+        let mut supervisor = MicroVmSupervisor::new(config.clone());
         supervisor.launch(&self.firecracker_bin).await?;
-        supervisor.shutdown().await;
-        Err(
-            "microvm guest dispatch needs a vsock guest agent; boot/shutdown lifecycle verified"
-                .to_string(),
+        let request = runner_guest_agent::ExecRequest {
+            argv: command.to_vec(),
+            cwd: "/".to_string(),
+            env: std::env::vars().collect(),
+            timeout_secs: timeout.as_secs().max(1),
+        };
+        let outcome = crate::vsock::dispatch(
+            &config.vsock_path,
+            &request,
+            timeout,
+            &mut tokio::io::stdout(),
+            &mut tokio::io::stderr(),
         )
+        .await;
+        supervisor.shutdown().await;
+        outcome
     }
 }
 

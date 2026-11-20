@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.2.0 and prior)
+## Shipped (v1.3.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -14,8 +14,15 @@ services or heavyweight frameworks.
 - Spend ledger + budget stops, dynamic eBPF IHL walking, mock
   cloud lifecycle harness.
 - Real `runner init` onboarding (config merge, token store, layout seed).
+- Tier-1 vsock guest dispatch (`runner-guest-agent`, loopback-gated).
 
-## Current: v1.2.0 (Real `runner init` Onboarding)
+## Current: v1.3.0 (Tier-1 vsock Guest Dispatch)
+
+- `exec --driver microvm` runs workloads via the in-guest agent over
+  vsock (shared NDJSON protocol, streamed stdio, exit codes).
+- UDS loopback tests are the CI gates; live KVM boots stay manual-only.
+
+## Shipped in v1.2.0: Real `runner init` Onboarding
 
 - `runner init` writes `config.toml`, merges idempotently, stores
   `--token` in the 0600 env file, and prints next steps.

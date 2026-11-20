@@ -120,12 +120,12 @@ Existing self-hosted runners fail at this because:
 | **Dual-Tier RBAC** | **Yes (Human Super Admin / AI Admin)**| None | Kubernetes RBAC | None | SaaS Team Roles |
 | **Peer WAN Federation** | **P2P WireGuard Mesh (Job Routing Planned)**| Manual | Complex VPN / Multi-cluster | None | None |
 | **Cloud Credit Bursting** | **Yes (DigitalOcean / Render auto-scale)**| None | Custom autoscalers | None | Proprietary SaaS |
-| **AFK Boost Mode** | **Planned (cgroups CFS throttle active)** | None | None | None | N/A |
+| **AFK Boost Mode** | **Yes (shipped v0.7.0)** | None | None | None | N/A |
 | **Infrastructure Overhead** | **Zero (Single static binary)** | Low (Directory install) | Very High (Kubernetes cluster) | Low (Docker CLI) | Managed SaaS |
 | **Distributed LAN Cache** | **Transparent (ACTIONS_CACHE_URL)**| No | Optional (MinIO / S3 setup) | Local Docker volume only | Cloud cache |
 | **macOS Apple Silicon Support** | **Planned (Linux cgroups v2 active)** | Unmanaged | Not supported | Local Docker (Rosetta/arm) | Metered cloud |
 | **Multi-Provider CI** | **GitHub + GitLab + Bitbucket + Local** | GitHub only | GitHub only | GitHub emu only | GitHub (+ paid add-ons) |
-| **Tier-1 MicroVMs** | **Partial (Firecracker ready, guest dispatch planned)** | None | None | None | Yes (Firecracker per job) |
+| **Tier-1 MicroVMs** | **Yes (Firecracker + vsock guest agent)** | None | None | None | Yes (Firecracker per job) |
 
 ---
 
@@ -154,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v1.2.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v1.3.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -191,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v1.2.0  (q quit, live cadence)
+runner top v1.3.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -319,7 +319,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "1.2.0", "governor": "normal",
+{"status": "healthy", "version": "1.3.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -599,6 +599,12 @@ rootfs, vsock, `InstanceStart`, and graceful `SendCtrlAltDel` shutdown.
 exit. `probe_kvm()` gates Tier-1 on `/dev/kvm` availability — hosts
 without KVM degrade gracefully to Tier-2 namespaces, never crashing.
 
+Workload dispatch runs over vsock: the host serves one exec session per
+boot to the in-guest agent (`crates/runner-guest-agent`, baked into the
+rootfs), streams its stdio, and returns its exit code. See
+[`docs/microvm-tier.md`](docs/microvm-tier.md) for the protocol, the
+rootfs-baking recipe, and the vsock assumptions.
+
 ### Centralized Control Plane with OIDC SSO
 
 `runner server --listen 0.0.0.0:8080` starts the embedded Axum plane:
@@ -629,6 +635,7 @@ gating by binary. A Cargo workspace keeps every layer loosely coupled:
 | `crates/runner-telemetry` | Ring-buffer capture + structured JSON logs | Both |
 | `crates/runner-enterprise` | Control plane, audit trail, fleet policy, SSO hooks | Enterprise |
 | `crates/runner-cli` | Unified `runner` binary entrypoint | Both |
+| `crates/runner-guest-agent` | Tier-1 in-guest exec agent (vsock) | Both |
 
 The root `runner` crate is a thin facade re-exporting the stable
 `runner::*` API, so existing agents, tests, and scripts keep working

@@ -6,6 +6,22 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.3.0 — 2026-11-20
+
+- Tier-1 MicroVM guest dispatch: the engine boots the guest, serves one
+  exec session over vsock to the in-guest agent, streams its stdio, and
+  tears the VM down (`runner exec --driver microvm` runs workloads now).
+- New `runner-guest-agent` crate (blocking std, zero non-workspace deps):
+  shared NDJSON protocol (`ExecRequest`/`ExecChunk`/`ExecResult`, base64
+  stdio), raw-libc vsock dial, timeout kills with exit `124`, plus a
+  `--uds` loopback seam for testing without vsock.
+- Host dispatcher rejects oversized lines, unknown streams, and bad
+  base64; the socket file is removed on every path; no-KVM and
+  no-image failures stay clean errors with zero host execution.
+- `docs/microvm-tier.md`: protocol, rootfs-baking recipe, vsock
+  assumptions. Live KVM boots stay manual-only; UDS loopback tests
+  (`test_vsock_dispatch`, guest `test_uds_smoke`) are the CI gates.
+
 ## v1.2.0 — 2026-11-20
 
 - Real `runner init` onboarding: writes `~/.config/runner/config.toml`

@@ -1,0 +1,16 @@
+[package]
+name = "runner-guest-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tier-1 in-guest exec agent: runs commands inside Firecracker guests over vsock"
+
+[[bin]]
+name = "runner-guest-agent"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+libc.workspace = true

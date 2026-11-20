@@ -6,6 +6,23 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.7.1 — 2026-11-20
+
+- Supply-chain gates: `deny.toml` policy (duplicate bans, permissive
+  licenses, advisories, crates.io-only sources) enforced by a new CI
+  step, releases build with `--locked`, and the tokio `full` feature
+  shrinks to the 10 actually-used features. Dependencies unified
+  where possible (nix 0.31, base64 0.23); the syn 2/3 proc-macro
+  split and the base64 ecosystem split stay documented skips.
+- eBPF egress hardening: the IPv6 filter walks up to 4 extension
+  headers (Hop-by-Hop, Routing, Fragment, Destination Options)
+  instead of assuming a fixed 40-byte header, closing the
+  header-chaining port-smuggling bypass; non-first fragments and
+  unwalkable headers drop. Packet-level tests pin the walk.
+- Documentation truth: new `docs/cache-isolation.md`, spec §8/§9
+  aligned with the shipped CLI and release history, `// SAFETY:`
+  comments on the terminal handling in `top.rs`.
+
 ## v1.7.0 — 2026-11-20
 
 - Per-repo cache isolation: the transparent proxy namespaces entries

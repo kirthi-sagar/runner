@@ -44,7 +44,7 @@ jobs:
       - name: Build release binary
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p runner-cli
+        run: cargo build --locked --release --target ${{ matrix.target }} -p runner-cli
 
       - name: Smoke-test release binary (native)
         if: matrix.target == 'x86_64-unknown-linux-gnu'

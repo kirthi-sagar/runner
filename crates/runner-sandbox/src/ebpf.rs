@@ -12,8 +12,10 @@
 //! Multi-byte absolute loads yield big-endian (network-order) values, so
 //! port constants compare directly against 53/443. IPv4 transport offsets
 //! derive dynamically from the IHL nibble (RFC 791), so IP options never
-//! shift port matching. IPv6 keeps a fixed 40-byte header assumption;
-//! extension-header walking is the remaining hardening follow-up.
+//! shift port matching. IPv6 walks up to [`MAX_V6_EXTENSIONS`] extension
+//! headers (RFC 8200 §4) the same way — Hop-by-Hop, Routing, Fragment,
+//! Destination Options — so header chaining never shifts port matching
+//! either. Anything the walker cannot parse drops.
 
 /// eBPF opcode classes and ALU/JMP operation codes (linux/bpf.h).
 pub mod op {
@@ -99,6 +101,28 @@ pub fn ld_ind(size_opcode: u8, src: u8, offset: u32) -> BpfInstruction {
         src_reg: src,
         off: 0,
         imm: offset as i32,
+    }
+}
+
+/// 64-bit register-register ALU (dst op= src), e.g. ADD64_REG.
+pub fn alu64_reg(op: u8, dst: u8, src: u8) -> BpfInstruction {
+    BpfInstruction {
+        code: 0x0f | op,
+        dst_reg: dst,
+        src_reg: src,
+        off: 0,
+        imm: 0,
+    }
+}
+
+/// 64-bit immediate move (dst = imm).
+pub fn mov64_imm(dst: u8, imm: i32) -> BpfInstruction {
+    BpfInstruction {
+        code: op::MOV64_IMM,
+        dst_reg: dst,
+        src_reg: 0,
+        off: 0,
+        imm,
     }
 }
 
@@ -194,6 +218,10 @@ impl Assembler {
     }
 }
 
+/// Maximum IPv6 extension headers walked before dropping (unrolled
+/// stages; a fifth header means the transport offset stays unresolved).
+pub const MAX_V6_EXTENSIONS: usize = 4;
+
 /// Egress filter policy: blocked ranges + port whitelist.
 #[derive(Debug, Clone)]
 pub struct EgressFilterProgram {
@@ -255,12 +283,9 @@ impl EgressFilterProgram {
         asm.emit(ld_abs(LD_ABS_B, 24));
         asm.emit(alu64_imm(0x50, 0, 0xfe));
         asm.jump(0x10, 0, 0xfc, "drop");
-        asm.emit(ld_abs(LD_ABS_B, 6));
-        asm.jump(0x10, 0, 6, "tcp_v6");
-        asm.jump(0x10, 0, 17, "udp_v6");
-        asm.jump(0x00, 0, 0, "drop");
-        self.emit_port_check(&mut asm, "tcp_v6", 6, 42);
-        self.emit_port_check(&mut asm, "udp_v6", 17, 42);
+        self.emit_v6_walk(&mut asm);
+        self.emit_port_check(&mut asm, "tcp_v6", 6);
+        self.emit_port_check(&mut asm, "udp_v6", 17);
 
         asm.label("allow");
         for insn in exit_ok() {
@@ -273,19 +298,85 @@ impl EgressFilterProgram {
         asm.finish()
     }
 
-    fn emit_port_check(&self, asm: &mut Assembler, label: &str, proto: u8, dport_off: u32) {
+    /// IPv6 port check at the walked transport offset: R1 holds the
+    /// header offset (placed by [`Self::emit_v6_walk`]) and the
+    /// destination port loads indirectly from R1 + 2.
+    fn emit_port_check(&self, asm: &mut Assembler, label: &str, proto: u8) {
         asm.label(label);
         let port = self
             .allowed_ports
             .iter()
             .find(|(p, _)| *p == proto)
             .map(|(_, port)| *port as i32);
-        asm.emit(ld_abs(op::LD_ABS_H, dport_off));
+        asm.emit(ld_ind(op::LD_IND_H, 1, 2));
         match port {
             Some(port) => asm.jump(0x10, 0, port, "allow"),
             None => asm.jump(0x00, 0, 0, "drop"),
         }
         asm.jump(0x00, 0, 0, "drop");
+    }
+
+    /// IPv6 extension-header walk (RFC 8200 §4), unrolled into
+    /// [`MAX_V6_EXTENSIONS`] advancing stages plus one terminal
+    /// dispatch (no backward jumps: socket-filter BPF is straight-line
+    /// by design). R1 carries the current header offset (starts at
+    /// 40), R0 the next-header selector. Each stage dispatches TCP
+    /// (6)/UDP (17) to the port checks, advances over Hop-by-Hop (0),
+    /// Routing (43), and Destination Options (60) by `(Hdr Ext Len +
+    /// 1) * 8`, and over first-fragments (44, zero frag offset) by 8.
+    /// Anything else — ESP/AH/unknown headers, non-first fragments
+    /// (no transport header to check), truncated reads (OOB loads
+    /// yield 0, which never matches a port), or a fifth extension —
+    /// drops. Fail-closed: whatever the walker cannot parse never
+    /// reaches `allow`.
+    fn emit_v6_walk(&self, asm: &mut Assembler) {
+        asm.emit(mov64_imm(1, 40)); // R1 = base header length
+        asm.emit(ld_abs(op::LD_ABS_B, 6)); // R0 = first next-header
+        for stage in 0..MAX_V6_EXTENSIONS {
+            let next = if stage + 1 < MAX_V6_EXTENSIONS {
+                format!("walk{}", stage + 1)
+            } else {
+                // Last stage advances onto the terminal dispatch, so a
+                // full 4-header chain still resolves its transport.
+                "walk_term".to_string()
+            };
+            asm.label(&format!("walk{stage}"));
+            asm.jump(0x10, 0, 6, "tcp_v6"); // JEQ_IMM
+            asm.jump(0x10, 0, 17, "udp_v6");
+            asm.jump(0x10, 0, 0, &format!("extv{stage}")); // Hop-by-Hop
+            asm.jump(0x10, 0, 43, &format!("extv{stage}")); // Routing
+            asm.jump(0x10, 0, 60, &format!("extv{stage}")); // Dest Options
+            asm.jump(0x10, 0, 44, &format!("extf{stage}")); // Fragment
+            asm.jump(0x00, 0, 0, "drop"); // JA: ESP/AH/unknown
+                                          // Variable-length header: R1 += (Hdr Ext Len + 1) * 8, then
+                                          // re-read the following next-header byte.
+            asm.label(&format!("extv{stage}"));
+            asm.emit(ld_ind(op::LD_IND_B, 1, 1));
+            asm.emit(alu64_imm(0x00, 0, 1)); // ADD64_IMM
+            asm.emit(alu64_imm(0x60, 0, 3)); // LSH64_IMM: * 8
+            asm.emit(alu64_reg(0x00, 1, 0)); // ADD64_REG: R1 += R0
+            asm.emit(ld_ind(op::LD_IND_B, 1, 0));
+            asm.jump(0x00, 0, 0, &next); // JA
+                                         // Fragment: fixed 8 bytes, but only zero-offset first
+                                         // fragments carry a transport header (bytes R1+2..R1+3 hold
+                                         // the 13-bit offset in the top bits; mask 0xFFF8).
+            asm.label(&format!("extf{stage}"));
+            asm.emit(ld_ind(op::LD_IND_H, 1, 2));
+            asm.emit(alu64_imm(0x50, 0, 0xfff8)); // AND64_IMM
+            asm.jump(0x10, 0, 0, &format!("fragok{stage}"));
+            asm.jump(0x00, 0, 0, "drop"); // JA: non-first fragment
+            asm.label(&format!("fragok{stage}"));
+            asm.emit(alu64_imm(0x00, 1, 8)); // ADD64_IMM: R1 += 8
+            asm.emit(ld_ind(op::LD_IND_B, 1, 0));
+            asm.jump(0x00, 0, 0, &next); // JA
+        }
+        // Terminal dispatch after the fourth advance: transport
+        // protocols resolve, a fifth extension (or anything else)
+        // drops.
+        asm.label("walk_term");
+        asm.jump(0x10, 0, 6, "tcp_v6"); // JEQ_IMM
+        asm.jump(0x10, 0, 17, "udp_v6");
+        asm.jump(0x00, 0, 0, "drop"); // JA
     }
 
     /// IPv4 port check with dynamic IHL walking (RFC 791): R1 ends up
@@ -412,9 +503,11 @@ mod tests {
                 .count(),
             2
         );
-        // Indirect half-word loads from R1 + 2 (dst port).
+        // Indirect half-word loads from R1 + 2: two v4 dst ports
+        // (IHL-derived), two v6 dst ports (walk-derived), and four
+        // fragment-offset words (one per walk stage).
         let inds: Vec<_> = insns.iter().filter(|i| i.code == op::LD_IND_H).collect();
-        assert_eq!(inds.len(), 2);
+        assert_eq!(inds.len(), 8);
         assert!(inds.iter().all(|i| i.src_reg == 1 && i.imm == 2));
         // Malformed headers (IHL < 5, i.e. length < 20) drop.
         assert_eq!(
@@ -424,9 +517,10 @@ mod tests {
                 .count(),
             2
         );
-        // No fixed-offset v4 port load remains; v6 keeps offset 42.
+        // No fixed-offset port load remains on either path (v4 used 22,
+        // v6 used 42 before the walk).
         assert!(!insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == 22));
-        assert!(insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == 42));
+        assert!(!insns.iter().any(|i| i.code == op::LD_ABS_H && i.imm == 42));
     }
 
     /// Test-only semantic mirror of the v4 program path: version, range

@@ -274,10 +274,15 @@ impl RawGuard {
     fn enter() -> Option<Self> {
         use std::os::unix::io::AsRawFd;
         let fd = std::io::stdin().as_raw_fd();
+        // SAFETY: isatty takes any fd (invalid ones return 0 with errno).
         if unsafe { libc::isatty(fd) } != 1 {
             return None;
         }
+        // SAFETY: termios is a plain-old-data struct; all-zero is a valid
+        // (if meaningless) value, immediately overwritten by tcgetattr.
         let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: fd is a live stdin descriptor and orig is a valid,
+        // correctly aligned out-pointer for this call's duration.
         if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
             return None;
         }
@@ -285,6 +290,8 @@ impl RawGuard {
         raw.c_lflag &= !(libc::ICANON | libc::ECHO);
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
+        // SAFETY: same live fd; raw is a valid termios read (tcgetattr
+        // output with flag/byte tweaks, still well-formed).
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return None;
         }
@@ -304,6 +311,9 @@ impl RawGuard {
 
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        // SAFETY: restores the termios captured at enter() on the same
+        // live stdin fd; best-effort (a failing restore must not panic
+        // in Drop, so the return value is ignored).
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
         }
@@ -312,6 +322,7 @@ impl Drop for RawGuard {
 
 fn stdout_is_tty() -> bool {
     use std::os::unix::io::AsRawFd;
+    // SAFETY: isatty takes any fd (invalid ones return 0 with errno).
     unsafe { libc::isatty(std::io::stdout().as_raw_fd()) == 1 }
 }
 

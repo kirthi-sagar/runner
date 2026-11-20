@@ -1,0 +1,63 @@
+# Supply-chain policy for `cargo deny check` (CI gate).
+# Baseline: duplicate versions denied, permissive licenses only,
+# vulnerabilities/unmaintained/yanked denied, crates.io-only sources.
+
+[graph]
+# The full target set we ship (Linux + macOS, x64 + ARM).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# Vulnerabilities always error (no opt-out in current cargo-deny).
+yanked = "deny"
+unmaintained = "all"
+ignore = []
+
+[licenses]
+# Workspace crates are MIT; allow the common permissive set only.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unlicense",
+    # ICU crates (transitive via idna/reqwest).
+    "Unicode-3.0",
+    # Mozilla CA bundle data (transitive via rustls/webpki-roots).
+    "CDLA-Permissive-2.0",
+]
+private = { ignore = true }
+
+[bans]
+multiple-versions = "deny"
+wildcards = "warn"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = [
+    # syn 2 (curve25519/tracing/zeroize derives) + syn 3
+    # (async-trait/clap derives): proc-macro-only crates that never
+    # ship in the binary, required at incompatible majors by
+    # upstream. Revisit when the 2.x users migrate.
+    { name = "syn", version = "2" },
+    # base64 0.22 (reqwest/boringtun/jsonwebtoken) + 0.23
+    # (hyper-util, and our own workspace requirement): upstream
+    # ecosystem split mid-migration. Revisit on reqwest/boringtun
+    # updates; both lines are maintained releases.
+    { name = "base64", version = "0.22.1" },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

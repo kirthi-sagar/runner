@@ -590,55 +590,60 @@ runs-on: ${{ (vars.USE_LOCAL_RUNNER == 'true') && fromJSON('["self-hosted", "run
 
 ## 8. CLI Reference & MCP Tool Specification
 
+> Aligned with the shipped CLI as of v1.7.x (the codebase and
+> `README.md` are normative; the original RFC draft below it is kept
+> for history). Not every RFC-sketched command shipped: `reserve`,
+> `release`, `inspect-logs`, `mesh init`, and `mesh token create`
+> were never implemented — slot reservation is automatic, failure
+> inspection lives in `status`/`top`/MCP tools, and mesh onboarding
+> is `mesh invite` + `join`.
+
 ### Core Management CLI
 ```bash
 # Initialize runner configuration on host
-runner init --org=resub-health --token=<github-pat>
+runner init --repo=owner/name --token=<github-pat>
 
 # Start coordinator daemon
-runner start --daemon
+runner start [--daemon]
 
 # Start as Model Context Protocol (MCP) server for AI agents
-runner mcp --transport=stdio
+runner mcp
 
-# Stop daemon gracefully
-runner stop --graceful
+# Stop daemon gracefully (SIGTERM; --force for SIGKILL)
+runner stop [--force]
+
+# Preflight health checklist (text or --format json)
+runner doctor [--format json]
 ```
 
 ### Agent Inspection & Control CLI
 ```bash
 # Query real-time machine health, slot availability, and job statuses
-runner status --format=json
+runner status --format json
 
-# Reserve hardware for agent local compilation
-runner reserve --cores=4 --ram=8G --duration=10m --reason="codex-local-compilation"
-
-# Release active reservation
-runner release --reservation-id="res-7712"
+# Live fleet/process monitor (q to quit)
+runner top
 
 # Temporarily throttle runner to minimum priority (cpu.weight: 1)
-runner throttle --level=high --duration=15m
+runner throttle --level high --duration 15
 
-# Inspect failures from the last completed job
-runner inspect-logs --job=<job_id> --format=json
+# Execute one command under supervision inside the zero-freeze sandbox
+runner exec -- <command>
+
+# Inspect transparent cache contents and hit rates
+runner cache stats
 ```
 
 ### Multi-PC Mesh CLI
 ```bash
-# Initialize local LAN mesh cluster (on primary coordinator)
-runner mesh init
+# Mint a signed invitation token + show coordinator pubkey
+runner mesh invite --ttl 1h
 
-# Generate encrypted join token for a secondary machine
-runner mesh token create --ttl=1h
+# Join a mesh with an invitation token (on the joining machine)
+runner join <token> --coordinator <host:port> --coordinator-pubkey <key>
 
-# Join mesh cluster (on secondary machine)
-runner join <mesh-token>
-
-# List all connected nodes on the LAN
-runner mesh list --format=json
-
-# Inspect distributed cache hit rates
-runner cache stats
+# List mesh peers (WAN) or browse LAN nodes
+runner mesh list [--lan] [--format json]
 ```
 
 ---
@@ -678,6 +683,18 @@ runner cache stats
 |  - Starter GitHub Actions workflow templates and open-source release                    |
 +-----------------------------------------------------------------------------------------+
 ```
+
+> Shipped amendments (authoritative errata as of v1.7.x — the diagram
+> above is the original RFC record). Wording corrections: the
+> supervisor is Rust-only ("Rust/Go" never materialized); MCP is
+> stdio-only (no SSE transport); mesh dispatch runs over Noise-UDP
+> via boringtun (no mTLS, no TUN — the daemon stays unprivileged).
+> Delivered beyond Phase 4: v1.4 WAN peer WireGuard transport, v1.5
+> macOS port, v1.6 STUN NAT traversal, v1.7 per-repo cache isolation
+> + doctor NAT diagnostics, plus the OIDC control plane, eBPF egress
+> filter, spend ledger, and supply-chain gates (`deny.toml`, `--locked`
+> releases) along the way. See `CHANGELOG.md` and `ROADMAP.md` for
+> the release-by-release record.
 
 ---
 

@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.7.0 and prior)
+## Shipped (v1.7.1 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -22,8 +22,14 @@ services or heavyweight frameworks.
   routing through cone + symmetric NAT, JoinAccept).
 - Per-repo cache isolation (`owner/repo` namespacing, legacy `global`
   fallback) + doctor NAT diagnostics.
+- Supply-chain gates, pruned tokio, IPv6 eBPF walk, docs truth (v1.7.1).
 
-## Current: v1.7.0 (Per-Repo Cache Isolation & Doctor NAT Diagnostics)
+## Current: v1.7.1 (Supply Chain, Hardening & Documentation Truth)
+
+- `deny.toml` + audit CI gate, `--locked` releases, minimal tokio.
+- IPv6 extension-header walk, SAFETY docs, spec alignment.
+
+## Shipped in v1.7.0: Per-Repo Cache Isolation & Doctor NAT Diagnostics
 
 - Scoped proxy routes + store indices; slug injection on both paths.
 - `doctor` reports reflexive address + NAT class (never fails offline).

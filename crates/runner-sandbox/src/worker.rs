@@ -380,7 +380,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.exit_code, Some(0));
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), "process\n");
+        // The hook applies once per spawn attempt, and the deliberate
+        // ETXTBSY retry (spawn_with_busy_retry) may legitimately apply
+        // it twice under parallel CI load — so assert placement
+        // (nonempty, all lines valid), not an exact count.
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !logged.is_empty() && logged.lines().all(|line| line == "process"),
+            "QoS hook must apply at least once per spawn; got: {logged:?}"
+        );
         // A failing backend never fails the spawn.
         let failing = Arc::new(MockQos::new());
         failing.set_failing();

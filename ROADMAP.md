@@ -22,6 +22,13 @@ services or heavyweight frameworks.
 - Transient spawn retry, zero doc warnings, opt-in live-KVM harness.
 - No behavior change beyond reliability; patch release.
 
+## Next: v1.3.2 (targeted patch, unscheduled)
+
+- Verify the Firecracker UDS direction contract (`<uds>_<port>` listen
+  + `CONNECT` handshake) against a live binary; rework the Tier-1
+  dispatcher path and tighten the live harness assertion accordingly.
+- Blocked on a live Firecracker environment; not started.
+
 ## Shipped in v1.3.0: Tier-1 vsock Guest Dispatch
 
 - `exec --driver microvm` runs workloads via the in-guest agent over

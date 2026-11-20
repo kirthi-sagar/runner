@@ -40,9 +40,18 @@ base64; either side timing out kills the command (the agent reports the
 conventional exit code `124` for overruns it kills itself).
 
 vsock assumptions: the agent dials host CID `2`, port `5000`
-(`HOST_CID` / `GUEST_VSOCK_PORT`). Firecracker's UDS-backed vsock
-forwards guest connections to the host listener regardless of port, so
-the port is a convention, documented here and in code.
+(`HOST_CID` / `GUEST_VSOCK_PORT`).
+
+> **Firecracker UDS direction contract (unverified live):** per the
+> Firecracker API model docs, for host-initiated connections Firecracker
+> itself binds/listens on `uds_path`, and the host connects and sends
+> `CONNECT <port>\n`; guest-initiated dials surface at
+> `<uds_path>_<PORT>` on a host-listening socket. Our dispatcher
+> currently binds the bare `vsock_path`, which likely mismatches a live
+> Firecracker (expect a clean bind/timeout error, never silent
+> misbehavior). Tracked for a targeted v1.3.2 patch once a live
+> Firecracker environment is available; the UDS loopback contract used
+> by the CI gates is unchanged.
 
 ## Baking the agent into the rootfs
 

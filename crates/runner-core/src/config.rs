@@ -47,6 +47,27 @@ pub struct MeshConfig {
     /// Hex-encoded 32-byte secret. Generated on first `mesh invite`.
     #[serde(default)]
     pub secret: Option<String>,
+    /// This node's WireGuard private key (base64). Generated on first
+    /// `mesh invite` (coordinator) or `join` (peer); the 0600 config
+    /// file is its only store — it is never printed after generation.
+    #[serde(default)]
+    pub node_key: Option<String>,
+    /// UDP port for the WAN peer transport. `None` (default) disables
+    /// the listener entirely; set it to federate (direct/LAN peers).
+    #[serde(default)]
+    pub peer_port: Option<u16>,
+    /// Coordinator `host:port` for join-announce (joiner side, from
+    /// `runner join --coordinator`). Unset on pure coordinators.
+    #[serde(default)]
+    pub coordinator: Option<String>,
+    /// Coordinator WireGuard public key (joiner side, from
+    /// `runner join --coordinator-pubkey`). Unset on pure coordinators.
+    #[serde(default)]
+    pub coordinator_pubkey: Option<String>,
+    /// Invitation token (joiner side, stored at join for re-announce;
+    /// 0600 file). Expires per its TTL; re-join afterwards.
+    #[serde(default)]
+    pub join_token: Option<String>,
 }
 
 /// Donor caps applied when this host serves foreign jobs.

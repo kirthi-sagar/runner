@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.3.1 and prior)
+## Shipped (v1.4.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -16,18 +16,24 @@ services or heavyweight frameworks.
 - Real `runner init` onboarding (config merge, token store, layout seed).
 - Tier-1 vsock guest dispatch (`runner-guest-agent`, loopback-gated).
 - Zero-flake spawn retry, zero doc warnings, opt-in live-KVM harness.
+- WAN peer WireGuard execution transport (loopback-gated, direct peers).
 
-## Current: v1.3.1 (Zero-Flake Hardening & Test Harness)
+## Current: v1.4.0 (WAN Peer WireGuard Execution Transport)
 
-- Transient spawn retry, zero doc warnings, opt-in live-KVM harness.
-- No behavior change beyond reliability; patch release.
+- Coordinator dispatches to `active` peers over Noise-encrypted UDP.
+- Join-announce onboarding, donor caps, leases, loopback gates.
 
-## Next: v1.3.2 (targeted patch, unscheduled)
+## Next: v1.4.1 (targeted patch, unscheduled)
 
 - Verify the Firecracker UDS direction contract (`<uds>_<port>` listen
   + `CONNECT` handshake) against a live binary; rework the Tier-1
   dispatcher path and tighten the live harness assertion accordingly.
 - Blocked on a live Firecracker environment; not started.
+
+## Shipped in v1.3.1: Zero-Flake Hardening & Test Harness
+
+- Transient spawn retry, zero doc warnings, opt-in live-KVM harness.
+- No behavior change beyond reliability; patch release.
 
 ## Shipped in v1.3.0: Tier-1 vsock Guest Dispatch
 
@@ -153,10 +159,10 @@ services or heavyweight frameworks.
 - Per-repo isolation once the protocol can carry repo identity
   (standard clients send none).
 
-## Later: post-v1.0 enterprise extensions
+## Later: post-v1.4 enterprise extensions
 
-- WAN peer WireGuard execution transport (routing stays
-  fail-closed to cloud burst / wait until this ships).
+- NAT traversal for WAN peers (STUN/ICE/DERP hole-punching; direct
+  endpoints only today).
 
 ## Explicit non-goals
 

@@ -166,22 +166,30 @@ pub enum RouteDecision {
 /// Route one job: local slot → active, non-drained WAN peer → cloud
 /// burst → wait. Peers route only while their handshake status reads
 /// `active` (fail closed: `join` persists `joining`, so unproven
-/// peers never receive jobs). `cloud_provider` is the resolved burst
-/// target (`None` when no cloud provider is configured); routing never
-/// hardcodes a provider name.
+/// peers never receive jobs), their donor caps cover the job minimums,
+/// and their in-flight load is below their cap-derived max.
+/// `cloud_provider` is the resolved burst target (`None` when no cloud
+/// provider is configured); routing never hardcodes a provider name.
 pub fn route_job(
     local_slots_free: u32,
     peers: &[runner_core::config::PeerRecord],
     drained: &std::collections::HashMap<String, String>,
+    peer_load: &std::collections::HashMap<String, u32>,
+    job_min_cores: f64,
+    job_min_ram_mb: u64,
     cloud_provider: Option<&str>,
 ) -> RouteDecision {
     if local_slots_free > 0 {
         return RouteDecision::Local;
     }
-    if let Some(peer) = peers
-        .iter()
-        .find(|p| p.status == "active" && !drained.contains_key(&p.node_id))
-    {
+    if let Some(peer) = peers.iter().find(|p| {
+        p.status == "active"
+            && !drained.contains_key(&p.node_id)
+            && f64::from(p.max_cores) >= job_min_cores
+            && p.max_ram_mb >= job_min_ram_mb
+            && peer_load.get(&p.node_id).copied().unwrap_or(0)
+                < runner_core::mesh::peer::peer_max_jobs(p.max_cores, p.max_ram_mb)
+    }) {
         return RouteDecision::WanPeer {
             node_id: peer.node_id.clone(),
         };
@@ -232,51 +240,99 @@ pub struct DispatchContext {
     pub cache_token: Option<String>,
 }
 
-/// Dispatch one job locally: mint JIT → cache worker → sandbox → supervise.
-pub async fn dispatch_local(
-    job: &QueuedJob,
-    ctx: &DispatchContext,
+/// Worker run inputs shared by local dispatch (mints first) and peer
+/// execution (uses the received blob).
+#[derive(Debug, Clone)]
+pub(crate) struct WorkerRunConfig {
+    pub worker_version: String,
+    pub jit_blob: String,
+    pub job_tag: String,
+    pub job_name: String,
+    pub sandboxed: bool,
+    pub cache: Option<(String, String)>,
+    pub timeout: Duration,
+}
+
+/// Mint one JIT config for a job (shared by local + peer dispatch).
+pub(crate) async fn mint_jit(
+    github: &GithubClient,
+    scope: &JitScope,
+    req: &JitRequest,
+) -> Result<super::jit::JitResponse, String> {
+    match scope {
+        JitScope::Org { org } => generate_org_jit(github, org, req).await,
+        JitScope::Repo { owner, repo } => generate_repo_jit(github, owner, repo, req).await,
+    }
+}
+
+/// Run one worker to completion from a pre-minted JIT blob: validate,
+/// cache the worker package, sandbox, supervise. The single hook for
+/// both local dispatch and peer execution (no duplicated worker path).
+pub(crate) async fn run_worker_with_jit(
+    cfg: &WorkerRunConfig,
     slice: Option<&runner_core::governor::cgroup::CgroupSlice>,
 ) -> Result<runner_sandbox::worker::WorkerOutcome, String> {
     use runner_sandbox::mounts::Workspace;
     use runner_sandbox::worker::{ensure_cached, run_supervised, WorkerLaunch};
 
-    let req = JitRequest {
-        name: format!("runner-{}-{}", job.run_id, job.id),
-        runner_group_id: ctx.runner_group_id,
-        labels: vec!["self-hosted".to_string(), "runner".to_string()],
-        work_folder: "_work".to_string(),
-    };
-    let jit = match &ctx.scope {
-        JitScope::Org { org } => generate_org_jit(&ctx.github, org, &req).await?,
-        JitScope::Repo { owner, repo } => generate_repo_jit(&ctx.github, owner, repo, &req).await?,
-    };
-    super::jit::decode_jit_config(&jit.encoded_jit_config)?;
-
-    let work_dir = ensure_cached(&ctx.worker_version).await?;
-    let workspace =
-        Workspace::create(&format!("job-{}", job.id)).map_err(|e| format!("workspace: {e}"))?;
-    let mut launch = WorkerLaunch::new(work_dir, jit.encoded_jit_config);
-    if ctx.sandboxed {
+    super::jit::decode_jit_config(&cfg.jit_blob)?;
+    let work_dir = ensure_cached(&cfg.worker_version).await?;
+    let workspace = Workspace::create(&format!("job-{}", cfg.job_tag))
+        .map_err(|e| format!("workspace: {e}"))?;
+    let mut launch = WorkerLaunch::new(work_dir, cfg.jit_blob.clone());
+    if cfg.sandboxed {
         let spec = workspace.sandbox_spec()?;
         launch = launch.sandboxed(spec);
     }
     // Transparent LAN cache: no cache_url means the proxy failed to
     // bind at boot, and the worker falls back to upstream caching.
-    if let (Some(url), Some(token)) = (ctx.cache_url.as_deref(), ctx.cache_token.as_deref()) {
+    // WAN peers never receive the coordinator's LAN cache endpoint.
+    if let Some((url, token)) = cfg.cache.as_ref() {
         for (key, value) in runner_core::cache::server::worker_env(url, token) {
             launch = launch.env(key, value);
         }
     }
     eprintln!(
         "runner: dispatching job {} ({}) sandboxed={}",
-        job.id, job.name, ctx.sandboxed
+        cfg.job_tag, cfg.job_name, cfg.sandboxed
     );
-    let outcome = run_supervised(&launch, slice, ctx.timeout)
+    let outcome = run_supervised(&launch, slice, cfg.timeout)
         .await
         .map_err(|e| format!("worker spawn: {e}"))?;
-    eprintln!("runner: job {} finished: {:?}", job.id, outcome);
+    eprintln!("runner: job {} finished: {:?}", cfg.job_tag, outcome);
     Ok(outcome)
+}
+
+/// Dispatch one job locally: mint JIT → cache worker → sandbox → supervise.
+pub async fn dispatch_local(
+    job: &QueuedJob,
+    ctx: &DispatchContext,
+    slice: Option<&runner_core::governor::cgroup::CgroupSlice>,
+) -> Result<runner_sandbox::worker::WorkerOutcome, String> {
+    let req = JitRequest {
+        name: format!("runner-{}-{}", job.run_id, job.id),
+        runner_group_id: ctx.runner_group_id,
+        labels: vec!["self-hosted".to_string(), "runner".to_string()],
+        work_folder: "_work".to_string(),
+    };
+    let jit = mint_jit(&ctx.github, &ctx.scope, &req).await?;
+    let cache = match (ctx.cache_url.clone(), ctx.cache_token.clone()) {
+        (Some(url), Some(token)) => Some((url, token)),
+        _ => None,
+    };
+    run_worker_with_jit(
+        &WorkerRunConfig {
+            worker_version: ctx.worker_version.clone(),
+            jit_blob: jit.encoded_jit_config,
+            job_tag: job.id.to_string(),
+            job_name: job.name.clone(),
+            sandboxed: ctx.sandboxed,
+            cache,
+            timeout: ctx.timeout,
+        },
+        slice,
+    )
+    .await
 }
 
 /// Coordinator poll loop: poll queued jobs, route each one, and execute
@@ -409,14 +465,21 @@ pub async fn run_coordinator(
             guard.set_queue_depth(jobs.len() as u32);
             guard.record_forge_poll("github", jobs.len() as u32, None);
         }
+        {
+            let mut guard = state.write().await;
+            for (provider, id, node) in guard.release_expired_leases(Instant::now()) {
+                eprintln!("runner: peer lease expired for {provider}/{id} on {node}; re-queueing");
+            }
+        }
         for job in jobs {
-            let (free, peers, drained, flying) = {
+            let (free, peers, drained, flying, peer_load) = {
                 let guard = state.read().await;
                 (
                     guard.last_slots.saturating_sub(guard.in_flight()),
                     guard.peers(),
                     guard.drained_nodes(),
                     guard.in_flight_jobs(),
+                    guard.peer_load(),
                 )
             };
             if already_in_flight(&flying, "github", &job.id.to_string()) {
@@ -427,7 +490,16 @@ pub async fn run_coordinator(
                 continue;
             }
             let cloud_provider = cloud.as_ref().and_then(|pool| pool.preferred_provider());
-            match route_job(free, &peers, &drained, cloud_provider.as_deref()) {
+            let (min_cores, min_ram) = runner_core::mesh::peer::parse_job_minimums(&job.labels);
+            match route_job(
+                free,
+                &peers,
+                &drained,
+                &peer_load,
+                min_cores,
+                min_ram,
+                cloud_provider.as_deref(),
+            ) {
                 RouteDecision::Local => {
                     eprintln!("runner: job {} ({}) routed local", job.id, job.name);
                     if let Some(ctx) = dispatch.clone() {
@@ -462,21 +534,36 @@ pub async fn run_coordinator(
                     }
                 }
                 RouteDecision::WanPeer { node_id } => {
-                    // No remote execution transport exists yet: an
-                    // active peer was selected, but handoff cannot
-                    // proceed, so fail closed to cloud-or-wait in this
-                    // same tick. Peers are excluded from the recompute
-                    // so the fallback cannot loop back here.
-                    eprintln!(
-                        "runner: job {} ({}) peer {node_id} handoff unavailable; falling back",
-                        job.id, job.name
-                    );
-                    match route_job(free, &[], &drained, cloud_provider.as_deref()) {
-                        RouteDecision::Cloud { provider } => {
-                            burst_cloud(&job, &provider, &cloud, auto, &state).await;
-                        }
-                        _ => {
-                            eprintln!("runner: job {} ({}) waiting for capacity", job.id, job.name)
+                    // Any handoff failure (decline, timeout, transport
+                    // down) falls back to cloud-or-wait in this same
+                    // tick. Peers are excluded from the recompute so
+                    // the fallback cannot loop back here.
+                    match try_peer_dispatch(&job, &node_id, dispatch.as_ref(), &state).await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "runner: job {} ({}) peer {node_id} handoff failed ({e}); falling back",
+                                job.id, job.name
+                            );
+                            match route_job(
+                                free,
+                                &[],
+                                &drained,
+                                &HashMap::new(),
+                                0.0,
+                                0,
+                                cloud_provider.as_deref(),
+                            ) {
+                                RouteDecision::Cloud { provider } => {
+                                    burst_cloud(&job, &provider, &cloud, auto, &state).await;
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "runner: job {} ({}) waiting for capacity",
+                                        job.id, job.name
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -495,6 +582,49 @@ pub async fn run_coordinator(
         // Scale-to-zero runs in the standalone watchdog task
         // (`spawn_cloud_watchdog`), independent of this loop.
     }
+}
+
+/// Dispatch one job to a WAN peer: mint JIT, offer, await accept,
+/// record the in-flight entry + lease. Requires auto-dispatch and a
+/// live transport, preserving log-only mode when either is off.
+async fn try_peer_dispatch(
+    job: &QueuedJob,
+    node_id: &str,
+    dispatch: Option<&DispatchContext>,
+    state: &runner_core::governor::supervisor::SharedState,
+) -> Result<(), String> {
+    let ctx = dispatch.ok_or("auto-dispatch off")?;
+    let tx = state
+        .read()
+        .await
+        .peer_transport()
+        .ok_or("peer transport off")?;
+    let req = JitRequest {
+        name: format!("runner-peer-{}-{}", job.run_id, job.id),
+        runner_group_id: ctx.runner_group_id,
+        labels: vec!["self-hosted".to_string(), "runner".to_string()],
+        work_folder: "_work".to_string(),
+    };
+    let jit = mint_jit(&ctx.github, &ctx.scope, &req).await?;
+    super::jit::decode_jit_config(&jit.encoded_jit_config)?;
+    crate::wan::dispatch_to_peer(
+        &tx,
+        state,
+        runner_core::mesh::proto::JobOffer {
+            proto: runner_core::mesh::proto::PROTO_TAG.to_string(),
+            provider: "github".to_string(),
+            job_id: job.id,
+            run_id: job.run_id,
+            name: job.name.clone(),
+            labels: job.labels.clone(),
+            jit_blob: jit.encoded_jit_config,
+            worker_version: ctx.worker_version.clone(),
+            timeout_secs: ctx.timeout.as_secs().max(1),
+        },
+        ctx.timeout,
+        node_id,
+    )
+    .await
 }
 
 /// Cloud burst for one job: hard budget stop, dedup record, async
@@ -728,31 +858,115 @@ mod tests {
             max_ram_mb: 8192,
             status: "active".to_string(),
         };
+        let no_load = HashMap::new();
         assert_eq!(
-            route_job(1, &[], &HashMap::new(), None),
+            route_job(1, &[], &HashMap::new(), &no_load, 0.0, 0, None),
             RouteDecision::Local
         );
         assert_eq!(
-            route_job(0, std::slice::from_ref(&peer), &HashMap::new(), None),
+            route_job(
+                0,
+                std::slice::from_ref(&peer),
+                &HashMap::new(),
+                &no_load,
+                0.0,
+                0,
+                None
+            ),
             RouteDecision::WanPeer {
                 node_id: "n1".to_string()
             }
         );
         assert_eq!(
-            route_job(0, &[], &HashMap::new(), Some("digitalocean")),
+            route_job(
+                0,
+                &[],
+                &HashMap::new(),
+                &no_load,
+                0.0,
+                0,
+                Some("digitalocean")
+            ),
             RouteDecision::Cloud {
                 provider: "digitalocean".to_string()
             }
         );
         assert_eq!(
-            route_job(0, &[], &HashMap::new(), None),
+            route_job(0, &[], &HashMap::new(), &no_load, 0.0, 0, None),
             RouteDecision::Wait
         );
         let mut drained = HashMap::new();
         drained.insert("n1".to_string(), "t".to_string());
         assert_eq!(
-            route_job(0, std::slice::from_ref(&peer), &drained, None),
+            route_job(
+                0,
+                std::slice::from_ref(&peer),
+                &drained,
+                &no_load,
+                0.0,
+                0,
+                None
+            ),
             RouteDecision::Wait
+        );
+    }
+
+    #[test]
+    fn routing_skips_overcap_and_undercap_peers() {
+        use std::collections::HashMap;
+        // 4 cores / 8192 MB donor: peer_max_jobs == 2.
+        let peer = runner_core::config::PeerRecord {
+            node_id: "n1".to_string(),
+            public_key: "k".to_string(),
+            endpoint: None,
+            max_cores: 4,
+            max_ram_mb: 8192,
+            status: "active".to_string(),
+        };
+        let peers = std::slice::from_ref(&peer);
+        let drained: HashMap<String, String> = HashMap::new();
+        let idle: HashMap<String, u32> = HashMap::new();
+        // Job minimums above caps fall through to cloud.
+        assert_eq!(
+            route_job(0, peers, &drained, &idle, 64.0, 0, Some("digitalocean")),
+            RouteDecision::Cloud {
+                provider: "digitalocean".to_string()
+            }
+        );
+        assert_eq!(
+            route_job(
+                0,
+                peers,
+                &drained,
+                &idle,
+                0.0,
+                1_000_000,
+                Some("digitalocean")
+            ),
+            RouteDecision::Cloud {
+                provider: "digitalocean".to_string()
+            }
+        );
+        // Minimums within caps still route to the peer.
+        assert_eq!(
+            route_job(0, peers, &drained, &idle, 2.0, 4096, None),
+            RouteDecision::WanPeer {
+                node_id: "n1".to_string()
+            }
+        );
+        // At cap load the peer is skipped; below cap it takes jobs.
+        let mut load = HashMap::new();
+        load.insert("n1".to_string(), 2u32);
+        assert_eq!(
+            route_job(0, peers, &drained, &load, 0.0, 0, None),
+            RouteDecision::Wait
+        );
+        load.insert("n1".to_string(), 1u32);
+        assert_eq!(
+            route_job(0, peers, &drained, &load, 0.0, 0, None),
+            RouteDecision::WanPeer {
+                node_id: "n1".to_string()
+            }
         );
     }
 
@@ -771,20 +985,29 @@ mod tests {
             status: "joining".to_string(),
         };
         let peers = std::slice::from_ref(&joining);
+        let empty = HashMap::new();
         assert_eq!(
-            route_job(0, peers, &HashMap::new(), Some("digitalocean")),
+            route_job(
+                0,
+                peers,
+                &HashMap::new(),
+                &empty,
+                0.0,
+                0,
+                Some("digitalocean")
+            ),
             RouteDecision::Cloud {
                 provider: "digitalocean".to_string()
             }
         );
         assert_eq!(
-            route_job(0, peers, &HashMap::new(), None),
+            route_job(0, peers, &HashMap::new(), &empty, 0.0, 0, None),
             RouteDecision::Wait
         );
         // Peer-excluded recompute (the WAN fallback path) can never
         // loop back to a peer.
         assert_eq!(
-            route_job(0, &[], &HashMap::new(), Some("render")),
+            route_job(0, &[], &HashMap::new(), &empty, 0.0, 0, Some("render")),
             RouteDecision::Cloud {
                 provider: "render".to_string()
             }
@@ -797,7 +1020,15 @@ mod tests {
         // Render-only pool: the resolved provider flows through
         // instead of a hardcoded DigitalOcean selection.
         assert_eq!(
-            route_job(0, &[], &HashMap::new(), Some("render")),
+            route_job(
+                0,
+                &[],
+                &HashMap::new(),
+                &HashMap::new(),
+                0.0,
+                0,
+                Some("render")
+            ),
             RouteDecision::Cloud {
                 provider: "render".to_string()
             }

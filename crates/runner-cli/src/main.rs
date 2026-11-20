@@ -15,7 +15,7 @@ use runner_core::mesh::invite::{
     generate_secret_hex, parse_size_mb, parse_ttl_secs, secret_from_hex, InviteAuthority,
     InviteCaps, InviteRole, InviteToken,
 };
-use runner_core::mesh::peer::{generate_keypair, render_config, DEFAULT_KEEPALIVE_SECS};
+use runner_core::mesh::peer::generate_keypair;
 use runner_core::pidfile::{
     process_alive, read_pid, remove as remove_pidfile, resolve_pid_path, signal_daemon,
     wait_for_exit, write_current_pid,
@@ -93,7 +93,15 @@ enum Commands {
         command: MeshCommands,
     },
     /// Join a mesh with an invitation token
-    Join { token: String },
+    Join {
+        token: String,
+        /// Coordinator endpoint (host:port) for join-announce
+        #[arg(long)]
+        coordinator: String,
+        /// Coordinator WireGuard public key (printed by `mesh invite`)
+        #[arg(long)]
+        coordinator_pubkey: String,
+    },
     /// Manage the systemd user service (install/status/stop/start/uninstall)
     Service {
         #[command(subcommand)]
@@ -376,12 +384,36 @@ fn cmd_mesh_invite(role: &str, max_cores: u32, max_ram: &str, ttl: &str, name: &
         name: name.to_string(),
     };
     let minted = authority.mint(&token).map_err(|e| anyhow::anyhow!(e))?;
+    let keys = runner_core::mesh::peer::ensure_node_keypair(&mut config)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    config
+        .save()
+        .map_err(|e| anyhow::anyhow!("failed to save mesh identity: {e}"))?;
     println!("{minted}");
+    println!("coordinator pubkey: {}", keys.public_b64);
     eprintln!("invite for {name}: role={role} cores={max_cores} ram={max_ram} ttl={ttl}");
     Ok(())
 }
 
-async fn cmd_join(token: &str) -> Result<()> {
+/// Split `host:port` for `--coordinator` (shape only; the daemon
+/// resolves DNS when announcing).
+fn parse_coordinator_endpoint(raw: &str) -> Result<(String, u16)> {
+    let (host, port) = raw
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("coordinator must be host:port, got {raw:?}"))?;
+    if host.trim().is_empty() {
+        anyhow::bail!("coordinator host is empty");
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| anyhow::anyhow!("coordinator port must be 1-65535"))?;
+    if port == 0 {
+        anyhow::bail!("coordinator port must be 1-65535");
+    }
+    Ok((host.trim().to_string(), port))
+}
+
+async fn cmd_join(token: &str, coordinator: &str, coordinator_pubkey: &str) -> Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
     let payload = InviteAuthority::decode_unverified(token).map_err(|e| anyhow::anyhow!(e))?;
     let now = SystemTime::now()
@@ -390,6 +422,10 @@ async fn cmd_join(token: &str) -> Result<()> {
         .unwrap_or(0);
     if now >= payload.expires_at {
         anyhow::bail!("invitation token has expired");
+    }
+    let (host, port) = parse_coordinator_endpoint(coordinator)?;
+    if !runner_core::mesh::peer::valid_public_key(coordinator_pubkey) {
+        anyhow::bail!("coordinator public key is not a valid base64 WireGuard key");
     }
     // This host donates *up to* the token caps: persist them so the local
     // supervisor (cgroups weight ladder + AFK boost + slot clamp) enforces
@@ -416,6 +452,12 @@ async fn cmd_join(token: &str) -> Result<()> {
     if !config.peers.iter().any(|p| p.node_id == node_id) {
         config.peers.push(record.clone());
     }
+    // Mesh identity + federation coordinates (0600 file): the daemon
+    // announces from these without further operator input.
+    config.mesh.node_key = Some(keys.private_b64.clone());
+    config.mesh.coordinator = Some(format!("{host}:{port}"));
+    config.mesh.coordinator_pubkey = Some(coordinator_pubkey.to_string());
+    config.mesh.join_token = Some(token.to_string());
     config.save()?;
     // Hot-add to a running daemon when present (best effort).
     let sock = resolve_sock_path();
@@ -431,18 +473,9 @@ async fn cmd_join(token: &str) -> Result<()> {
         "joined as {node_id} (donor caps: {} cores, {}MB ram)",
         payload.max_cores, payload.max_ram_mb
     );
-    println!("--- wireguard identity (send PublicKey to the coordinator) ---");
-    println!(
-        "{}",
-        render_config(
-            &keys.private_b64,
-            "<coordinator-pubkey>",
-            &["10.9.0.0/24"],
-            None,
-            DEFAULT_KEEPALIVE_SECS,
-        )
-    );
     println!("public key: {}", keys.public_b64);
+    println!("private key stored in ~/.config/runner/config.toml (0600, never printed again)");
+    println!("announcing to coordinator at {host}:{port} within 60s (or restart the daemon)");
     Ok(())
 }
 
@@ -1189,6 +1222,29 @@ async fn main() -> Result<()> {
             if let Err(e) = write_current_pid(&pid_path) {
                 eprintln!("runner: pid file unavailable ({e})");
             }
+            // WAN federation identity (persisted once when generated;
+            // untouched otherwise so daemon boots never rewrite config).
+            let mut mesh_config = config.clone();
+            let mut mesh_changed = false;
+            if mesh_config.mesh.secret.is_none() {
+                mesh_config.mesh.secret = Some(generate_secret_hex());
+                mesh_changed = true;
+            }
+            let had_key = mesh_config.mesh.node_key.is_some();
+            match runner_core::mesh::peer::ensure_node_keypair(&mut mesh_config) {
+                Ok(_) => {
+                    mesh_changed |= !had_key;
+                }
+                Err(e) => {
+                    eprintln!("runner: mesh identity unavailable ({e}); WAN federation off");
+                }
+            }
+            if mesh_changed {
+                if let Err(e) = mesh_config.save() {
+                    eprintln!("runner: failed to save mesh identity ({e}); WAN federation off");
+                }
+            }
+            runner_cli::coordinator::spawn_peer_transport(&mesh_config, state.clone()).await;
             spawn_coordinator(&config, state.clone()).await;
             spawn_embedded_listener(&config, state.clone()).await;
             run_supervisor(state).await?;
@@ -1317,8 +1373,12 @@ async fn main() -> Result<()> {
                 cmd_mesh_list(&format, lan).await?;
             }
         },
-        Commands::Join { token } => {
-            cmd_join(&token).await?;
+        Commands::Join {
+            token,
+            coordinator,
+            coordinator_pubkey,
+        } => {
+            cmd_join(&token, &coordinator, &coordinator_pubkey).await?;
         }
         Commands::Service { command } => match command {
             ServiceCommands::Install => runner_cli::service::install()?,

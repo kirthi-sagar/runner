@@ -6,6 +6,23 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.4.0 — 2026-11-20
+
+- WAN peer WireGuard execution transport: the coordinator dispatches
+  jobs to `active` trusted peers over Noise-encrypted UDP (no TUN, no
+  privileges), with join-announce onboarding, offer/accept handshake,
+  result reporting, and lease expiry with same-tick cloud/Wait
+  fallback. `runner join` takes `--coordinator` + `--coordinator-pubkey`;
+  `[mesh] peer_port` gates the listener (default off).
+- Two-sided donor protection: routing checks caps, label minimums
+  (`cpu-N`/`ram-Ngb`), and per-peer load; peers re-validate caps and
+  slots, execute in their cgroup slice, and never receive the
+  coordinator's LAN cache endpoint.
+- `docs/wan-federation.md`: protocol, donor model, NAT limits.
+  Loopback `test_wan_dispatch` (incl. a full coordinator-loop run
+  against a stub GitHub API) is the CI gate; no multi-machine
+  network needed.
+
 ## v1.3.1 — 2026-11-20
 
 - Zero-flake hardening: `execute_process` retries transient spawn errors

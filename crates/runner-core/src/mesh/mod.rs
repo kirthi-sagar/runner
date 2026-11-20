@@ -4,3 +4,6 @@ pub mod cloud;
 pub mod discovery;
 pub mod invite;
 pub mod peer;
+pub mod proto;
+pub mod roles;
+pub mod transport;

@@ -4,6 +4,7 @@
 
 pub mod github;
 pub mod providers;
+pub mod wan;
 
 #[cfg(test)]
 mod test_stub;

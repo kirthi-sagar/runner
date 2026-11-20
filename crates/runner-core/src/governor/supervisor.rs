@@ -65,6 +65,14 @@ pub struct InFlightJob {
 /// Cap on tracked jobs; oldest entries roll off first.
 pub const MAX_TRACKED_JOBS: usize = 64;
 
+/// Lease for one peer-dispatched job: the result is expected before
+/// `deadline`, else the sweeper releases it for re-dispatch.
+#[derive(Debug, Clone)]
+pub struct PeerLease {
+    pub node_id: String,
+    pub deadline: Instant,
+}
+
 /// Last-known poll health of one CI forge, surfaced over IPC/MCP/CLI.
 #[derive(Debug, Clone, Serialize)]
 pub struct ForgeHealth {
@@ -94,6 +102,10 @@ pub struct SupervisorState {
     throttle: Option<ThrottleOverride>,
     drained: HashMap<String, String>,
     peers: HashMap<String, PeerRecord>,
+    /// WAN peer transport handle (None when `[mesh] peer_port` unset).
+    peer_transport: Option<crate::mesh::transport::PeerTransport>,
+    /// Leases for peer-dispatched jobs awaiting results.
+    peer_leases: HashMap<(String, String), PeerLease>,
     cloud_nodes: Vec<CloudNode>,
     cloud_pool: Option<CloudPool>,
     cloud_spend_cap: f64,
@@ -130,6 +142,8 @@ impl SupervisorState {
             throttle: None,
             drained: HashMap::new(),
             peers: HashMap::new(),
+            peer_transport: None,
+            peer_leases: HashMap::new(),
             cloud_nodes: Vec::new(),
             cloud_pool: None,
             cloud_spend_cap: 0.0,
@@ -395,6 +409,66 @@ impl SupervisorState {
         self.jobs.retain(|j| j.provider != provider || j.id != id);
     }
 
+    /// Install the WAN transport handle (daemon Start with `[mesh] peer_port`).
+    pub fn set_peer_transport(&mut self, tx: crate::mesh::transport::PeerTransport) {
+        self.peer_transport = Some(tx);
+    }
+
+    pub fn peer_transport(&self) -> Option<crate::mesh::transport::PeerTransport> {
+        self.peer_transport.clone()
+    }
+
+    /// Whether this host donates capacity (joined with donor caps).
+    pub fn is_donor(&self) -> bool {
+        self.donor_caps.is_some()
+    }
+
+    /// Donated capacity ceilings, when this host is a donor.
+    pub fn donor_caps(&self) -> Option<(u32, u64)> {
+        self.donor_caps
+    }
+
+    /// Active peer-dispatched jobs per node (for route load balancing).
+    pub fn peer_load(&self) -> HashMap<String, u32> {
+        let mut load = HashMap::new();
+        for lease in self.peer_leases.values() {
+            *load.entry(lease.node_id.clone()).or_insert(0) += 1;
+        }
+        load
+    }
+
+    /// Record a peer-dispatched job lease.
+    pub fn add_peer_lease(&mut self, provider: &str, id: &str, node_id: String, deadline: Instant) {
+        self.peer_leases.insert(
+            (provider.to_string(), id.to_string()),
+            PeerLease { node_id, deadline },
+        );
+    }
+
+    /// Drop one lease (result received).
+    pub fn release_peer_lease(&mut self, provider: &str, id: &str) {
+        self.peer_leases
+            .remove(&(provider.to_string(), id.to_string()));
+    }
+
+    /// Release expired leases, dropping their job entries so the next
+    /// tick re-dispatches. Returns `(provider, id, node_id)` for logging.
+    pub fn release_expired_leases(&mut self, now: Instant) -> Vec<(String, String, String)> {
+        let mut released = Vec::new();
+        self.peer_leases.retain(|(provider, id), lease| {
+            if lease.deadline <= now {
+                released.push((provider.clone(), id.clone(), lease.node_id.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        for (provider, id, _) in &released {
+            self.job_finished(provider, id);
+        }
+        released
+    }
+
     /// Record one forge poll outcome for IPC/MCP/CLI visibility.
     pub fn record_forge_poll(&mut self, provider: &str, queue_depth: u32, error: Option<String>) {
         self.forge_health.insert(
@@ -658,6 +732,46 @@ mod tests {
         assert_eq!(state.in_flight_jobs().len(), 1);
         state.job_finished("github", "42");
         assert!(state.in_flight_jobs().is_empty());
+    }
+
+    #[test]
+    fn peer_leases_expire_and_free_their_jobs() {
+        let mut state = SupervisorState::new();
+        let now = Instant::now();
+        state.job_started("github", "7", "wan-job");
+        state.add_peer_lease(
+            "github",
+            "7",
+            "bob".to_string(),
+            now + Duration::from_secs(60),
+        );
+        state.job_started("github", "8", "wan-job");
+        state.add_peer_lease(
+            "github",
+            "8",
+            "bob".to_string(),
+            now - Duration::from_secs(1),
+        );
+        // Fresh lease survives; expired lease releases job + lease.
+        let released = state.release_expired_leases(now);
+        assert_eq!(
+            released,
+            vec![("github".to_string(), "8".to_string(), "bob".to_string())]
+        );
+        assert!(already_in_flight_here(&state, "github", "7"));
+        assert!(!already_in_flight_here(&state, "github", "8"));
+        // Explicit release drops the lease but keeps the job entry
+        // (the result path finishes the job separately).
+        state.release_peer_lease("github", "7");
+        assert!(state.release_expired_leases(now).is_empty());
+        assert!(already_in_flight_here(&state, "github", "7"));
+    }
+
+    fn already_in_flight_here(state: &SupervisorState, provider: &str, id: &str) -> bool {
+        state
+            .in_flight_jobs()
+            .iter()
+            .any(|j| j.provider == provider && j.id == id)
     }
 
     #[test]

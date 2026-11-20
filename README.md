@@ -89,7 +89,7 @@ Existing self-hosted runners fail at this because:
    - **AFK Boost Mode**: Listens to desktop screen-lock events (`org.freedesktop.ScreenSaver` / Wayland idle notify) to automatically collapse reserved headroom to zero when the user is away, converting the workstation into a 100% dedicated build server until user input resumes.
 
 3. **Federated Hybrid Mesh & Cloud Bursting**:
-   - **Local LAN**: Connect spare PCs or Mac minis with `runner join <token>`.
+   - **Local LAN**: Connect spare PCs or Mac minis with `runner join <token> --coordinator <host:port> --coordinator-pubkey <key>`.
    - **Trusted Peer Nodes (Friends & Family WAN)**: Connect trusted peer machines across the internet over encrypted peer-to-peer WireGuard tunnels with mutual invite tokens. Peer donors set explicit donor limits (e.g. "donate up to 4 idle cores"), ensuring foreign CI jobs never interrupt their own computer use.
    - **Cloud Bursting Connectors**: Native connectors for DigitalOcean droplets and Render.com background workers allow the fleet to absorb CI spikes using free/promotional credits. When the queue clears, cloud instances terminate automatically after 5 minutes of idle time.
 
@@ -118,7 +118,7 @@ Existing self-hosted runners fail at this because:
 | **Test Timer Protection** | **Yes (CFS weight 1 trickle)** | N/A (Runs at 100%) | N/A (Dedicated node) | No | Managed cloud VM |
 | **Autonomous AI Agent API** | **Native MCP + Unix Socket + CLI**| None | Kubernetes CRDs only | CLI flags only | Web UI / Cloud API |
 | **Dual-Tier RBAC** | **Yes (Human Super Admin / AI Admin)**| None | Kubernetes RBAC | None | SaaS Team Roles |
-| **Peer WAN Federation** | **P2P WireGuard Mesh (Job Routing Planned)**| Manual | Complex VPN / Multi-cluster | None | None |
+| **Peer WAN Federation** | **Yes (P2P WireGuard mesh dispatch)**| Manual | Complex VPN / Multi-cluster | None | None |
 | **Cloud Credit Bursting** | **Yes (DigitalOcean / Render auto-scale)**| None | Custom autoscalers | None | Proprietary SaaS |
 | **AFK Boost Mode** | **Yes (shipped v0.7.0)** | None | None | None | N/A |
 | **Infrastructure Overhead** | **Zero (Single static binary)** | Low (Directory install) | Very High (Kubernetes cluster) | Low (Docker CLI) | Managed SaaS |
@@ -154,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`).
 
-Zero-dependency install (downloads the prebuilt v1.3.1 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v1.4.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -191,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v1.3.1  (q quit, live cadence)
+runner top v1.4.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -319,7 +319,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "1.3.1", "governor": "normal",
+{"status": "healthy", "version": "1.4.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -535,13 +535,18 @@ Pool a trusted peer machine (friends & family) over an encrypted WireGuard mesh:
 # On the coordinator (Super Admin): mint a capped invitation
 runner mesh invite --role=donor --max-cores=4 --max-ram=8G --ttl=7d --name=alice-desktop
 # → prints: runner1.<payload>.<signature>
+# → prints: coordinator pubkey: <base64>  (send both to the peer operator)
 
-# On the trusted peer machine: join with the token
-runner join 'runner1....'
+# On the trusted peer machine: join with the token + coordinator coordinates
+runner join 'runner1....' --coordinator 203.0.113.7:48717 --coordinator-pubkey '<base64>'
 
 # Back on the coordinator (or any daemon): list the fleet
 runner mesh list
 ```
+
+Set `[mesh] peer_port` (e.g. `48717`) on both daemons to enable the
+transport; see [`docs/wan-federation.md`](docs/wan-federation.md) for the
+protocol, donor model, and limits.
 
 Donor safety is structural: the joiner's supervisor enforces the token's
 caps through the local cgroups weight ladder, AFK Boost, and slot

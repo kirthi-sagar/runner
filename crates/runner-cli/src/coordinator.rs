@@ -136,6 +136,170 @@ pub async fn spawn_cloud_watchdog(pool: CloudPool, state: SharedState) {
     }
 }
 
+/// Re-announce cadence for joiners (heals coordinator restarts and
+/// NAT rebinding; the first announce fires immediately at spawn).
+pub const ANNOUNCE_INTERVAL_SECS: u64 = 60;
+
+/// Spawn the WAN peer transport when `[mesh] peer_port` is set, plus the
+/// join-announce loop when coordinator coordinates are configured. Runs
+/// even with zero forges: donor-only nodes still serve peers. Silent
+/// when unset; misconfiguration logs loudly and disables the transport.
+pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState) {
+    use runner_core::mesh::invite::{secret_from_hex, InviteAuthority};
+    use runner_core::mesh::peer::ensure_node_keypair;
+    use runner_core::mesh::roles::{CoordinatorRole, MeshRoles, PeerRole};
+    use runner_core::mesh::transport::{PeerTransport, TransportConfig};
+    use runner_providers::wan::WorkerExecutor;
+    use std::sync::Arc;
+
+    let Some(port) = config.mesh.peer_port else {
+        return;
+    };
+    let mut cfg = config.clone();
+    let keys = match ensure_node_keypair(&mut cfg) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("runner: mesh identity invalid ({e}); WAN transport off");
+            return;
+        }
+    };
+    let secret_hex = match config.mesh.secret.clone() {
+        Some(hex) => hex,
+        None => {
+            eprintln!("runner: [mesh] peer_port set without a mesh secret; WAN transport off");
+            return;
+        }
+    };
+    let authority = match secret_from_hex(&secret_hex)
+        .map_err(|e| e.to_string())
+        .and_then(InviteAuthority::new)
+    {
+        Ok(authority) => authority,
+        Err(e) => {
+            eprintln!("runner: mesh secret invalid ({e}); WAN transport off");
+            return;
+        }
+    };
+    let executor = Arc::new(WorkerExecutor::new(
+        config.coordinator.worker_version.clone(),
+        runner_sandbox::mounts::probe_userns(),
+        Duration::from_secs(config.coordinator.job_timeout_mins.max(1) * 60),
+        runner_core::governor::cgroup::CgroupSlice::system_default(),
+    ));
+    let roles = Arc::new(MeshRoles::new(
+        CoordinatorRole::new(authority, state.clone(), RunnerConfig::default_path()),
+        PeerRole::new(executor, state.clone()),
+    ));
+    let tx = match PeerTransport::spawn(
+        TransportConfig {
+            listen: std::net::SocketAddr::from(([0, 0, 0, 0], port)),
+            keys: keys.clone(),
+        },
+        roles,
+    )
+    .await
+    {
+        Ok(tx) => tx,
+        Err(e) => {
+            eprintln!("runner: peer transport bind failed ({e}); WAN transport off");
+            return;
+        }
+    };
+    state.write().await.set_peer_transport(tx.clone());
+    eprintln!("runner: WAN peer transport on 0.0.0.0:{port}");
+    if let (Some(coordinator), Some(pubkey), Some(token)) = (
+        config.mesh.coordinator.clone(),
+        config.mesh.coordinator_pubkey.clone(),
+        config.mesh.join_token.clone(),
+    ) {
+        // Self record: the join-time entry matching our own public key.
+        let me = config
+            .peers
+            .iter()
+            .find(|p| p.public_key == keys.public_b64);
+        match me {
+            Some(record) => {
+                let join = AnnounceIdentity {
+                    node_id: record.node_id.clone(),
+                    pubkey_b64: record.public_key.clone(),
+                    max_cores: record.max_cores,
+                    max_ram_mb: record.max_ram_mb,
+                    listen_port: port,
+                };
+                tokio::spawn(announce_loop(tx.clone(), coordinator, pubkey, token, join));
+            }
+            None => eprintln!(
+                "runner: no join record matching this identity; run `runner join` to federate"
+            ),
+        }
+    }
+}
+
+/// Join-time identity + caps riding every announce.
+struct AnnounceIdentity {
+    node_id: String,
+    pubkey_b64: String,
+    max_cores: u32,
+    max_ram_mb: u64,
+    listen_port: u16,
+}
+
+/// Announce this joiner to its coordinator immediately, then every
+/// [`ANNOUNCE_INTERVAL_SECS`] (heals coordinator restarts and NAT
+/// rebinding; the coordinator dedups known nodes by pubkey).
+async fn announce_loop(
+    tx: runner_core::mesh::transport::PeerTransport,
+    coordinator: String,
+    pubkey: String,
+    token: String,
+    me: AnnounceIdentity,
+) {
+    use runner_core::mesh::proto::JoinAnnounce;
+    use tokio::net::lookup_host;
+
+    let mut last_addr: Option<std::net::SocketAddr> = None;
+    loop {
+        let addr = match lookup_host(&coordinator).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => addr,
+                None => {
+                    eprintln!("runner: coordinator {coordinator} resolved to nothing; retrying");
+                    tokio::time::sleep(Duration::from_secs(ANNOUNCE_INTERVAL_SECS)).await;
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("runner: coordinator {coordinator} unresolvable ({e}); retrying");
+                tokio::time::sleep(Duration::from_secs(ANNOUNCE_INTERVAL_SECS)).await;
+                continue;
+            }
+        };
+        // Session (re-)registration only when the endpoint is new;
+        // steady state just re-announces over the live session.
+        if last_addr != Some(addr) {
+            if let Err(e) = tx.add_session("coordinator", &pubkey, addr).await {
+                eprintln!("runner: coordinator session failed ({e}); retrying");
+                tokio::time::sleep(Duration::from_secs(ANNOUNCE_INTERVAL_SECS)).await;
+                continue;
+            }
+            last_addr = Some(addr);
+        }
+        let announce = JoinAnnounce {
+            proto: runner_core::mesh::proto::PROTO_TAG.to_string(),
+            node_id: me.node_id.clone(),
+            pubkey_b64: me.pubkey_b64.clone(),
+            token: token.clone(),
+            listen_port: me.listen_port,
+            max_cores: me.max_cores,
+            max_ram_mb: me.max_ram_mb,
+        };
+        if let Err(e) = tx.announce(addr, announce).await {
+            eprintln!("runner: join-announce to {coordinator} failed ({e}); retrying");
+        }
+        tokio::time::sleep(Duration::from_secs(ANNOUNCE_INTERVAL_SECS)).await;
+    }
+}
+
 /// Spawn one coordinator task per enabled forge. Without any forge the
 /// daemon runs governor-only.
 ///

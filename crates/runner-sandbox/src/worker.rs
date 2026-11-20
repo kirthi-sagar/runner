@@ -114,13 +114,40 @@ fn extract_archive(bytes: &[u8], dir: &Path) -> Result<(), String> {
 
 /// Unpack a downloaded worker archive: gzip-tarball on unix, zip on
 /// Windows (the `actions/runner` Windows assets ship as `.zip`).
+/// Quote one path for PowerShell single-quoted strings (embedded
+/// quotes doubled; backslashes are literal there). Portable on
+/// purpose: production use is Windows-only, but the unit test below
+/// runs on Linux CI.
+#[cfg_attr(unix, allow(dead_code))]
+fn ps_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
 #[cfg(windows)]
 fn extract_archive(bytes: &[u8], dir: &Path) -> Result<(), String> {
-    let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("worker extract: {e}"))?;
-    archive
-        .extract(dir)
-        .map_err(|e| format!("worker extract: {e}"))
+    // No zip crate: the `zip` 2.x line carries RustSec advisories
+    // against exactly this extraction API, so unpack via the inbox
+    // `Expand-Archive` cmdlet instead (zero new supply-chain surface).
+    let zip_path = dir.join("worker.zip");
+    std::fs::write(&zip_path, bytes).map_err(|e| format!("worker stage: {e}"))?;
+    let script = format!(
+        "Expand-Archive -LiteralPath {} -DestinationPath {} -Force",
+        ps_quote(&zip_path),
+        ps_quote(dir),
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .map_err(|e| format!("worker extract: {e}"))?;
+    let _ = std::fs::remove_file(&zip_path);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "worker extract: Expand-Archive exited {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
 }
 
 /// Host architecture label matching release assets.
@@ -459,5 +486,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.exit_code, Some(0));
+    }
+
+    #[test]
+    fn ps_quote_wraps_spaces_and_doubles_quotes() {
+        // Backslashes pass through literally (single-quoted PowerShell).
+        assert_eq!(
+            ps_quote(Path::new(r"C:\Users\Ada Runner\App\worker.zip")),
+            "'C:\\Users\\Ada Runner\\App\\worker.zip'"
+        );
+        assert_eq!(ps_quote(Path::new("C:\\o'ne")), "'C:\\o''ne'");
     }
 }

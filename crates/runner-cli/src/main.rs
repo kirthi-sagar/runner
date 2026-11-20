@@ -591,6 +591,7 @@ async fn spawn_embedded_listener(
     });
 }
 
+#[cfg(unix)]
 async fn listen_shutdown() {
     use tokio::signal::unix::{signal, SignalKind};
     // Registration can fail in restricted containers; degrade to
@@ -604,6 +605,12 @@ async fn listen_shutdown() {
         _ = runner_core::governor::supervisor::wait_for_signal(sigint) => {},
         _ = runner_core::governor::supervisor::wait_for_signal(sigterm) => {},
     }
+}
+
+/// Windows has no POSIX signals; Ctrl-C is the only shutdown path.
+#[cfg(windows)]
+async fn listen_shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Standalone `runner listen`: verify webhooks here, wake the daemon over

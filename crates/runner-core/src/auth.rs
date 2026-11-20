@@ -4,6 +4,7 @@
 //! followed by `systemctl --user restart runner` rotates credentials with
 //! no unit editing. Token values are never logged or echoed.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -121,7 +122,12 @@ impl TokenStore {
             &self.path,
             upsert_env_var(&current, slot.env_var(), token.trim()),
         )?;
+        #[cfg(unix)]
         std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
+        #[cfg(windows)]
+        eprintln!(
+            "[runner] unsupported on Windows: POSIX file modes (token store saved with default ACLs)"
+        );
         Ok(self.path.clone())
     }
 

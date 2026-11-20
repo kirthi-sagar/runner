@@ -2,8 +2,10 @@
 //! slots, in-flight jobs, and fleet summary. Rendering is pure (and
 //! unit-tested); only [`run`] touches the terminal.
 
+#[cfg(unix)]
 use std::io::Write;
 use std::path::Path;
+#[cfg(unix)]
 use std::time::Duration;
 
 use runner_core::governor::psi::PressureLevel;
@@ -264,11 +266,13 @@ pub async fn fetch(sock_path: &Path) -> TopData {
 }
 
 /// Terminal raw-mode guard (libc termios): restores on drop.
+#[cfg(unix)]
 struct RawGuard {
     fd: i32,
     orig: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawGuard {
     /// Enter raw mode; `None` when stdin is not a TTY (piped use).
     fn enter() -> Option<Self> {
@@ -309,6 +313,7 @@ impl RawGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawGuard {
     fn drop(&mut self) {
         // SAFETY: restores the termios captured at enter() on the same
@@ -320,12 +325,14 @@ impl Drop for RawGuard {
     }
 }
 
+#[cfg(unix)]
 fn stdout_is_tty() -> bool {
     use std::os::unix::io::AsRawFd;
     // SAFETY: isatty takes any fd (invalid ones return 0 with errno).
     unsafe { libc::isatty(std::io::stdout().as_raw_fd()) == 1 }
 }
 
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     // Registration can fail in restricted containers; degrade to
@@ -344,6 +351,7 @@ async fn shutdown_signal() {
 
 /// Run the monitor: redraw every `interval_ms` until `q`/signal.
 /// `--once` prints a single frame (scripts/CI).
+#[cfg(unix)]
 pub async fn run(sock_path: &Path, interval_ms: u64, once: bool) -> anyhow::Result<()> {
     let color = stdout_is_tty() && std::env::var_os("NO_COLOR").is_none();
     let data = fetch(sock_path).await;
@@ -361,6 +369,16 @@ pub async fn run(sock_path: &Path, interval_ms: u64, once: bool) -> anyhow::Resu
     result
 }
 
+/// Windows has no `/proc` telemetry to monitor; `top` exits loudly.
+#[cfg(windows)]
+pub async fn run(_sock_path: &Path, _interval_ms: u64, _once: bool) -> anyhow::Result<()> {
+    eprintln!("[runner] unsupported on Windows: runner top (/proc)");
+    Err(anyhow::anyhow!(
+        "unsupported on Windows: runner top (/proc)"
+    ))
+}
+
+#[cfg(unix)]
 async fn top_loop(sock_path: &Path, interval: Duration, color: bool) -> anyhow::Result<()> {
     // Single raw-mode owner: restores termios on drop (all exit paths).
     // None on non-TTY stdin: signals remain the exit path there.

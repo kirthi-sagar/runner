@@ -7,6 +7,7 @@
 //! effects are tested against temp dirs, never the caller's repo.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -88,11 +89,16 @@ pub fn install(repo: &Path, command: &str) -> Result<PathBuf, String> {
         }
     }
     fs::write(&hook_path, render_hook(command)).map_err(|e| format!("cannot write hook: {e}"))?;
-    let mut perms = fs::metadata(&hook_path)
-        .map_err(|e| format!("cannot stat hook: {e}"))?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&hook_path, perms).map_err(|e| format!("cannot chmod hook: {e}"))?;
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&hook_path)
+            .map_err(|e| format!("cannot stat hook: {e}"))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).map_err(|e| format!("cannot chmod hook: {e}"))?;
+    }
+    #[cfg(windows)]
+    eprintln!("[runner] unsupported on Windows: hook chmod (POSIX permissions)");
     Ok(hook_path)
 }
 
@@ -151,6 +157,7 @@ mod tests {
         assert!(script.contains("exec \"$RUNNER_BIN\" exec --no-sandbox -- cargo test --workspace"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn install_write_executable_and_reinstall_idempotent() {
         let dir = scratch("install");

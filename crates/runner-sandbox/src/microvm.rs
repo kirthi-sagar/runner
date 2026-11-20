@@ -81,6 +81,9 @@ pub const DEFAULT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off";
 
 /// Minimal HTTP/1.1 client over a Unix socket for the Firecracker API.
 pub struct FirecrackerClient {
+    // Unread on Windows (`put` fails before dialing); kept so the
+    // public shape stays identical across platforms.
+    #[cfg_attr(windows, allow(dead_code))]
     socket_path: PathBuf,
 }
 
@@ -90,7 +93,21 @@ impl FirecrackerClient {
     }
 
     /// Raw `PUT <path>` with a JSON body; Ok on 2xx, Err otherwise.
+    #[cfg(unix)]
     pub async fn put(&self, path: &str, body: &serde_json::Value) -> Result<(), String> {
+        self.put_inner(path, body).await
+    }
+
+    /// Windows has no Firecracker/KVM; Tier-1 calls fail loudly at the
+    /// single choke point every setter delegates through.
+    #[cfg(windows)]
+    pub async fn put(&self, _path: &str, _body: &serde_json::Value) -> Result<(), String> {
+        eprintln!("[runner] unsupported on Windows: Tier-1 microVM (Firecracker)");
+        Err("unsupported on Windows: Tier-1 microVM (Firecracker)".to_string())
+    }
+
+    #[cfg(unix)]
+    async fn put_inner(&self, path: &str, body: &serde_json::Value) -> Result<(), String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let body = serde_json::to_vec(body).map_err(|e| format!("encode: {e}"))?;
         let request = format!(
@@ -168,6 +185,7 @@ pub fn probe_kvm() -> bool {
 }
 
 /// Wait for a UDS path to accept connections (readiness polling).
+#[cfg(unix)]
 pub async fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> Result<(), String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -179,6 +197,13 @@ pub async fn wait_for_socket(path: &Path, timeout: std::time::Duration) -> Resul
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// Windows has no Unix domain sockets; readiness polling fails loudly.
+#[cfg(windows)]
+pub async fn wait_for_socket(_path: &Path, _timeout: std::time::Duration) -> Result<(), String> {
+    eprintln!("[runner] unsupported on Windows: Tier-1 microVM (Firecracker)");
+    Err("unsupported on Windows: Tier-1 microVM (Firecracker)".to_string())
 }
 
 /// MicroVM lifecycle supervisor: spawn, configure, start, stop, clean.

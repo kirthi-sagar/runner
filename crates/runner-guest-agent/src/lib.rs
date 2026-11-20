@@ -11,6 +11,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -77,6 +78,7 @@ pub fn decode_line<T: serde::de::DeserializeOwned>(line: &str) -> Result<T, Stri
 /// Raw syscalls with the kernel `sockaddr_vm` layout (no vsock crate, so
 /// the guest binary keeps zero non-workspace dependencies). The fd is
 /// closed on every error path and owned by the returned `File` on success.
+#[cfg(unix)]
 pub fn connect_host(cid: u32, port: u32) -> std::io::Result<File> {
     #[repr(C)]
     struct SockAddrVm {
@@ -115,6 +117,16 @@ pub fn connect_host(cid: u32, port: u32) -> std::io::Result<File> {
         }
         Ok(File::from_raw_fd(fd))
     }
+}
+
+/// Windows has no vsock; the guest agent cannot dial the host.
+#[cfg(windows)]
+pub fn connect_host(_cid: u32, _port: u32) -> std::io::Result<File> {
+    eprintln!("[runner] unsupported on Windows: guest-agent (vsock)");
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported on Windows: guest-agent (vsock)",
+    ))
 }
 
 fn pump_pipe<R: Read, W: Write>(

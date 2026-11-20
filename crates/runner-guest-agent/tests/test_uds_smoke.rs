@@ -2,6 +2,8 @@
 //! session over a loopback UDS socket (`--uds` seam for hosts without
 //! vsock, mirroring the repo's loopback-seam testing posture).
 
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::process::Command;

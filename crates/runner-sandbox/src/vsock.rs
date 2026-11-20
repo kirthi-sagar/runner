@@ -9,18 +9,24 @@
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(unix)]
 use base64::Engine;
+use runner_guest_agent::ExecRequest;
+#[cfg(unix)]
 use runner_guest_agent::{
-    decode_line, encode_line, ExecChunk, ExecRequest, ExecResult, STREAM_STDERR, STREAM_STDOUT,
+    decode_line, encode_line, ExecChunk, ExecResult, STREAM_STDERR, STREAM_STDOUT,
 };
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 /// Maximum protocol line accepted from the guest (8 KiB chunks land near
 /// 11 KiB base64; anything larger is a runaway or hostile guest).
+#[cfg(unix)]
 const MAX_LINE_BYTES: usize = 256 * 1024;
 
 /// Dispatch one command to the guest agent and return its exit code.
 /// `timeout` bounds both the guest connect wait and the whole session.
+#[cfg(unix)]
 pub async fn dispatch<W1, W2>(
     uds_path: &Path,
     request: &ExecRequest,
@@ -37,6 +43,24 @@ where
     outcome
 }
 
+/// Windows has no vsock/UDS transport; guest dispatch fails loudly.
+#[cfg(windows)]
+pub async fn dispatch<W1, W2>(
+    _uds_path: &Path,
+    _request: &ExecRequest,
+    _timeout: Duration,
+    _stdout: &mut W1,
+    _stderr: &mut W2,
+) -> Result<i32, String>
+where
+    W1: tokio::io::AsyncWrite + Unpin,
+    W2: tokio::io::AsyncWrite + Unpin,
+{
+    eprintln!("[runner] unsupported on Windows: vsock transport");
+    Err("unsupported on Windows: vsock transport".to_string())
+}
+
+#[cfg(unix)]
 async fn dispatch_inner<W1, W2>(
     uds_path: &Path,
     request: &ExecRequest,

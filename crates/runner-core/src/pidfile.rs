@@ -6,7 +6,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use nix::sys::signal::{kill, Signal};
+#[cfg(unix)]
 use nix::unistd::Pid;
 
 /// Privileged PID file path.
@@ -47,6 +49,7 @@ pub fn read_pid(path: &Path) -> io::Result<u32> {
 }
 
 /// True if the process exists (signal 0 probe; EPERM counts as alive).
+#[cfg(unix)]
 pub fn process_alive(pid: u32) -> bool {
     match kill(Pid::from_raw(pid as i32), None) {
         Ok(()) => true,
@@ -55,7 +58,16 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Windows has no signal-0 probe; report not-alive (`stop` fails
+/// earlier with the unsupported message from `signal_daemon`).
+#[cfg(windows)]
+pub fn process_alive(_pid: u32) -> bool {
+    eprintln!("[runner] unsupported on Windows: pidfile (POSIX lock)");
+    false
+}
+
 /// Send SIGTERM (or SIGKILL when `force`) to the recorded daemon.
+#[cfg(unix)]
 pub fn signal_daemon(pid: u32, force: bool) -> Result<(), String> {
     let signal = if force {
         Signal::SIGKILL
@@ -64,6 +76,13 @@ pub fn signal_daemon(pid: u32, force: bool) -> Result<(), String> {
     };
     kill(Pid::from_raw(pid as i32), signal)
         .map_err(|e| format!("failed to signal daemon pid {pid}: {e}"))
+}
+
+/// Windows has no POSIX signals; stopping the daemon is unsupported.
+#[cfg(windows)]
+pub fn signal_daemon(_pid: u32, _force: bool) -> Result<(), String> {
+    eprintln!("[runner] unsupported on Windows: pidfile (POSIX lock)");
+    Err("unsupported on Windows: pidfile (POSIX lock)".to_string())
 }
 
 /// Wait up to `timeout` for the process to exit.

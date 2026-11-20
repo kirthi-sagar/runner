@@ -8,11 +8,14 @@
 //! coordinator for instant dispatch).
 
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::governor::supervisor::SharedState;
@@ -390,6 +393,7 @@ pub fn throttle_weight_for_level(level: &str) -> Option<u32> {
     }
 }
 
+#[cfg(unix)]
 async fn serve_conn(stream: UnixStream, state: SharedState) -> io::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -414,12 +418,17 @@ async fn serve_conn(stream: UnixStream, state: SharedState) -> io::Result<()> {
 /// Bound IPC server.
 pub struct IpcServer {
     path: PathBuf,
+    #[cfg(unix)]
     listener: UnixListener,
+    // Unread on Windows (`bind` fails before serving); kept so the
+    // public shape stays identical across platforms.
+    #[cfg_attr(windows, allow(dead_code))]
     state: SharedState,
 }
 
 impl IpcServer {
     /// Bind `path` (removing a stale socket first) with `0600` permissions.
+    #[cfg(unix)]
     pub async fn bind(path: &Path, state: SharedState) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -434,11 +443,23 @@ impl IpcServer {
         })
     }
 
+    /// Windows has no Unix domain sockets; the daemon IPC server
+    /// cannot bind. Loud by design: every stub names its placeholder.
+    #[cfg(windows)]
+    pub async fn bind(_path: &Path, _state: SharedState) -> io::Result<Self> {
+        eprintln!("[runner] unsupported on Windows: IPC (Unix domain socket)");
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported on Windows: IPC (Unix domain socket)",
+        ))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// Accept loop; runs until the listener errors fatally.
+    #[cfg(unix)]
     pub async fn serve(&self) -> io::Result<()> {
         loop {
             let (stream, _) = self.listener.accept().await?;
@@ -450,6 +471,17 @@ impl IpcServer {
             });
         }
     }
+
+    /// Unreachable: `bind` already fails on Windows, but the signature
+    /// must exist for unconditional callers.
+    #[cfg(windows)]
+    pub async fn serve(&self) -> io::Result<()> {
+        eprintln!("[runner] unsupported on Windows: IPC (Unix domain socket)");
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported on Windows: IPC (Unix domain socket)",
+        ))
+    }
 }
 
 /// Client: send one method call and wait for the response object.
@@ -458,7 +490,31 @@ pub async fn ipc_call(path: &Path, method: &str) -> io::Result<Value> {
 }
 
 /// Client: method call with optional params.
+#[cfg(unix)]
 pub async fn ipc_call_with(path: &Path, method: &str, params: Option<Value>) -> io::Result<Value> {
+    ipc_call_with_inner(path, method, params).await
+}
+
+/// Windows has no Unix domain sockets; IPC calls fail loudly.
+#[cfg(windows)]
+pub async fn ipc_call_with(
+    _path: &Path,
+    _method: &str,
+    _params: Option<Value>,
+) -> io::Result<Value> {
+    eprintln!("[runner] unsupported on Windows: IPC (Unix domain socket)");
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unsupported on Windows: IPC (Unix domain socket)",
+    ))
+}
+
+#[cfg(unix)]
+async fn ipc_call_with_inner(
+    path: &Path,
+    method: &str,
+    params: Option<Value>,
+) -> io::Result<Value> {
     let stream = UnixStream::connect(path).await?;
     let (reader, mut writer) = stream.into_split();
     let mut req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method });
@@ -494,6 +550,7 @@ mod tests {
         task.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_has_owner_only_permissions() {
         use std::os::unix::fs::MetadataExt;

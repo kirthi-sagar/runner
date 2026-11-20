@@ -1,6 +1,8 @@
 //! Tier-1 vsock dispatch without KVM: the host dispatcher against mock
 //! guests, and the real guest agent loop against a mock host.
 
+#![cfg(unix)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;

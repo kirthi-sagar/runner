@@ -4,6 +4,7 @@
 //! with `0600`: it may hold the mesh signing secret and cloud tokens).
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -281,14 +282,22 @@ fn token_from_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|t| !t.trim().is_empty())
 }
 
-/// Default environment file path (`~/.config/runner/env`).
+/// Default environment file path (`~/.config/runner/env`,
+/// `%APPDATA%\runner\env` on Windows).
 pub fn default_env_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("runner")
-            .join("env")
-    })
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join(".config")
+                .join("runner")
+                .join("env")
+        })
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("runner").join("env"))
+    }
 }
 
 /// Parse shell-style `KEY=value` lines (comments, blanks, `export ` prefix,
@@ -581,15 +590,19 @@ impl Default for CacheConfig {
 }
 
 /// Resolve the cache directory: explicit `[cache] dir` wins, else
-/// `~/.runner/cache/` (current dir fallback without HOME).
+/// `~/.runner/cache/` (`%APPDATA%\runner\cache` on Windows, current
+/// dir fallback when neither home variable exists).
 pub fn resolve_cache_dir(config: &CacheConfig) -> std::path::PathBuf {
     if !config.dir.trim().is_empty() {
         return std::path::PathBuf::from(config.dir.trim());
     }
-    std::env::var_os("HOME").map_or_else(
-        || std::path::PathBuf::from(".runner-cache"),
-        |home| std::path::PathBuf::from(home).join(".runner").join("cache"),
-    )
+    #[cfg(unix)]
+    let home = std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join(".runner").join("cache"));
+    #[cfg(windows)]
+    let home = std::env::var_os("APPDATA")
+        .map(|dir| std::path::PathBuf::from(dir).join("runner").join("cache"));
+    home.map_or_else(|| std::path::PathBuf::from(".runner-cache"), |dir| dir)
 }
 
 /// Resource-governor tuning: CPU PSI `some avg10` bands for the
@@ -688,14 +701,22 @@ pub struct ServerConfig {
 }
 
 impl RunnerConfig {
-    /// Default config file path.
+    /// Default config file path (`%APPDATA%\runner\config.toml` on Windows).
     pub fn default_path() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|home| {
-            PathBuf::from(home)
-                .join(".config")
-                .join("runner")
-                .join("config.toml")
-        })
+        #[cfg(unix)]
+        {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("runner")
+                    .join("config.toml")
+            })
+        }
+        #[cfg(windows)]
+        {
+            std::env::var_os("APPDATA")
+                .map(|dir| PathBuf::from(dir).join("runner").join("config.toml"))
+        }
     }
 
     /// Load from disk, falling back to defaults when missing, then
@@ -751,7 +772,12 @@ impl RunnerConfig {
         let text = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         fs::write(path, text)?;
+        #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        #[cfg(windows)]
+        eprintln!(
+            "[runner] unsupported on Windows: POSIX file modes (config saved with default ACLs)"
+        );
         Ok(())
     }
 

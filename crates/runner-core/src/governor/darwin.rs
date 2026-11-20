@@ -151,6 +151,7 @@ impl QosBackend for MockQos {
 /// (best-effort: never fails a spawn, unloggable post-fork) followed
 /// by the optional sandbox setup. The single choke point every spawn
 /// path uses instead of hand-rolling `pre_exec`.
+#[cfg(unix)]
 pub fn install_child_hook<F>(
     cmd: &mut tokio::process::Command,
     qos: std::sync::Arc<dyn QosBackend>,
@@ -169,6 +170,19 @@ pub fn install_child_hook<F>(
             }
         });
     }
+}
+
+/// Windows has no `pre_exec` (no fork); spawns proceed without the
+/// child hook. Loud by design: every stub names its v2.0 placeholder.
+#[cfg(windows)]
+pub fn install_child_hook<F>(
+    _cmd: &mut tokio::process::Command,
+    _qos: std::sync::Arc<dyn QosBackend>,
+    _sandbox: Option<F>,
+) where
+    F: FnOnce() -> io::Result<()> + Send + Sync + 'static,
+{
+    eprintln!("[runner] unsupported on Windows: pre_exec child hook");
 }
 
 #[cfg(test)]

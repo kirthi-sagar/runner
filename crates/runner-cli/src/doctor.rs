@@ -3,6 +3,7 @@
 //! audit continuity. Checks are pure over gathered facts and unit-tested;
 //! only [`run_all`] touches the live system.
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 /// Check severity: exit code is 0 unless a [`Status::Fail`] exists.
@@ -73,6 +74,17 @@ pub fn parse_kernel_release(text: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// Windows has no `/proc` telemetry; the check names the gap instead
+/// of probing paths that can never exist.
+#[cfg(windows)]
+fn check_kernel() -> Check {
+    Check::fail(
+        "kernel",
+        "feature unavailable on Windows: kernel PSI telemetry (/proc)".to_string(),
+    )
+}
+
+#[cfg(unix)]
 fn check_kernel() -> Check {
     let release =
         std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_else(|_| "?".to_string());
@@ -101,6 +113,16 @@ fn check_kernel() -> Check {
     }
 }
 
+/// Windows has no cgroups; the check names the gap explicitly.
+#[cfg(windows)]
+fn check_cgroup() -> Check {
+    Check::fail(
+        "cgroupsv2",
+        "feature unavailable on Windows: cgroup pressure control".to_string(),
+    )
+}
+
+#[cfg(unix)]
 fn check_cgroup() -> Check {
     match std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") {
         Ok(text) => {
@@ -171,9 +193,14 @@ async fn check_daemon() -> Check {
             format!("socket {} absent; daemon not running?", path.display()),
         );
     }
+    #[cfg(unix)]
     let mode_ok = std::fs::metadata(&path)
         .map(|m| m.permissions().mode() & 0o777 == 0o600)
         .unwrap_or(false);
+    // No POSIX modes on Windows; the socket is absent there anyway
+    // (IPC is unsupported), so the warn path below always applies.
+    #[cfg(windows)]
+    let mode_ok = false;
     match runner_core::ipc::ipc_call(&path, "ping").await {
         Ok(_) if mode_ok => {
             Check::pass("daemon", format!("IPC alive at {} (0600)", path.display()))

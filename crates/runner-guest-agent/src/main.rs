@@ -15,7 +15,21 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(unix)]
 fn run() -> Result<(), String> {
+    run_inner()
+}
+
+/// Windows stub: a `main` must exist (a missing `main` is E0601), so
+/// this errors loudly and the process exits non-zero via `main`.
+#[cfg(windows)]
+fn run() -> Result<(), String> {
+    eprintln!("[runner] unsupported on Windows: guest-agent (vsock)");
+    Err("unsupported on Windows: guest-agent (vsock)".to_string())
+}
+
+#[cfg(unix)]
+fn run_inner() -> Result<(), String> {
     // Manual arg parsing keeps clap out of the guest binary.
     let mut args = std::env::args().skip(1);
     if let Some(flag) = args.next() {

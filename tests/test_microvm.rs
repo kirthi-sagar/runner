@@ -2,13 +2,16 @@
 //! and graceful KVM-absent behavior (no hardware required).
 
 use runner::sandbox::microvm::{
-    action_payload, boot_source_payload, drive_payload, probe_kvm, vsock_payload, wait_for_socket,
-    FirecrackerClient, MicroVmConfig, MicroVmSupervisor,
+    action_payload, boot_source_payload, drive_payload, probe_kvm, vsock_payload, MicroVmConfig,
+    MicroVmSupervisor,
 };
+#[cfg(unix)]
+use runner::sandbox::microvm::{wait_for_socket, FirecrackerClient};
 use std::path::Path;
 use std::time::Duration;
 
 /// Minimal mock Firecracker API: accepts PUTs, records paths, answers 204.
+#[cfg(unix)]
 async fn serve_mock(
     path: std::path::PathBuf,
     seen: std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -59,6 +62,7 @@ fn payload_structures_match_api() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn client_handshake_and_instance_start_over_mock_uds() {
     let dir = runner::test_support::TempDir::new("fc-mock").unwrap();

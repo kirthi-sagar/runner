@@ -15,8 +15,13 @@ use serde::Serialize;
 use tokio::sync::{Notify, RwLock};
 
 use super::afk::{poll_desktop_idle, AfkBoost, AfkMode, IdleState, PROBE_EVERY};
-use super::cgroup::{weight_for_cpu_psi_with, CgroupSlice};
-use super::psi::{PressureLevel, PsiPoller, PsiSnapshot};
+use super::cgroup::weight_for_cpu_psi_with;
+#[cfg(unix)]
+use super::cgroup::CgroupSlice;
+#[cfg(unix)]
+use super::psi::PsiPoller;
+use super::psi::{PressureLevel, PsiSnapshot};
+#[cfg(unix)]
 use super::topology::detect_slots;
 use crate::cache::server::CacheServerState;
 use crate::cache::CacheStore;
@@ -564,6 +569,7 @@ pub fn apply_workstation_guards(slots: u32, throttled: bool, discharging: bool) 
 /// in a restricted container) pends forever inside its `select!` arm:
 /// the loop keeps its own cadence and SIGKILL still works. Shared by
 /// the daemon, `runner listen`, and `runner top` — no panicking path.
+#[cfg(unix)]
 pub async fn wait_for_signal(stream: Option<tokio::signal::unix::Signal>) {
     match stream {
         Some(mut s) => {
@@ -576,6 +582,7 @@ pub async fn wait_for_signal(stream: Option<tokio::signal::unix::Signal>) {
 /// Wait for SIGINT or SIGTERM. Registration can fail in restricted
 /// containers; that degrades to "no signal handling" (the loop keeps
 /// its own cadence; SIGKILL still works) instead of aborting startup.
+#[cfg(unix)]
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
     let sigint = signal(SignalKind::interrupt()).ok();
@@ -593,7 +600,23 @@ async fn shutdown_signal() {
 ///
 /// Best-effort under unprivileged execution: if the slice is not writable,
 /// pressure is still polled, logged, and published to state.
+#[cfg(unix)]
 pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
+    run_supervisor_inner(state).await
+}
+
+/// Windows has no governor (no PSI, no cgroups); the daemon does not
+/// start. Tier-3 direct dispatch (`runner exec`) is the supported path.
+#[cfg(windows)]
+pub async fn run_supervisor(_state: SharedState) -> anyhow::Result<()> {
+    eprintln!("[runner] unsupported on Windows: governor (cgroups)");
+    Err(anyhow::anyhow!(
+        "unsupported on Windows: governor (cgroups)"
+    ))
+}
+
+#[cfg(unix)]
+async fn run_supervisor_inner(state: SharedState) -> anyhow::Result<()> {
     let slice = CgroupSlice::system_default();
     let writable = match slice.ensure_baseline() {
         Ok(()) => true,

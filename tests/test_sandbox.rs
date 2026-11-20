@@ -121,6 +121,7 @@ async fn live_worker_cache_download() {
 /// child spawn where unprivileged mounts work, else the plain-spawn
 /// fallback the dispatcher takes when `probe_userns` is false.
 /// Run explicitly: `cargo test --test test_sandbox -- --ignored`.
+#[cfg(unix)]
 #[test]
 #[ignore]
 fn live_sandbox_or_fallback_spawn() {

@@ -3,7 +3,7 @@ resolver = "2"
 members = [".", "crates/*"]
 
 [workspace.package]
-version = "1.7.1"
+version = "1.7.2"
 edition = "2021"
 license = "MIT"
 
@@ -31,13 +31,13 @@ futures-util = { version = "0.3", default-features = false }
 bytes = "1"
 jsonwebtoken = "9"
 libc = "0.2"
-runner-core = { path = "crates/runner-core", version = "1.7.1" }
-runner-sandbox = { path = "crates/runner-sandbox", version = "1.7.1" }
-runner-providers = { path = "crates/runner-providers", version = "1.7.1" }
-runner-telemetry = { path = "crates/runner-telemetry", version = "1.7.1" }
-runner-enterprise = { path = "crates/runner-enterprise", version = "1.7.1" }
-runner-cli = { path = "crates/runner-cli", version = "1.7.1" }
-runner-guest-agent = { path = "crates/runner-guest-agent", version = "1.7.1" }
+runner-core = { path = "crates/runner-core", version = "1.7.2" }
+runner-sandbox = { path = "crates/runner-sandbox", version = "1.7.2" }
+runner-providers = { path = "crates/runner-providers", version = "1.7.2" }
+runner-telemetry = { path = "crates/runner-telemetry", version = "1.7.2" }
+runner-enterprise = { path = "crates/runner-enterprise", version = "1.7.2" }
+runner-cli = { path = "crates/runner-cli", version = "1.7.2" }
+runner-guest-agent = { path = "crates/runner-guest-agent", version = "1.7.2" }
 
 [package]
 name = "runner"

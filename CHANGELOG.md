@@ -6,6 +6,14 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.7.2 — 2026-11-20
+
+- WSL2 supported path: new `docs/windows.md` (systemd, NAT-vs-mirrored,
+  `/home` rule, Vmmem limits), installer preflights that fail closed on
+  missing systemd or `/mnt` checkouts, a `wsl2-smoke` CI job on
+  `windows-latest`, and a `doctor` WSL identity/readiness check. The
+  platform badge claim is now verified instead of asserted.
+
 ## v1.7.1 — 2026-11-20
 
 - Supply-chain gates: `deny.toml` policy (duplicate bans, permissive

@@ -60,3 +60,52 @@ jobs:
       - name: Darwin syscall tests (macOS live)
         if: runner.os == 'macOS'
         run: cargo test -p runner-core --lib governor::darwin
+
+  wsl2-smoke:
+    name: WSL2 smoke (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Force LF checkouts (WSL scripts break on CRLF)
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable systemd in Ubuntu distro
+        shell: pwsh
+        run: |
+          wsl -d Ubuntu -u root bash -c "printf '[boot]\nsystemd=true\n' > /etc/wsl.conf"
+          wsl --shutdown
+          wsl -d Ubuntu -u root test -d /run/systemd/system
+
+      - name: Refuse /mnt checkout (negative preflight test)
+        shell: pwsh
+        run: |
+          $wslPath = '/mnt/' + $env:GITHUB_WORKSPACE.Substring(0,1).ToLower() + $env:GITHUB_WORKSPACE.Substring(2).Replace('\','/')
+          $out = wsl -d Ubuntu -u root bash -c "cd '$wslPath' && ./install.sh --dry-run" 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0 -or $out -notmatch '/mnt/c') {
+            Write-Error "expected install.sh to refuse the /mnt checkout, got exit=$LASTEXITCODE out=$out"
+            exit 1
+          }
+
+      - name: Install inside the distro
+        shell: pwsh
+        run: |
+          $wslPath = '/mnt/' + $env:GITHUB_WORKSPACE.Substring(0,1).ToLower() + $env:GITHUB_WORKSPACE.Substring(2).Replace('\','/')
+          wsl -d Ubuntu -u root bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates"
+          wsl -d Ubuntu -u root bash -c "rm -rf /root/runner && cp -r '$wslPath' /root/runner && cd /root/runner && chmod +x ./install.sh && ./install.sh"
+
+      - name: Assert doctor wsl check passes
+        shell: pwsh
+        run: |
+          wsl -d Ubuntu -u root bash -c '/usr/local/bin/runner doctor --format json | python3 -c "import json,sys; d=json.load(sys.stdin); checks={c[\"name\"]:c[\"status\"] for c in d[\"checks\"]}; assert checks.get(\"wsl\")==\"pass\", checks"'
+
+      - name: Tier-3 dispatch smoke (governed job from /root)
+        shell: pwsh
+        run: |
+          $out = wsl -d Ubuntu -u root bash -c "cd /root && /usr/local/bin/runner exec echo wsl-smoke-ok" 2>&1 | Out-String
+          if ($out -notmatch 'wsl-smoke-ok') {
+            Write-Error "Tier-3 exec failed: $out"
+            exit 1
+          }

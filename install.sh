@@ -6,7 +6,7 @@
 #   ./install.sh --help       show help
 set -eu
 
-VERSION="1.7.1"
+VERSION="1.7.2"
 MIN_KERNEL_MAJOR=5
 MIN_KERNEL_MINOR=8
 
@@ -155,6 +155,34 @@ if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
 else
     log "error: cgroups v2 not mounted (/sys/fs/cgroup/cgroup.controllers missing)"
     exit 1
+fi
+
+# --- WSL2 preflights ---------------------------------------------------------
+# WSL2 reports Linux to uname, so detect it explicitly and fail closed on
+# the known-bad configurations (see docs/windows.md). A hard error (not a
+# warning) is deliberate here: unlike bare Linux without systemd (rare,
+# expert), WSL-without-systemd is the default/novice case, and the user
+# service the installer exists to create can never start there.
+IS_WSL=0
+if [ -n "${WSL_DISTRO_NAME:-}" ]; then
+    IS_WSL=1
+elif grep -qi microsoft /proc/version 2>/dev/null; then
+    IS_WSL=1
+fi
+if [ "$IS_WSL" -eq 1 ]; then
+    log "WSL2 environment detected (${WSL_DISTRO_NAME:-unknown distro})"
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        log "systemd active under WSL2 OK"
+    else
+        log "error: WSL2 without systemd; set [boot] systemd=true in /etc/wsl.conf and run: wsl --shutdown"
+        exit 1
+    fi
+    case "$(pwd -P 2>/dev/null || pwd)" in
+        /mnt/*)
+            log "error: running from $PWD: install and check out runner inside the distro (/home/...) — /mnt/c is 9P (slow) and breaks Linux tooling (CRLF/permissions). See docs/windows.md"
+            exit 1
+            ;;
+    esac
 fi
 
 if command -v nft >/dev/null 2>&1; then

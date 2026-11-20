@@ -12,7 +12,7 @@ Prefers the daemon's state-enriched report over IPC; falls back to a
 local kernel read when the daemon is down.
 
 - `status`: `"healthy"` (fixed string).
-- `version`: semver string (e.g. `"1.7.1"`).
+- `version`: semver string (e.g. `"1.7.2"`).
 - `host`: `total_cores`, `physical_cores`,
   `available_cores_for_ci`, `total_memory_bytes`,
   `available_memory_bytes`, `psi_pressure` (`cpu_some_avg10`,
@@ -34,7 +34,7 @@ local kernel read when the daemon is down.
 - `ok`: boolean — false iff any check has status `"fail"`
   (warnings keep `ok: true`; exit code mirrors it).
 - `checks`: array of `name` (e.g. `kernel`, `cgroupsv2`, `userns`,
-  `kvm`, `ebpf`, `daemon`, `mcp`, `cache`, `guards`, `afk`, `nat`,
+  `kvm`, `ebpf`, `daemon`, `mcp`, `cache`, `guards`, `afk`, `nat`, `wsl`,
   plus `policy`/`audit` with `--enterprise` and `egress:*` with
   `--egress`), `status` (`"pass"`|`"warn"`|`"fail"`), `detail`
   (human-readable string; the `nat` detail carries the reflexive

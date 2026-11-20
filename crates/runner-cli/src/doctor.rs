@@ -611,6 +611,51 @@ async fn check_nat(config: &runner_core::config::RunnerConfig) -> Check {
     }
 }
 
+struct WslFacts {
+    proc_version: String,
+    distro: Option<String>,
+    systemd_active: bool,
+}
+
+fn wsl_verdict(facts: &WslFacts) -> Check {
+    let lowered = facts.proc_version.to_ascii_lowercase();
+    if !lowered.contains("microsoft") && facts.distro.is_none() {
+        return Check::pass("wsl", "not running under WSL".to_string());
+    }
+    let generation = if lowered.contains("wsl2") {
+        "WSL2"
+    } else {
+        "WSL"
+    };
+    let distro = facts
+        .distro
+        .clone()
+        .unwrap_or_else(|| "unknown distro".to_string());
+    if facts.systemd_active {
+        Check::pass("wsl", format!("{generation} ({distro}), systemd active"))
+    } else {
+        Check::warn(
+            "wsl",
+            format!(
+                "{generation} ({distro}) without systemd; set [boot] systemd=true in /etc/wsl.conf and run: wsl --shutdown"
+            ),
+        )
+    }
+}
+
+/// Windows Subsystem for Linux identity + systemd readiness. Never
+/// fails: native Linux passes trivially, WSL without systemd warns
+/// with the exact remediation (see docs/windows.md).
+fn check_wsl() -> Check {
+    wsl_verdict(&WslFacts {
+        proc_version: std::fs::read_to_string("/proc/version").unwrap_or_default(),
+        distro: std::env::var("WSL_DISTRO_NAME")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        systemd_active: std::path::Path::new("/run/systemd/system").is_dir(),
+    })
+}
+
 fn check_afk_boost(config: &runner_core::config::RunnerConfig) -> Check {
     use runner_core::governor::afk::{detector_available, AfkMode};
 
@@ -639,6 +684,7 @@ pub async fn run_all(
         check_workstation_guards(),
         check_afk_boost(config),
         check_nat(config).await,
+        check_wsl(),
     ];
     if enterprise {
         checks.push(check_policy());
@@ -970,5 +1016,49 @@ mod tests {
             .map(|c| c["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["cache", "guards", "afk"]);
+    }
+
+    #[test]
+    fn wsl_verdict_covers_native_ready_and_unready() {
+        // Native Linux (or macOS): trivial pass, never noise.
+        let native = wsl_verdict(&WslFacts {
+            proc_version: "Linux version 6.8.0-91-generic".to_string(),
+            distro: None,
+            systemd_active: true,
+        });
+        assert_eq!(native.name, "wsl");
+        assert!(matches!(native.status, Status::Pass));
+
+        // WSL2 + systemd: pass naming distro and readiness.
+        let ready = wsl_verdict(&WslFacts {
+            proc_version: "Linux version 5.15.153.1-microsoft-standard-WSL2".to_string(),
+            distro: Some("Ubuntu".to_string()),
+            systemd_active: true,
+        });
+        assert!(matches!(ready.status, Status::Pass));
+        assert!(ready.detail.contains("WSL2"), "{}", ready.detail);
+        assert!(ready.detail.contains("Ubuntu"), "{}", ready.detail);
+
+        // WSL without systemd: warn with the exact remediation.
+        let unready = wsl_verdict(&WslFacts {
+            proc_version: "Linux version 5.15.153.1-microsoft-standard-WSL2".to_string(),
+            distro: None,
+            systemd_active: false,
+        });
+        assert!(matches!(unready.status, Status::Warn));
+        assert!(
+            unready.detail.contains("systemd=true"),
+            "{}",
+            unready.detail
+        );
+
+        // Distro env alone (unreadable /proc/version) still detects WSL.
+        let env_only = wsl_verdict(&WslFacts {
+            proc_version: String::new(),
+            distro: Some("Debian".to_string()),
+            systemd_active: true,
+        });
+        assert!(matches!(env_only.status, Status::Pass));
+        assert!(env_only.detail.contains("Debian"), "{}", env_only.detail);
     }
 }

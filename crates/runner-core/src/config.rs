@@ -602,7 +602,7 @@ pub fn resolve_cache_dir(config: &CacheConfig) -> std::path::PathBuf {
     #[cfg(windows)]
     let home = std::env::var_os("APPDATA")
         .map(|dir| std::path::PathBuf::from(dir).join("runner").join("cache"));
-    home.map_or_else(|| std::path::PathBuf::from(".runner-cache"), |dir| dir)
+    home.unwrap_or_else(|| std::path::PathBuf::from(".runner-cache"))
 }
 
 /// Resource-governor tuning: CPU PSI `some avg10` bands for the

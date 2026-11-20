@@ -7,9 +7,12 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::process::Command as TokioCommand;
+
+use runner_core::governor::darwin::QosBackend;
 
 /// Privileged root for pre-cached official worker packages.
 pub const WORKER_CACHE_ROOT: &str = "/var/cache/runner";
@@ -211,6 +214,7 @@ pub async fn run_supervised(
     launch: &WorkerLaunch,
     slice: Option<&runner_core::governor::cgroup::CgroupSlice>,
     timeout: Duration,
+    qos: Arc<dyn QosBackend>,
 ) -> io::Result<WorkerOutcome> {
     let mut cmd = TokioCommand::new(RUN_SCRIPT);
     cmd.current_dir(&launch.work_dir)
@@ -223,14 +227,16 @@ pub async fn run_supervised(
     for (key, value) in &launch.env {
         cmd.env(key, value);
     }
-    if let Some(spec) = launch.sandbox.clone() {
-        // SAFETY: pre_exec runs after fork in the child only. The closure
-        // performs only async-signal-safe syscalls plus synchronous file
-        // writes before exec; on failure the child aborts the spawn.
-        unsafe {
-            cmd.pre_exec(move || crate::mounts::sandbox_pre_exec(&spec));
-        }
-    }
+    // QoS hook always installed (no-op off macOS); sandbox setup rides
+    // along only when the launch carries a spec.
+    runner_core::governor::darwin::install_child_hook(
+        &mut cmd,
+        qos,
+        launch
+            .sandbox
+            .clone()
+            .map(|spec| move || crate::mounts::sandbox_pre_exec(&spec)),
+    );
     let mut child = spawn_with_busy_retry(&mut cmd).await?;
     if let (Some(pid), Some(slice)) = (child.id(), slice) {
         attach_to_slice(slice, pid);
@@ -254,6 +260,7 @@ pub async fn run_supervised(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runner_core::governor::darwin::{DarwinQos, MockQos};
 
     /// Write a test script and force it to stable storage before launch,
     /// closing the ETXTBSY race on the writer side.
@@ -316,7 +323,7 @@ mod tests {
                 .unwrap();
         }
         let launch = WorkerLaunch::new(pkg, "BLOB");
-        let outcome = run_supervised(&launch, None, Duration::from_secs(10))
+        let outcome = run_supervised(&launch, None, Duration::from_secs(10), Arc::new(DarwinQos))
             .await
             .unwrap();
         assert_eq!(
@@ -341,9 +348,46 @@ mod tests {
                 .unwrap();
         }
         let launch = WorkerLaunch::new(pkg, "BLOB");
-        let outcome = run_supervised(&launch, None, Duration::from_millis(300))
+        let outcome = run_supervised(
+            &launch,
+            None,
+            Duration::from_millis(300),
+            Arc::new(DarwinQos),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.killed);
+    }
+
+    #[tokio::test]
+    async fn supervised_spawn_applies_qos_best_effort() {
+        let dir = runner_core::test_support::TempDir::new("worker-qos").unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        write_script(&pkg.join("run.sh"), "#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(pkg.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        // File-backed mock: the hook runs post-fork, so only the log
+        // file proves placement.
+        let log = dir.path().join("qos.log");
+        let mock = Arc::new(MockQos::with_log(log.clone()));
+        let launch = WorkerLaunch::new(pkg.clone(), "BLOB");
+        let outcome = run_supervised(&launch, None, Duration::from_secs(10), mock)
             .await
             .unwrap();
-        assert!(outcome.killed);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "process\n");
+        // A failing backend never fails the spawn.
+        let failing = Arc::new(MockQos::new());
+        failing.set_failing();
+        let launch = WorkerLaunch::new(pkg, "BLOB");
+        let outcome = run_supervised(&launch, None, Duration::from_secs(10), failing)
+            .await
+            .unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
     }
 }

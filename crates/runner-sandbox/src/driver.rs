@@ -13,12 +13,14 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::process::Command as TokioCommand;
 
 use crate::microvm::{probe_kvm, MicroVmConfig, MicroVmSupervisor};
 use crate::mounts::{probe_userns, sanitize_job_id, Workspace};
+use runner_core::governor::darwin::QosBackend;
 
 /// Isolation tier selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,7 +89,14 @@ impl SandboxEngine {
     /// tears the VM down.
     pub async fn execute(&self, command: &[String], timeout: Duration) -> Result<i32, String> {
         match self.driver {
-            SandboxDriver::Process => execute_process(command, timeout).await,
+            SandboxDriver::Process => {
+                execute_process(
+                    command,
+                    timeout,
+                    Arc::new(runner_core::governor::darwin::DarwinQos),
+                )
+                .await
+            }
             SandboxDriver::MicroVm => self.execute_microvm(command, timeout).await,
         }
     }
@@ -161,7 +170,11 @@ async fn spawn_with_transient_retry(
     }
 }
 
-async fn execute_process(command: &[String], timeout: Duration) -> Result<i32, String> {
+async fn execute_process(
+    command: &[String],
+    timeout: Duration,
+    qos: Arc<dyn QosBackend>,
+) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command to execute".to_string());
     }
@@ -175,15 +188,20 @@ async fn execute_process(command: &[String], timeout: Duration) -> Result<i32, S
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-    if sandboxed {
-        let spec = workspace.sandbox_spec()?;
-        // SAFETY: pre_exec runs after fork in the child only.
-        unsafe {
-            cmd.pre_exec(move || crate::mounts::sandbox_pre_exec(&spec));
-        }
+    // QoS hook always installed (no-op off macOS); the sandbox setup
+    // rides along only when namespaces probed usable. Unsandboxed runs
+    // inherit the caller's cwd so repo-relative commands resolve.
+    let spec = if sandboxed {
+        Some(workspace.sandbox_spec()?)
     } else {
         cmd.current_dir(workspace.path());
-    }
+        None
+    };
+    runner_core::governor::darwin::install_child_hook(
+        &mut cmd,
+        qos,
+        spec.map(|spec| move || crate::mounts::sandbox_pre_exec(&spec)),
+    );
 
     let mut child = spawn_with_transient_retry(&mut cmd)
         .await
@@ -290,6 +308,26 @@ mod tests {
             "retry took too long: {:?}",
             start.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn process_spawns_apply_qos_best_effort() {
+        use runner_core::governor::darwin::MockQos;
+        let dir = runner_core::test_support::TempDir::new("driver-qos").unwrap();
+        let log = dir.path().join("qos.log");
+        let mock = Arc::new(MockQos::with_log(log.clone()));
+        let code = execute_process(&["true".to_string()], Duration::from_secs(30), mock)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "process\n");
+        // A failing backend never fails the spawn.
+        let failing = Arc::new(MockQos::new());
+        failing.set_failing();
+        let code = execute_process(&["true".to_string()], Duration::from_secs(30), failing)
+            .await
+            .unwrap();
+        assert_eq!(code, 0);
     }
 
     #[tokio::test]

@@ -6,6 +6,24 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.5.0 — 2026-11-20
+
+- macOS Apple Silicon port (spec §3.5): the workspace compiles for
+  `aarch64`/`x86_64-apple-darwin` (Linux-only namespaces + eBPF
+  probes cfg-gated with graceful fallbacks; no dependency changes).
+- Darwin QoS pinning (`governor::darwin`): worker children background
+  themselves via `setpriority(PRIO_DARWIN_BG)` + pthread QoS FFI
+  (`QOS_CLASS_BACKGROUND`, SDK-verified) through a mockable seam, so
+  XNU schedules CI onto Efficiency cores; slots from
+  `available_parallelism` + `sysconf` memory.
+- Installer macOS support: Apple Silicon detection (Intel refused),
+  `runner-darwin-arm64.tar.gz` asset, `com.runner.coordinator.plist`
+  launchd agent/daemon with `load`/`unload` lifecycle and uninstall
+  parity; CI + release matrices gain `macos-latest`, with a live
+  Darwin syscall test job.
+- `docs/macos.md`: design, install, and the v1 limitation list (no
+  mac sandbox isolation, pressure feedback, AFK/thermal guards).
+
 ## v1.4.0 — 2026-11-20
 
 - WAN peer WireGuard execution transport: the coordinator dispatches

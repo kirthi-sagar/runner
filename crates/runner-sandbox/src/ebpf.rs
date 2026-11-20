@@ -316,7 +316,9 @@ impl EgressFilterProgram {
 
 /// Probe unprivileged socket-filter attachment: binds a loopback UDP
 /// socket and attempts a harmless accept-all `SO_ATTACH_FILTER`.
-/// Returns false (never panics) when the kernel refuses.
+/// Returns false (never panics) when the kernel refuses. Linux-only;
+/// other platforms have no `SO_ATTACH_FILTER` and always degrade.
+#[cfg(target_os = "linux")]
 pub fn probe_ebpf() -> bool {
     use std::os::unix::io::AsRawFd;
 
@@ -361,6 +363,12 @@ pub fn probe_ebpf() -> bool {
         )
     };
     rc == 0
+}
+
+/// Non-Linux kernels have no socket-filter attach; always degrade.
+#[cfg(not(target_os = "linux"))]
+pub fn probe_ebpf() -> bool {
+    false
 }
 
 #[cfg(test)]

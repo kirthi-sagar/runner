@@ -32,7 +32,9 @@ pub fn job_workspace(job_id: &str) -> PathBuf {
     job_root().join(job_id)
 }
 
-/// Namespace flags for the unprivileged sandbox.
+/// Namespace flags for the unprivileged sandbox (Linux-only; other
+/// platforms have no user namespaces and always degrade).
+#[cfg(target_os = "linux")]
 pub fn unshare_flags() -> nix::sched::CloneFlags {
     use nix::sched::CloneFlags;
     CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID
@@ -68,37 +70,48 @@ impl SandboxSpec {
 /// Child-side setup for `Command::pre_exec`: enter unprivileged namespaces,
 /// map our own UID/GID 1:1, mount tmpfs over the workspace, chdir into it.
 ///
-/// Returns `Err` (aborting the spawn) when any step fails.
+/// Returns `Err` (aborting the spawn) when any step fails. Off Linux this
+/// is a no-op (callers gate on [`probe_userns`], always false there), kept
+/// so `pre_exec` closures compile on every Unix.
 pub fn sandbox_pre_exec(spec: &SandboxSpec) -> io::Result<()> {
-    use nix::mount::{mount, MsFlags};
-    use nix::sched::unshare;
-    use nix::unistd::{Gid, Uid};
+    #[cfg(target_os = "linux")]
+    {
+        use nix::mount::{mount, MsFlags};
+        use nix::sched::unshare;
+        use nix::unistd::{Gid, Uid};
 
-    validate_no_home_mount(&[&spec.workspace])
-        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
-    unshare(unshare_flags())?;
+        validate_no_home_mount(&[&spec.workspace])
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+        unshare(unshare_flags())?;
 
-    // 1:1 UID/GID mapping (unprivileged single-map write).
-    std::fs::write("/proc/self/setgroups", "deny").ok();
-    let uid = Uid::current();
-    let gid = Gid::current();
-    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
-    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+        // 1:1 UID/GID mapping (unprivileged single-map write).
+        std::fs::write("/proc/self/setgroups", "deny").ok();
+        let uid = Uid::current();
+        let gid = Gid::current();
+        std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+        std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
 
-    std::fs::create_dir_all(&spec.workspace)?;
-    mount(
-        Some("tmpfs"),
-        &spec.workspace,
-        Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        Some("size=80%,mode=755"),
-    )?;
-    std::env::set_current_dir(&spec.workspace)?;
-    Ok(())
+        std::fs::create_dir_all(&spec.workspace)?;
+        mount(
+            Some("tmpfs"),
+            &spec.workspace,
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("size=80%,mode=755"),
+        )?;
+        std::env::set_current_dir(&spec.workspace)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = spec;
+        Ok(())
+    }
 }
 
 /// Probe unprivileged userns support by spawning `true` with the child
 /// setup. Used once at startup to choose sandboxed vs plain spawning.
+#[cfg(target_os = "linux")]
 pub fn probe_userns() -> bool {
     let dir = std::env::temp_dir().join(format!("runner-userns-probe-{}", std::process::id()));
     let spec = match SandboxSpec::new(dir.clone()) {
@@ -115,6 +128,13 @@ pub fn probe_userns() -> bool {
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&dir);
     ok
+}
+
+/// Non-Linux hosts have no user namespaces; Tier-2 always degrades to
+/// governed direct spawning (plus platform QoS where available).
+#[cfg(not(target_os = "linux"))]
+pub fn probe_userns() -> bool {
+    false
 }
 
 /// Overwrite a file's bytes with OS randomness (best-effort per file).

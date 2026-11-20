@@ -11,15 +11,20 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             arch: x64
+            os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             arch: arm64
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            arch: arm64
+            os: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -55,15 +60,32 @@ jobs:
           # Cannot execute aarch64 on the x64 runner: assert arch instead.
           file "target/${{ matrix.target }}/release/runner" | grep -q aarch64
 
+      - name: Smoke-test release binary (macOS native)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/runner"
+          "$BIN" --version
+          # No doctor-ok assertion: Linux-only checks fail on macOS by
+          # design (see docs/macos.md); arch + version prove the build.
+          file "$BIN" | grep -q arm64
+
       - name: Package archive with checksums
         run: |
           set -euo pipefail
           STAGE="runner-${{ github.ref_name }}-${{ matrix.target }}"
+          if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
+            STAGE="runner-darwin-arm64"
+          fi
           mkdir -p "$STAGE"
           cp "target/${{ matrix.target }}/release/runner" "$STAGE/runner"
           cp README.md LICENSE "$STAGE/"
           tar -czf "$STAGE.tar.gz" "$STAGE"
-          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          else
+            shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

@@ -14,7 +14,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-latest]
+        # macos-latest is Apple Silicon (ARM); it gates portability
+        # (fmt/clippy/build) plus the live Darwin syscall tests, while
+        # the full hermetic suite stays Linux-only.
+        os: [ubuntu-22.04, ubuntu-latest, macos-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,7 +37,17 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run automated test suite
+        if: runner.os == 'Linux'
         run: cargo test --workspace --all-features
 
       - name: Documentation check
+        if: runner.os == 'Linux'
         run: cargo doc --workspace --no-deps
+
+      - name: Build all targets (macOS link check)
+        if: runner.os == 'macOS'
+        run: cargo build --workspace --all-targets
+
+      - name: Darwin syscall tests (macOS live)
+        if: runner.os == 'macOS'
+        run: cargo test -p runner-core --lib governor::darwin

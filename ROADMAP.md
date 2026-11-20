@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.4.0 and prior)
+## Shipped (v1.5.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -17,8 +17,14 @@ services or heavyweight frameworks.
 - Tier-1 vsock guest dispatch (`runner-guest-agent`, loopback-gated).
 - Zero-flake spawn retry, zero doc warnings, opt-in live-KVM harness.
 - WAN peer WireGuard execution transport (loopback-gated, direct peers).
+- macOS Apple Silicon port (Darwin QoS pinning, launchd, CI matrix).
 
-## Current: v1.4.0 (WAN Peer WireGuard Execution Transport)
+## Current: v1.5.0 (macOS Apple Silicon & Darwin QoS Portability)
+
+- Workspace compiles for both Apple targets; QoS pins CI to E-cores.
+- launchd installer, macOS CI + release assets, hermetic QoS tests.
+
+## Shipped in v1.4.0: WAN Peer WireGuard Execution Transport
 
 - Coordinator dispatches to `active` peers over Noise-encrypted UDP.
 - Join-announce onboarding, donor caps, leases, loopback gates.

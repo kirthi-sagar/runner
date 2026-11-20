@@ -296,9 +296,14 @@ pub(crate) async fn run_worker_with_jit(
         "runner: dispatching job {} ({}) sandboxed={}",
         cfg.job_tag, cfg.job_name, cfg.sandboxed
     );
-    let outcome = run_supervised(&launch, slice, cfg.timeout)
-        .await
-        .map_err(|e| format!("worker spawn: {e}"))?;
+    let outcome = run_supervised(
+        &launch,
+        slice,
+        cfg.timeout,
+        std::sync::Arc::new(runner_core::governor::darwin::DarwinQos),
+    )
+    .await
+    .map_err(|e| format!("worker spawn: {e}"))?;
     eprintln!("runner: job {} finished: {:?}", cfg.job_tag, outcome);
     Ok(outcome)
 }

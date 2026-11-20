@@ -182,8 +182,31 @@ pub struct SlotReport {
 /// Detect live slots. Under `afk_boost`, reserved headroom collapses to
 /// near-zero (spec section 3.4).
 pub fn detect_slots(afk_boost: bool) -> io::Result<SlotReport> {
-    let topology = detect_topology()?;
-    let (mem_total_mb, mem_avail_mb) = read_meminfo_mb()?;
+    #[cfg(target_os = "macos")]
+    {
+        return mac_slots(afk_boost);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let topology = detect_topology()?;
+        let (mem_total_mb, mem_avail_mb) = read_meminfo_mb()?;
+        Ok(slots_from_counts(
+            topology,
+            mem_total_mb,
+            mem_avail_mb,
+            afk_boost,
+        ))
+    }
+}
+
+/// Assemble a slot report from explicit counts (shared by the Linux
+/// sysfs path and the macOS sysconf path).
+fn slots_from_counts(
+    topology: CpuTopology,
+    mem_total_mb: u64,
+    mem_avail_mb: u64,
+    afk_boost: bool,
+) -> SlotReport {
     let (c_reserved, m_reserved_mb) = if afk_boost {
         (0.5, 512)
     } else {
@@ -200,13 +223,41 @@ pub fn detect_slots(afk_boost: bool) -> io::Result<SlotReport> {
         m_reserved_mb,
         m_job_min_mb: JOB_MIN_MEM_MB,
     });
-    Ok(SlotReport {
+    SlotReport {
         topology,
         mem_total_mb,
         mem_avail_mb,
         slots,
         afk_boost,
-    })
+    }
+}
+
+/// macOS slot detection: logical CPUs from the stdlib, total RAM from
+/// sysconf. Available memory approximates as total (no pressure
+/// feedback on macOS v1); the static reserve headroom still applies.
+#[cfg(target_os = "macos")]
+fn mac_slots(afk_boost: bool) -> io::Result<SlotReport> {
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+        .max(1);
+    // SAFETY: sysconf with valid names is pure.
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) };
+    let mem_total_mb = if pages > 0 && page_size > 0 {
+        ((pages as u64) * (page_size as u64)) / (1024 * 1024)
+    } else {
+        8192
+    };
+    Ok(slots_from_counts(
+        CpuTopology {
+            logical,
+            physical: logical,
+        },
+        mem_total_mb,
+        mem_total_mb,
+        afk_boost,
+    ))
 }
 
 /// `nproc`-trap clamps injected into every job sandbox (spec section 3.6).
@@ -221,6 +272,44 @@ pub fn sandbox_env_clamps() -> [(&'static str, &'static str); 4] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slots_from_counts_matches_detect_contract() {
+        // 8 logical CPUs, 16 GiB: sane multi-slot report, AFK boosts.
+        let plain = slots_from_counts(
+            CpuTopology {
+                logical: 8,
+                physical: 8,
+            },
+            16384,
+            16384,
+            false,
+        );
+        assert!(plain.slots >= 2, "slots: {}", plain.slots);
+        assert_eq!(plain.mem_total_mb, 16384);
+        assert!(!plain.afk_boost);
+        let boosted = slots_from_counts(
+            CpuTopology {
+                logical: 8,
+                physical: 8,
+            },
+            16384,
+            16384,
+            true,
+        );
+        assert!(boosted.slots >= plain.slots);
+        // Degenerate inputs still yield a usable report (never zero slots).
+        let tiny = slots_from_counts(
+            CpuTopology {
+                logical: 1,
+                physical: 1,
+            },
+            512,
+            512,
+            false,
+        );
+        assert!(tiny.slots >= 1);
+    }
+
     use super::*;
 
     #[test]

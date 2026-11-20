@@ -93,14 +93,16 @@ pub async fn execute_local_sandboxed(
     // Sandboxed runs chdir into the scratch workspace via pre_exec;
     // governed-direct runs inherit the caller's cwd so repo-relative
     // commands (`cargo test`, pre-commit hooks) resolve correctly.
-    if sandboxed {
-        let spec = workspace.sandbox_spec().map_err(|e| anyhow::anyhow!(e))?;
-        // SAFETY: pre_exec runs after fork in the child only; the closure
-        // performs the documented unshare/mount/chdir setup.
-        unsafe {
-            cmd.pre_exec(move || runner_sandbox::mounts::sandbox_pre_exec(&spec));
-        }
-    }
+    let spec = if sandboxed {
+        Some(workspace.sandbox_spec().map_err(|e| anyhow::anyhow!(e))?)
+    } else {
+        None
+    };
+    runner_core::governor::darwin::install_child_hook(
+        &mut cmd,
+        std::sync::Arc::new(runner_core::governor::darwin::DarwinQos),
+        spec.map(|spec| move || runner_sandbox::mounts::sandbox_pre_exec(&spec)),
+    );
 
     let slice = CgroupSlice::system_default();
     let _ = slice.ensure();
@@ -160,15 +162,17 @@ pub async fn execute_captured(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if sandboxed {
-        let spec = workspace.sandbox_spec().map_err(|e| anyhow::anyhow!(e))?;
-        // SAFETY: pre_exec runs after fork in the child only.
-        unsafe {
-            cmd.pre_exec(move || runner_sandbox::mounts::sandbox_pre_exec(&spec));
-        }
+    let spec = if sandboxed {
+        Some(workspace.sandbox_spec().map_err(|e| anyhow::anyhow!(e))?)
     } else {
         cmd.current_dir(workspace.path());
-    }
+        None
+    };
+    runner_core::governor::darwin::install_child_hook(
+        &mut cmd,
+        std::sync::Arc::new(runner_core::governor::darwin::DarwinQos),
+        spec.map(|spec| move || runner_sandbox::mounts::sandbox_pre_exec(&spec)),
+    );
 
     let slice = CgroupSlice::system_default();
     let _ = slice.ensure();

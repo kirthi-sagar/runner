@@ -6,7 +6,7 @@
 #   ./install.sh --help       show help
 set -eu
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 MIN_KERNEL_MAJOR=5
 MIN_KERNEL_MINOR=8
 
@@ -62,6 +62,25 @@ fi
 
 # --- Uninstall (before pre-flight: must work on broken hosts too) --------------
 if [ "$UNINSTALL" -eq 1 ]; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        if [ "$MODE" = "system" ]; then
+            BIN_DST="/usr/local/bin/runner"
+            UNIT_FILE="/Library/LaunchDaemons/com.runner.coordinator.plist"
+        else
+            HOME_DIR="${HOME:-$HOME}"
+            BIN_DST="$HOME_DIR/.local/bin/runner"
+            UNIT_FILE="$HOME_DIR/Library/LaunchAgents/com.runner.coordinator.plist"
+        fi
+        log "uninstalling runner ($MODE mode; config and data are kept)"
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "[dry-run] launchctl unload $UNIT_FILE"
+        elif command -v launchctl >/dev/null 2>&1; then
+            launchctl unload "$UNIT_FILE" 2>/dev/null || true
+        fi
+        run rm -f "$BIN_DST" "$UNIT_FILE"
+        log "runner uninstalled from $BIN_DST"
+        exit 0
+    fi
     if [ "$MODE" = "system" ]; then
         BIN_DST="/usr/local/bin/runner"
         UNIT_FILE="/etc/systemd/system/runner.service"
@@ -70,8 +89,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
         RELOAD="systemctl daemon-reload"
     else
         HOME_DIR="${HOME:-$HOME}"
-        BIN_DST="$HOME_DIR/.local/bin/runner"
-        UNIT_FILE="$HOME_DIR/.config/systemd/user/runner.service"
+        BIN_DST="$HOME_DIR/.config/systemd/user/runner.service"
         STOP="systemctl --user stop runner"
         DISABLE="systemctl --user disable runner"
         RELOAD="systemctl --user daemon-reload"
@@ -97,12 +115,31 @@ if [ "$UNINSTALL" -eq 1 ]; then
     exit 0
 fi
 
-if [ "$(uname -s)" = "Darwin" ]; then
-    log "error: macOS is not supported: the supervisor requires Linux cgroups v2; macOS support is planned post-v1.0"
-    exit 1
-fi
+# --- Platform dispatch ---------------------------------------------------------
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+case "$OS-$ARCH" in
+    Darwin-arm64) log "macOS Apple Silicon detected" ;;
+    Darwin-*) log "error: macOS support requires Apple Silicon (arm64); Intel macs are not supported"; exit 1 ;;
+    Linux-*) ;;
+    *) log "error: unsupported OS: $OS (want Linux or macOS)"; exit 1 ;;
+esac
 
 # --- Pre-flight checks -------------------------------------------------------
+if [ "$OS" = "Darwin" ]; then
+    if command -v launchctl >/dev/null 2>&1; then
+        log "launchd available OK"
+    else
+        log "error: launchctl not found; cannot manage the runner service"
+        exit 1
+    fi
+    if command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1; then
+        log "checksum tool available OK"
+    else
+        log "error: shasum (or sha256sum) required for secure release verification"
+        exit 1
+    fi
+else
 KERNEL="$(uname -r)"
 KMAJOR="$(printf '%s' "$KERNEL" | cut -d. -f1)"
 KMINOR="$(printf '%s' "$KERNEL" | cut -d. -f2 | cut -d- -f1)"
@@ -131,6 +168,7 @@ if unshare -Urm true >/dev/null 2>&1; then
 else
     log "warning: unprivileged user namespaces blocked; Tier-2 sandboxes fall back to plain spawn"
 fi
+fi
 
 # --- Locate or build the binary ----------------------------------------------
 BIN_SRC=""
@@ -144,11 +182,12 @@ elif command -v cargo >/dev/null 2>&1; then
     BIN_SRC="./target/release/runner"
 else
     # Zero-dependency fallback: fetch a prebuilt release tarball.
-    case "$(uname -m)" in
-        x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-        aarch64|arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+    case "$OS-$ARCH" in
+        Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+        Linux-aarch64|Linux-arm64) TARGET="aarch64-unknown-linux-gnu" ;;
+        Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
         *)
-            log "error: no local binary, no cargo, and unsupported architecture $(uname -m)"
+            log "error: no local binary, no cargo, and unsupported platform $OS-$ARCH"
             exit 1
             ;;
     esac
@@ -161,6 +200,9 @@ else
         exit 1
     fi
     TARBALL="runner-v$VERSION-$TARGET.tar.gz"
+    if [ "$OS" = "Darwin" ]; then
+        TARBALL="runner-darwin-arm64.tar.gz"
+    fi
     BASE_URL="https://github.com/kirthi-sagar/runner/releases/download/v$VERSION"
     TMP_DL="$(mktemp -d)"
     log "fetching prebuilt $TARBALL"
@@ -187,6 +229,9 @@ else
         fi
         tar -xzf "$TMP_DL/$TARBALL" -C "$TMP_DL"
         BIN_SRC="$TMP_DL/runner-v$VERSION-$TARGET/runner"
+        if [ "$OS" = "Darwin" ]; then
+            BIN_SRC="$TMP_DL/runner-darwin-arm64/runner"
+        fi
     fi
 fi
 log "binary: $BIN_SRC"
@@ -215,6 +260,13 @@ else
     PATH_LINE='Environment="PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"'
     WANTED_BY="default.target"
     RELOAD="systemctl --user daemon-reload"
+fi
+if [ "$OS" = "Darwin" ]; then
+    if [ "$MODE" = "system" ]; then
+        UNIT_FILE="/Library/LaunchDaemons/com.runner.coordinator.plist"
+    else
+        UNIT_FILE="$HOME_DIR/Library/LaunchAgents/com.runner.coordinator.plist"
+    fi
 fi
 log "mode: $MODE"
 
@@ -260,7 +312,7 @@ else
     log "writing env template: $ENV_FILE"
     if [ "$DRY_RUN" -eq 0 ]; then
         cat >"$ENV_FILE" <<'EOF'
-# runner environment (sourced by systemd; keep secret).
+# runner environment (sourced by the daemon; keep secret).
 # GitHub token with administration:write (classic PAT: repo scope,
 # or fine-grained PAT with Administration read & write).
 RUNNER_GITHUB_TOKEN=
@@ -269,9 +321,55 @@ EOF
     fi
 fi
 
-log "writing service unit: $UNIT_FILE"
-if [ "$DRY_RUN" -eq 0 ]; then
-    cat >"$UNIT_FILE" <<EOF
+if [ "$OS" = "Darwin" ]; then
+    if [ "$MODE" = "system" ]; then
+        LOG_DIR="/var/log/runner"
+    else
+        LOG_DIR="$HOME_DIR/Library/Logs/runner"
+    fi
+    run mkdir -p "$LOG_DIR"
+    log "writing launchd plist: $UNIT_FILE"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        cat >"$UNIT_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.runner.coordinator</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$BIN_DST</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$LOG_DIR/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_DIR/stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+</dict>
+</plist>
+EOF
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "[dry-run] launchctl load $UNIT_FILE"
+    elif launchctl load "$UNIT_FILE" 2>/dev/null; then
+        log "launchd agent loaded"
+    else
+        log "warning: launchctl load failed; run manually: launchctl load $UNIT_FILE"
+    fi
+else
+    log "writing service unit: $UNIT_FILE"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=runner - Zero-Freeze Local & Federated GitHub Actions Runner
 After=network.target
@@ -290,28 +388,36 @@ TimeoutStopSec=15s
 [Install]
 WantedBy=$WANTED_BY
 EOF
-fi
-
-if command -v systemctl >/dev/null 2>&1; then
-    if [ "$DRY_RUN" -eq 1 ]; then
-        log "[dry-run] $RELOAD"
-    elif $RELOAD 2>/dev/null; then
-        log "systemd reloaded"
-    else
-        log "warning: systemd reload failed (no user bus?); run manually: $RELOAD"
     fi
-else
-    log "warning: systemctl not found; start the daemon manually"
+    if command -v systemctl >/dev/null 2>&1; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            log "[dry-run] $RELOAD"
+        elif $RELOAD 2>/dev/null; then
+            log "systemd reloaded"
+        else
+            log "warning: systemd reload failed (no user bus?); run manually: $RELOAD"
+        fi
+    else
+        log "warning: systemctl not found; start the daemon manually"
+    fi
 fi
 
 log ""
 log "runner $VERSION installed to $BIN_DST"
 if [ "$MODE" = "system" ]; then
     log "configure: $CONF_FILE + $ENV_FILE"
-    log "start:     systemctl enable --now runner"
+    if [ "$OS" = "Darwin" ]; then
+        log "start:     launchctl load $UNIT_FILE"
+    else
+        log "start:     systemctl enable --now runner"
+    fi
 else
     log "configure: $CONF_FILE + $ENV_FILE"
-    log "start:     systemctl --user enable --now runner   (or: runner start)"
+    if [ "$OS" = "Darwin" ]; then
+        log "start:     launchctl load $UNIT_FILE   (or: runner start)"
+    else
+        log "start:     systemctl --user enable --now runner   (or: runner start)"
+    fi
     case ":$PATH:" in
         *":$HOME_DIR/.local/bin:"*) ;;
         *) log "note: add $HOME_DIR/.local/bin to PATH" ;;

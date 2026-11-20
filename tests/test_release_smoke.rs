@@ -15,7 +15,7 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// `VERSION="1.4.0"` from install.sh.
+/// `VERSION="1.5.0"` from install.sh.
 fn installer_version(sh: &str) -> String {
     sh.lines()
         .find_map(|line| {
@@ -27,7 +27,7 @@ fn installer_version(sh: &str) -> String {
         .to_string()
 }
 
-/// `[workspace.package] version = "1.4.0"` from the root manifest.
+/// `[workspace.package] version = "1.5.0"` from the root manifest.
 fn workspace_version(toml: &str) -> String {
     let mut in_workspace_package = false;
     for line in toml.lines() {
@@ -70,8 +70,12 @@ fn asset_pattern_matches_release_matrix() {
         sh.contains("https://github.com/kirthi-sagar/runner/releases/download/v$VERSION"),
         "installer base URL drifted"
     );
-    // Both architectures the workflow builds must be installable.
-    for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+    // Every target the workflow builds must be installable.
+    for target in [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-apple-darwin",
+    ] {
         assert!(
             sh.contains(target),
             "installer missing TARGET mapping for {target}"
@@ -85,6 +89,12 @@ fn asset_pattern_matches_release_matrix() {
     // installer consumes.
     assert!(workflow.contains("runner-*.tar.gz"));
     assert!(workflow.contains("runner-*.tar.gz.sha256"));
+    // The Darwin asset name is a deliberate special case (not the
+    // `runner-<version>-<triple>` convention); both sides must agree.
+    // The workflow composes it via STAGE, the installer names it fully.
+    assert!(workflow.contains("STAGE=\"runner-darwin-arm64\""));
+    assert!(workflow.contains("\"$STAGE.tar.gz\""));
+    assert!(sh.contains("runner-darwin-arm64.tar.gz"));
 }
 
 #[test]
@@ -128,18 +138,26 @@ fn installer_supports_uninstall_and_rejects_macos() {
         uninstall < preflight,
         "uninstall must run before pre-flight gates"
     );
-    // macOS exits early with guidance, never a cgroups error.
-    assert!(sh.contains("$(uname -s)\" = \"Darwin\""), "darwin guard");
-    assert!(sh.contains("macOS support is planned post-v1.0"));
-    let darwin = sh.find("Darwin").unwrap();
-    assert!(darwin < preflight, "darwin check precedes pre-flight");
+    // macOS installs via launchd (no hard error); Intel macs refuse cleanly.
+    assert!(sh.contains("Darwin-arm64"), "darwin target mapping");
+    assert!(
+        sh.contains("Library/LaunchAgents/com.runner.coordinator.plist"),
+        "launchd agent path"
+    );
+    assert!(sh.contains("launchctl load"), "launchd enablement");
+    assert!(sh.contains("launchctl unload"), "launchd uninstall");
+    assert!(sh.contains("Intel macs are not supported"), "intel refusal");
+    assert!(
+        !sh.contains("macOS support is planned post-v1.0"),
+        "stale planned-post-v1.0 marker"
+    );
 }
 
 #[test]
 fn sha256_sidecar_format_parses() {
     // Format produced by `sha256sum file > file.sha256` in release.yml:
     // "<64 hex>  <filename>". Parse it the way a verifier would.
-    let line = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  runner-v1.4.0-x86_64-unknown-linux-gnu.tar.gz\n";
+    let line = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  runner-v1.5.0-x86_64-unknown-linux-gnu.tar.gz\n";
     let (hex, file) = line.split_once("  ").expect("two-space separator");
     assert_eq!(hex.len(), 64);
     assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));

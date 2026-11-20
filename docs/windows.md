@@ -1,11 +1,53 @@
-# Windows via WSL2 (`docs/windows.md`)
+# Windows support (`docs/windows.md`)
 
-Native Windows is not supported: there is no Windows binary, no
-`install.ps1`, and the governor/sandbox stack is Linux-only. The
-supported Windows path is **WSL2**, where `runner` installs and runs
-as a Linux guest. WSL1 is not supported (no systemd, no cgroup v2).
+Two supported paths, pick one:
 
-## Prerequisites
+- **Native Windows (Tier-3)**: `runner.exe`, direct unprivileged
+  subprocess dispatch, no governor/sandbox. See below.
+- **Windows via WSL2**: full Linux guest with governor + sandbox.
+  See "Windows via WSL2" further down.
+
+## Native Windows (Tier-3 degraded mode)
+
+Supported: Tier-3 dispatch (direct unprivileged subprocess) and the
+WireGuard mesh transport (UDP + STUN work unchanged on Windows).
+
+Unsupported — every item logs loudly at the point of use, never
+silently: the governor (no PSI, no cgroups), Tier-2 sandboxing (no
+Linux namespaces), Tier-1 microVMs (no Firecracker/KVM), daemon IPC
+(no Unix domain sockets), and `runner top` (no `/proc` telemetry).
+
+Install (no admin rights required):
+
+```powershell
+irm https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.ps1 | iex
+```
+
+Then restart the terminal and run `runner doctor`. Expected output
+marks the unsupported subsystems explicitly — `kernel` and
+`cgroupsv2` report `feature unavailable on Windows`, and daemon IPC
+shows absent. Those entries are normal on this tier, not defects.
+
+Known limitations:
+
+- `runner init` accepts governor config, but it is ignored on
+  Windows (the governor never starts).
+- `runner top` exits with an `unsupported on Windows` message.
+- `runner start` (daemon) refuses to start: without IPC sockets and
+  a governor there is nothing useful to supervise. `runner exec` is
+  the supported entry point.
+
+Future (v2.0): Job Object governor, WFP egress filtering, and a
+native sandbox backend. Every current stub logs its feature name so
+the v2.0 work can be harvested by grep.
+
+## Windows via WSL2
+
+Full Linux guest support: `runner` installs and runs inside WSL2
+with governor, sandbox, and systemd service. WSL1 is not supported
+(no systemd, no cgroup v2).
+
+### Prerequisites
 
 - Windows 10 2004+ (Build 19041+) or Windows 11; WSL 0.67.6+.
 - A Linux distro (Ubuntu recommended): `wsl --install` from an admin
@@ -18,7 +60,7 @@ as a Linux guest. WSL1 is not supported (no systemd, no cgroup v2).
 The installer enforces all of this: running `install.sh` under WSL2
 without systemd, or with cgroups v1, fails closed with the fix.
 
-## Install
+### Install
 
 From inside the distro (not `/mnt/c` — see below):
 
@@ -34,7 +76,7 @@ systemd; a warning means systemd is off (see above). The installer
 refuses to run from `/mnt/*`: checkouts, caches, and the install
 itself must live inside the distro filesystem (`/home/...`).
 
-## Filesystem rule: stay inside the distro
+### Filesystem rule: stay inside the distro
 
 Never check out or run `runner` from `/mnt/c`. The 9P bridge is an
 order of magnitude slower than the distro's ext4 disk on
@@ -42,7 +84,7 @@ many-small-file workloads (`git status`, `node_modules`, caches),
 and synthesized permissions + CRLF silently break Linux tooling
 (shebang `\r` failures, lost `+x` bits).
 
-## Networking: NAT vs mirrored
+### Networking: NAT vs mirrored
 
 WSL2 defaults to NAT: localhost works both directions, but LAN hosts
 cannot reach the distro without a manual `netsh interface portproxy`
@@ -51,7 +93,7 @@ rule (fragile — the distro IP changes). For mesh participation
 (`networkingMode=mirrored` in `%USERPROFILE%\.wslconfig`, Windows 11
 22H2+), which gives direct LAN access, IPv6, and VPN/multicast.
 
-## Resources and governor scope
+### Resources and governor scope
 
 WSL2 defaults to 50% host RAM and all host logical processors, shown
 opaquely as `Vmmem`/`VmmemWSL`; bound them explicitly in
@@ -61,7 +103,7 @@ and cannot see host Windows load. `zero-freeze` on WSL2 therefore
 means VM-local stability, not host-aware scheduling — size the
 `.wslconfig` limits so the host keeps headroom.
 
-## Known limitations
+### Known limitations
 
 - Tier-1 microVMs unavailable: no `/dev/kvm` under WSL2
   (Tier-2 sandbox and Tier-3 dispatch work normally).

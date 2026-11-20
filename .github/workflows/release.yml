@@ -25,6 +25,9 @@ jobs:
           - target: aarch64-apple-darwin
             arch: arm64
             os: macos-latest
+          - target: x86_64-pc-windows-gnu
+            arch: x64
+            os: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,6 +40,10 @@ jobs:
       - name: Install aarch64 linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install MinGW cross-toolchain
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
@@ -60,6 +67,12 @@ jobs:
           # Cannot execute aarch64 on the x64 runner: assert arch instead.
           file "target/${{ matrix.target }}/release/runner" | grep -q aarch64
 
+      - name: Verify Windows artifact format
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          # Cannot execute Windows on the Linux runner: assert PE32+.
+          file "target/${{ matrix.target }}/release/runner.exe" | grep -qi "PE32"
+
       - name: Smoke-test release binary (macOS native)
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
@@ -73,6 +86,12 @@ jobs:
       - name: Package archive with checksums
         run: |
           set -euo pipefail
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ]; then
+            # Flat exe + sidecar (install.ps1 downloads these directly).
+            cp "target/${{ matrix.target }}/release/runner.exe" runner-windows-x86_64.exe
+            sha256sum runner-windows-x86_64.exe > runner-windows-x86_64.exe.sha256
+            exit 0
+          fi
           STAGE="runner-${{ github.ref_name }}-${{ matrix.target }}"
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
             STAGE="runner-darwin-arm64"
@@ -94,6 +113,8 @@ jobs:
           path: |
             runner-*.tar.gz
             runner-*.tar.gz.sha256
+            runner-windows-x86_64.exe
+            runner-windows-x86_64.exe.sha256
 
   release:
     name: Publish GitHub Release
@@ -111,4 +132,6 @@ jobs:
           files: |
             runner-*.tar.gz
             runner-*.tar.gz.sha256
+            runner-windows-x86_64.exe
+            runner-windows-x86_64.exe.sha256
           generate_release_notes: true

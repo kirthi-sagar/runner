@@ -238,6 +238,10 @@ pub struct DispatchContext {
     pub cache_url: Option<String>,
     /// Per-boot cache bearer token (paired with `cache_url`).
     pub cache_token: Option<String>,
+    /// Polled `owner/repo` slug: the job's true source repo under both
+    /// JIT scopes, used for cache namespacing + WAN offers (None when
+    /// unconfigured → `global` namespace).
+    pub repo_slug: Option<String>,
 }
 
 /// Worker run inputs shared by local dispatch (mints first) and peer
@@ -322,7 +326,15 @@ pub async fn dispatch_local(
     };
     let jit = mint_jit(&ctx.github, &ctx.scope, &req).await?;
     let cache = match (ctx.cache_url.clone(), ctx.cache_token.clone()) {
-        (Some(url), Some(token)) => Some((url, token)),
+        (Some(url), Some(token)) => {
+            // Namespaced endpoint when the repo is known; the bare base
+            // otherwise (legacy `global` namespace).
+            let url = match ctx.repo_slug.clone() {
+                Some(slug) => runner_core::cache::server::scoped_base_url(&url, &slug),
+                None => url,
+            };
+            Some((url, token))
+        }
         _ => None,
     };
     run_worker_with_jit(
@@ -625,6 +637,7 @@ async fn try_peer_dispatch(
             jit_blob: jit.encoded_jit_config,
             worker_version: ctx.worker_version.clone(),
             timeout_secs: ctx.timeout.as_secs().max(1),
+            repo: ctx.repo_slug.clone(),
         },
         ctx.timeout,
         node_id,

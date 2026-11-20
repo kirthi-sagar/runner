@@ -150,6 +150,129 @@ async fn federated_miss_imports_and_serves_peer_bytes() {
     assert_eq!(state_a.store.stats().hits, 2);
 }
 
+/// Seed one committed archive under a scope prefix ("" for legacy).
+async fn seed_archive_under(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    prefix: &str,
+    key: &str,
+    payload: &[u8],
+) {
+    let res = auth(
+        http.post(format!("{base}{prefix}/_apis/artifactcache/caches")),
+        token,
+    )
+    .json(&serde_json::json!({"key": key, "version": "v1"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 201);
+    let id = res.json::<serde_json::Value>().await.unwrap()["cacheId"]
+        .as_u64()
+        .unwrap();
+    auth(
+        http.patch(format!("{base}{prefix}/_apis/artifactcache/caches/{id}")),
+        token,
+    )
+    .header("content-range", format!("bytes 0-{}/*", payload.len() - 1))
+    .body(payload.to_vec())
+    .send()
+    .await
+    .unwrap();
+    let res = auth(
+        http.post(format!("{base}{prefix}/_apis/artifactcache/caches/{id}")),
+        token,
+    )
+    .json(&serde_json::json!({"size": payload.len()}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn federation_imports_only_the_requesting_scope() {
+    // Node B holds the same key under two scopes with different bytes.
+    let (base_b, state_b) = spawn_proxy_with_peers(vec![]).await;
+    let http = reqwest::Client::new();
+    seed_archive_under(
+        &http,
+        &base_b,
+        &state_b.token,
+        "/repos/acme/web",
+        "lib",
+        b"WEB-PEER",
+    )
+    .await;
+    seed_archive_under(
+        &http,
+        &base_b,
+        &state_b.token,
+        "/repos/acme/api",
+        "lib",
+        b"API-PEER",
+    )
+    .await;
+
+    let peer = CachePeer {
+        node_id: "node-b".to_string(),
+        base_url: base_b.clone(),
+        token: state_b.token.clone(),
+    };
+    let (base_a, state_a) = spawn_proxy_with_peers(vec![peer]).await;
+
+    // Scoped lookup federates and imports only that scope's bytes.
+    let res = auth(
+        http.get(format!(
+            "{base_a}/repos/acme/web/_apis/artifactcache/cache?keys=lib&version=v1"
+        )),
+        &state_a.token,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let hit: serde_json::Value = res.json().await.unwrap();
+    let location = hit["archiveLocation"].as_str().unwrap().to_string();
+    assert!(location.starts_with(&base_a), "location: {location}");
+    let bytes = http
+        .get(&location)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"WEB-PEER");
+    assert_eq!(state_a.store.stats().entries, 1);
+
+    // The twin scope imports its own bytes independently — never the
+    // already-imported sibling.
+    let res = auth(
+        http.get(format!(
+            "{base_a}/repos/acme/api/_apis/artifactcache/cache?keys=lib&version=v1"
+        )),
+        &state_a.token,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let hit: serde_json::Value = res.json().await.unwrap();
+    let location = hit["archiveLocation"].as_str().unwrap().to_string();
+    let bytes = http
+        .get(&location)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), b"API-PEER");
+    assert_eq!(state_a.store.stats().entries, 2);
+}
+
 #[tokio::test]
 async fn dead_and_empty_peers_fall_back_to_miss() {
     let dead = CachePeer {

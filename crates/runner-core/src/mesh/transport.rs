@@ -769,6 +769,7 @@ mod tests {
                     jit_blob: "B".to_string(),
                     worker_version: "2.338.2".to_string(),
                     timeout_secs: 60,
+                    repo: None,
                 },
                 Duration::from_millis(150),
             )

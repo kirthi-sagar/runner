@@ -91,6 +91,7 @@ fn offer(job_id: u64) -> JobOffer {
         jit_blob: "BLOB".to_string(),
         worker_version: "2.338.2".to_string(),
         timeout_secs: 60,
+        repo: Some("o/r".to_string()),
     }
 }
 

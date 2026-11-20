@@ -78,6 +78,7 @@ fn offer(job_id: u64) -> JobOffer {
         jit_blob: "BLOB".to_string(),
         worker_version: "2.338.2".to_string(),
         timeout_secs: 60,
+        repo: Some("o/r".to_string()),
     }
 }
 
@@ -553,6 +554,7 @@ async fn loopback_coordinator_loop_dispatches_to_peer() {
         timeout: Duration::from_secs(60),
         cache_url: None,
         cache_token: None,
+        repo_slug: Some("o/r".to_string()),
     };
     let coding = tokio::spawn(run_coordinator(
         poller,

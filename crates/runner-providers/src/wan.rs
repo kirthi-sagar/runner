@@ -61,6 +61,7 @@ pub struct WorkerExecutor {
     sandboxed: bool,
     timeout_cap: Duration,
     slice: CgroupSlice,
+    state: SharedState,
 }
 
 impl WorkerExecutor {
@@ -69,12 +70,14 @@ impl WorkerExecutor {
         sandboxed: bool,
         timeout_cap: Duration,
         slice: CgroupSlice,
+        state: SharedState,
     ) -> Self {
         Self {
             worker_version,
             sandboxed,
             timeout_cap,
             slice,
+            state,
         }
     }
 }
@@ -86,15 +89,29 @@ impl PeerExecutor for WorkerExecutor {
     ) -> Pin<Box<dyn std::future::Future<Output = JobResult> + Send + 'a>> {
         Box::pin(async move {
             let timeout = Duration::from_secs(offer.timeout_secs.max(1)).min(self.timeout_cap);
+            // The peer's OWN loopback proxy (never the coordinator's LAN
+            // endpoint: unreachable over WAN, and its bearer must not
+            // cross the mesh), namespaced to the offered repo.
+            let cache = {
+                let guard = self.state.read().await;
+                match (guard.cache_base_url(), guard.cache_token()) {
+                    (Some(url), Some(token)) => {
+                        let url = match offer.repo.clone() {
+                            Some(slug) => runner_core::cache::server::scoped_base_url(&url, &slug),
+                            None => url,
+                        };
+                        Some((url, token))
+                    }
+                    _ => None,
+                }
+            };
             let cfg = WorkerRunConfig {
                 worker_version: self.worker_version.clone(),
                 jit_blob: offer.jit_blob.clone(),
                 job_tag: format!("peer-{}", offer.job_id),
                 job_name: offer.name.clone(),
                 sandboxed: self.sandboxed,
-                // Never the coordinator's LAN cache endpoint: unreachable
-                // over WAN and its bearer must not cross the mesh.
-                cache: None,
+                cache,
                 timeout,
             };
             match run_worker_with_jit(&cfg, Some(&self.slice)).await {

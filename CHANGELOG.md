@@ -6,6 +6,23 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.7.0 — 2026-11-20
+
+- Per-repo cache isolation: the transparent proxy namespaces entries
+  by `owner/repo` scope (`/repos/:owner/:repo/_apis/...` routes,
+  `(scope, version, key)` store indices), so multi-tenant meshes never
+  share or collide dependency caches across repositories. Workers get
+  a scoped `ACTIONS_CACHE_URL` on local dispatch and WAN peers (via
+  the peer's own loopback proxy); legacy unscoped clients and
+  pre-v1.7.0 index rows fall back to a `global` namespace with no
+  wipe. Federation imports only the requesting scope.
+- WAN wire note: `JobOffer` gains an optional `repo` slug — old peers
+  reject v1.7.0 offers (same one-directional pattern as v1.6.0), with
+  safe same-tick fallback; upgrade peers first.
+- Doctor NAT diagnostics: `runner doctor` reports the STUN reflexive
+  address and NAT class (`direct`/`cone`/`symmetric`) in text and
+  `--format json`, warning (never failing) when offline or symmetric.
+
 ## v1.6.0 — 2026-11-20
 
 - NAT traversal for WAN peers: friends-and-family donors behind home

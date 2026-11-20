@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use std::collections::HashMap;
 
-use super::store::{CacheStore, ReserveOutcome, StoreError};
+use super::store::{CacheStore, ReserveOutcome, StoreError, GLOBAL_SCOPE};
 
 /// Worker-facing cache endpoint variable.
 pub const ACTIONS_CACHE_URL_ENV: &str = "ACTIONS_CACHE_URL";
@@ -33,6 +33,49 @@ pub fn worker_env(base_url: &str, token: &str) -> Vec<(String, String)> {
         ),
         (ACTIONS_RUNTIME_TOKEN_ENV.to_string(), token.to_string()),
     ]
+}
+
+/// Scope a proxy base URL: appends `/repos/{scope}` (no trailing
+/// slash; `worker_env` adds it). Providers pre-scope the cached
+/// endpoint before handing it to the worker seam.
+pub fn scoped_base_url(base_url: &str, scope: &str) -> String {
+    format!("{}/repos/{scope}", base_url.trim_end_matches('/'))
+}
+
+/// Scoped worker env: the base URL gains `/repos/{scope}` so the
+/// client's `_apis/...` calls land on the namespaced routes.
+pub fn worker_env_scoped(base_url: &str, token: &str, scope: &str) -> Vec<(String, String)> {
+    worker_env(&scoped_base_url(base_url, scope), token)
+}
+
+/// Join validated `owner`/`repo` path segments into an `owner/repo`
+/// scope (`None` → 400). Segments follow GitHub naming (alphanumeric
+/// plus `.`, `_`, `-`); the scope is only ever an index key and hash
+/// input, never a filesystem path.
+fn scope_for(owner: &str, repo: &str) -> Option<String> {
+    if valid_scope_segment(owner) && valid_scope_segment(repo) {
+        Some(format!("{owner}/{repo}"))
+    } else {
+        None
+    }
+}
+
+fn valid_scope_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment.len() <= 128
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+fn bad_request(msg: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": msg })),
+    )
+        .into_response()
 }
 
 /// Shared server state (cloneable handle).
@@ -191,11 +234,34 @@ fn unauthorized() -> axum::response::Response {
         .into_response()
 }
 
-/// `GET cache?keys=a,b&version=v` → hit JSON or 204 miss.
+/// `GET cache?keys=a,b&version=v` → hit JSON or 204 miss (legacy
+/// unscoped route: serves the `global` namespace).
 async fn lookup_cache(
     State(state): State<CacheServerState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    lookup_cache_for(&state, headers, &params, GLOBAL_SCOPE).await
+}
+
+/// Scoped lookup: identical, namespaced to one repo.
+async fn lookup_cache_scoped(
+    State(state): State<CacheServerState>,
+    Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let Some(scope) = scope_for(&owner, &repo) else {
+        return bad_request("invalid repo scope");
+    };
+    lookup_cache_for(&state, headers, &params, &scope).await
+}
+
+async fn lookup_cache_for(
+    state: &CacheServerState,
+    headers: HeaderMap,
+    params: &HashMap<String, String>,
+    scope: &str,
 ) -> axum::response::Response {
     if !authorized(&headers, &state.token) {
         return unauthorized();
@@ -212,13 +278,13 @@ async fn lookup_cache(
         )
             .into_response();
     }
-    match state.store.lookup(&version, &keys) {
-        Some(entry) => lookup_hit(&state, &entry).into_response(),
-        None => match federate_lookup(&state, &version, &keys).await {
+    match state.store.lookup(scope, &version, &keys) {
+        Some(entry) => lookup_hit(state, &entry).into_response(),
+        None => match federate_lookup(state, scope, &version, &keys).await {
             // Imported from a peer: re-resolve locally so the response
             // carries our own signed URL and a consistent hit record.
-            Some(_) => match state.store.lookup(&version, &keys) {
-                Some(entry) => lookup_hit(&state, &entry).into_response(),
+            Some(_) => match state.store.lookup(scope, &version, &keys) {
+                Some(entry) => lookup_hit(state, &entry).into_response(),
                 None => StatusCode::NO_CONTENT.into_response(),
             },
             None => StatusCode::NO_CONTENT.into_response(),
@@ -255,24 +321,37 @@ fn lookup_hit(
 /// imported entry's key on success.
 async fn federate_lookup(
     state: &CacheServerState,
+    scope: &str,
     version: &str,
     keys: &[String],
 ) -> Option<String> {
     for peer in state.peers.cache_peers().await {
-        if let Some(key) = fetch_from_peer(state, &peer, version, keys).await {
+        if let Some(key) = fetch_from_peer(state, &peer, scope, version, keys).await {
             return Some(key);
         }
     }
     None
 }
 
+/// Peer lookup path for a scope: namespaced except `global`, so a
+/// federated hit can only ever import the requesting scope's entries.
+/// Pre-v1.7.0 peers 404 scoped paths, which falls through to a miss.
+fn peer_lookup_url(peer: &CachePeer, scope: &str) -> String {
+    if scope == GLOBAL_SCOPE {
+        format!("{}/_apis/artifactcache/cache", peer.base_url)
+    } else {
+        format!("{}/repos/{scope}/_apis/artifactcache/cache", peer.base_url)
+    }
+}
+
 async fn fetch_from_peer(
     state: &CacheServerState,
     peer: &CachePeer,
+    scope: &str,
     version: &str,
     keys: &[String],
 ) -> Option<String> {
-    let lookup_url = format!("{}/_apis/artifactcache/cache", peer.base_url);
+    let lookup_url = peer_lookup_url(peer, scope);
     let mut request = state
         .http
         .get(&lookup_url)
@@ -295,7 +374,7 @@ async fn fetch_from_peer(
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())?;
-    let id = match state.store.reserve(&key, version) {
+    let id = match state.store.reserve(scope, &key, version) {
         Ok(ReserveOutcome::Created(id)) => id,
         // Raced locally while fetching: already have it.
         Ok(ReserveOutcome::Exists(_)) => return Some(key),
@@ -346,6 +425,28 @@ async fn reserve_cache(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
+    reserve_cache_for(&state, headers, &body, GLOBAL_SCOPE).await
+}
+
+/// Scoped reserve: the pending upload is namespaced to one repo.
+async fn reserve_cache_scoped(
+    State(state): State<CacheServerState>,
+    Path((owner, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let Some(scope) = scope_for(&owner, &repo) else {
+        return bad_request("invalid repo scope");
+    };
+    reserve_cache_for(&state, headers, &body, &scope).await
+}
+
+async fn reserve_cache_for(
+    state: &CacheServerState,
+    headers: HeaderMap,
+    body: &serde_json::Value,
+    scope: &str,
+) -> axum::response::Response {
     if !authorized(&headers, &state.token) {
         return unauthorized();
     }
@@ -359,7 +460,7 @@ async fn reserve_cache(
         )
             .into_response();
     };
-    match state.store.reserve(key, version) {
+    match state.store.reserve(scope, key, version) {
         Ok(ReserveOutcome::Created(id)) => (
             StatusCode::CREATED,
             Json(serde_json::json!({ "cacheId": id })),
@@ -397,6 +498,29 @@ async fn upload_chunk(
     State(state): State<CacheServerState>,
     headers: HeaderMap,
     Path(id): Path<u64>,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    upload_chunk_for(state, headers, id, body).await
+}
+
+/// Scoped chunk upload: uploads are id-keyed (the scope was fixed at
+/// reserve), so this only validates the segments, then delegates.
+async fn upload_chunk_scoped(
+    State(state): State<CacheServerState>,
+    Path((owner, repo, id)): Path<(String, String, u64)>,
+    headers: HeaderMap,
+    body: axum::body::Body,
+) -> axum::response::Response {
+    if scope_for(&owner, &repo).is_none() {
+        return bad_request("invalid repo scope");
+    }
+    upload_chunk_for(state, headers, id, body).await
+}
+
+async fn upload_chunk_for(
+    state: CacheServerState,
+    headers: HeaderMap,
+    id: u64,
     body: axum::body::Body,
 ) -> axum::response::Response {
     use futures_util::TryStreamExt;
@@ -498,6 +622,28 @@ async fn commit_cache(
     headers: HeaderMap,
     Path(id): Path<u64>,
     Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    commit_cache_for(&state, headers, id, &body).await
+}
+
+/// Scoped commit: id-keyed like uploads; validates, then delegates.
+async fn commit_cache_scoped(
+    State(state): State<CacheServerState>,
+    Path((owner, repo, id)): Path<(String, String, u64)>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> axum::response::Response {
+    if scope_for(&owner, &repo).is_none() {
+        return bad_request("invalid repo scope");
+    }
+    commit_cache_for(&state, headers, id, &body).await
+}
+
+async fn commit_cache_for(
+    state: &CacheServerState,
+    headers: HeaderMap,
+    id: u64,
+    body: &serde_json::Value,
 ) -> axum::response::Response {
     if !authorized(&headers, &state.token) {
         return unauthorized();
@@ -672,6 +818,21 @@ pub fn router(state: CacheServerState) -> axum::Router {
             axum::routing::patch(upload_chunk).post(commit_cache),
         )
         .route("/_apis/artifactcache/artifacts/:id", get(download_artifact))
+        // Scoped twins: same handlers, namespaced to one repo. Downloads
+        // stay unscoped-only (lookup mints an absolute `archiveLocation`;
+        // the HMAC token minted at scoped lookup time is the gate).
+        .route(
+            "/repos/:owner/:repo/_apis/artifactcache/cache",
+            get(lookup_cache_scoped),
+        )
+        .route(
+            "/repos/:owner/:repo/_apis/artifactcache/caches",
+            axum::routing::post(reserve_cache_scoped),
+        )
+        .route(
+            "/repos/:owner/:repo/_apis/artifactcache/caches/:id",
+            axum::routing::patch(upload_chunk_scoped).post(commit_cache_scoped),
+        )
         .with_state(state)
 }
 
@@ -758,6 +919,49 @@ mod tests {
         assert_ne!(a.token, b.token);
         assert_ne!(a.download_secret, b.download_secret);
         assert!(!a.token.is_empty());
+    }
+
+    #[test]
+    fn scope_segments_join_and_reject_cleanly() {
+        assert_eq!(scope_for("acme", "web"), Some("acme/web".to_string()));
+        assert_eq!(
+            scope_for("my-org_1", "repo.js"),
+            Some("my-org_1/repo.js".to_string())
+        );
+        for (owner, repo) in [
+            ("", "web"),
+            ("acme", ""),
+            (".", "web"),
+            ("acme", ".."),
+            ("ac/me", "web"),
+            ("acme", "w eb"),
+            ("acme!", "web"),
+        ] {
+            assert_eq!(scope_for(owner, repo), None, "{owner}/{repo}");
+        }
+    }
+
+    #[test]
+    fn scoped_worker_env_nests_under_repos() {
+        let env = worker_env_scoped("http://127.0.0.1:8787", "tok", "acme/web");
+        assert_eq!(env[0].0, "ACTIONS_CACHE_URL");
+        assert_eq!(env[0].1, "http://127.0.0.1:8787/repos/acme/web/");
+        // Trailing slashes collapse; global stays unscoped.
+        let env = worker_env_scoped("http://127.0.0.1:8787/", "tok", "acme/web");
+        assert_eq!(env[0].1, "http://127.0.0.1:8787/repos/acme/web/");
+        let peer = CachePeer {
+            node_id: "n".to_string(),
+            base_url: "http://10.0.0.2:8787".to_string(),
+            token: "t".to_string(),
+        };
+        assert_eq!(
+            peer_lookup_url(&peer, "acme/web"),
+            "http://10.0.0.2:8787/repos/acme/web/_apis/artifactcache/cache"
+        );
+        assert_eq!(
+            peer_lookup_url(&peer, GLOBAL_SCOPE),
+            "http://10.0.0.2:8787/_apis/artifactcache/cache"
+        );
     }
 
     #[test]

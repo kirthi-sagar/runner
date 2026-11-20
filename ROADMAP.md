@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.6.0 and prior)
+## Shipped (v1.7.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -20,8 +20,15 @@ services or heavyweight frameworks.
 - macOS Apple Silicon port (Darwin QoS pinning, launchd, CI matrix).
 - NAT traversal for WAN peers (STUN reflexive discovery, observed-source
   routing through cone + symmetric NAT, JoinAccept).
+- Per-repo cache isolation (`owner/repo` namespacing, legacy `global`
+  fallback) + doctor NAT diagnostics.
 
-## Current: v1.6.0 (NAT Traversal for WAN Peers via STUN)
+## Current: v1.7.0 (Per-Repo Cache Isolation & Doctor NAT Diagnostics)
+
+- Scoped proxy routes + store indices; slug injection on both paths.
+- `doctor` reports reflexive address + NAT class (never fails offline).
+
+## Shipped in v1.6.0: NAT Traversal for WAN Peers via STUN
 
 - Zero-dependency RFC 5389 client; hole-punching via the WG handshake.
 - Hermetic NAT simulation gates (cone + symmetric) in CI.
@@ -81,7 +88,7 @@ services or heavyweight frameworks.
   authoritative (single laptop + Codespaces WAN cannot route
   link-local mDNS; physical two-laptop Wi-Fi does not block GA).
 - WAN peer WireGuard transport stays a post-v1.0 enterprise
-  extension (see Later); routing remains fail-closed.
+  extension (shipped in v1.4.0); routing remains fail-closed.
 
 ## Shipped in v1.0.0: GA Hardening & Production Polish
 
@@ -166,11 +173,6 @@ services or heavyweight frameworks.
 - MCP expansion to 10 agent-native tools (`AgentTools` trait).
 - Embedded web dashboard + enriched `/health`.
 - 5-minute scale-to-zero cloud watchdog + `runner cloud` CLI.
-
-## Later: cache federation follow-ups
-
-- Per-repo isolation once the protocol can carry repo identity
-  (standard clients send none).
 
 ## Explicit non-goals
 

@@ -9,11 +9,17 @@ use std::time::Duration;
 /// Spawn the proxy on an ephemeral loopback port with fresh per-boot
 /// credentials; returns (base URL, server state handle).
 async fn spawn_proxy() -> (String, CacheServerState) {
+    spawn_proxy_with_budget(1 << 30).await
+}
+
+/// Same, with an explicit store budget (eviction tests).
+async fn spawn_proxy_with_budget(max_bytes: u64) -> (String, CacheServerState) {
     let dir = runner::test_support::TempDir::new("cache-proxy").unwrap();
     // Leak the dir: the server task outlives this fn but the process
     // owns cleanup (TempDir drops at process exit via leaked Box).
     let dir: &'static _ = Box::leak(Box::new(dir));
-    let store = runner::cache::store::CacheStore::open(&dir.path().join("cache"), 1 << 30).unwrap();
+    let store =
+        runner::cache::store::CacheStore::open(&dir.path().join("cache"), max_bytes).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let base = format!("http://127.0.0.1:{port}");
@@ -422,4 +428,223 @@ async fn oversize_chunk_is_rejected_without_buffering() {
     .await
     .unwrap();
     assert_eq!(res.status().as_u16(), 413);
+}
+
+/// Reserve → single chunk → commit under `prefix` ("" for the legacy
+/// route, "/repos/{owner}/{repo}" for scoped); returns the cache id.
+async fn put(
+    http: &reqwest::Client,
+    base: &str,
+    prefix: &str,
+    token: &str,
+    key: &str,
+    version: &str,
+    payload: &[u8],
+) -> u64 {
+    let res = auth(
+        http.post(format!("{base}{prefix}/_apis/artifactcache/caches")),
+        token,
+    )
+    .json(&serde_json::json!({"key": key, "version": version}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 201, "reserve {key} under {prefix:?}");
+    let id = res.json::<serde_json::Value>().await.unwrap()["cacheId"]
+        .as_u64()
+        .unwrap();
+    let res = auth(
+        http.patch(format!("{base}{prefix}/_apis/artifactcache/caches/{id}")),
+        token,
+    )
+    .header("content-range", format!("bytes 0-{}/*", payload.len() - 1))
+    .body(payload.to_vec())
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    let res = auth(
+        http.post(format!("{base}{prefix}/_apis/artifactcache/caches/{id}")),
+        token,
+    )
+    .json(&serde_json::json!({"size": payload.len()}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    id
+}
+
+async fn lookup_status(
+    http: &reqwest::Client,
+    base: &str,
+    prefix: &str,
+    token: &str,
+    keys: &str,
+    version: &str,
+) -> u16 {
+    auth(
+        http.get(format!(
+            "{base}{prefix}/_apis/artifactcache/cache?keys={keys}&version={version}"
+        )),
+        token,
+    )
+    .send()
+    .await
+    .unwrap()
+    .status()
+    .as_u16()
+}
+
+async fn download_bytes(location: &str) -> Vec<u8> {
+    reqwest::Client::new()
+        .get(location)
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+#[tokio::test]
+async fn scoped_namespaces_are_isolated_over_http() {
+    let (base, state) = spawn_proxy().await;
+    let (http, token) = (reqwest::Client::new(), &state.token);
+    let web = "/repos/acme/web";
+    let api = "/repos/acme/api";
+
+    put(&http, &base, web, token, "npm-abc", "v1", b"WEB-DATA").await;
+    // Same key + version under another scope: miss, then an independent
+    // entry with its own bytes.
+    assert_eq!(
+        lookup_status(&http, &base, api, token, "npm-abc", "v1").await,
+        204
+    );
+    put(&http, &base, api, token, "npm-abc", "v1", b"API-DATA").await;
+
+    // Each scope serves its own bytes (via its own signed URL).
+    for (prefix, expected) in [(web, b"WEB-DATA"), (api, b"API-DATA")] {
+        let res = auth(
+            http.get(format!(
+                "{base}{prefix}/_apis/artifactcache/cache?keys=npm-abc&version=v1"
+            )),
+            token,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        let hit: serde_json::Value = res.json().await.unwrap();
+        let location = hit["archiveLocation"].as_str().unwrap().to_string();
+        assert_eq!(download_bytes(&location).await, expected);
+    }
+    // Restore-key prefixes never cross scopes either.
+    assert_eq!(
+        lookup_status(
+            &http,
+            &base,
+            "/repos/other/repo",
+            token,
+            "npm-zzz,npm-",
+            "v1"
+        )
+        .await,
+        204
+    );
+    assert_eq!(
+        lookup_status(&http, &base, web, token, "npm-zzz,npm-", "v1").await,
+        200
+    );
+}
+
+#[tokio::test]
+async fn legacy_unscoped_route_serves_global_namespace() {
+    let (base, state) = spawn_proxy().await;
+    let (http, token) = (reqwest::Client::new(), &state.token);
+
+    put(&http, &base, "", token, "tool-chain", "v2", b"GLOBAL-DATA").await;
+    assert_eq!(
+        lookup_status(&http, &base, "", token, "tool-chain", "v2").await,
+        200
+    );
+    // The global entry is invisible to scoped namespaces and vice versa.
+    assert_eq!(
+        lookup_status(&http, &base, "/repos/acme/web", token, "tool-chain", "v2").await,
+        204
+    );
+    put(
+        &http,
+        &base,
+        "/repos/acme/web",
+        token,
+        "tool-chain",
+        "v2",
+        b"SCOPED-DATA",
+    )
+    .await;
+    assert_eq!(
+        lookup_status(&http, &base, "", token, "tool-chain", "v2").await,
+        200
+    );
+}
+
+#[tokio::test]
+async fn invalid_scopes_rejected() {
+    let (base, state) = spawn_proxy().await;
+    let (http, token) = (reqwest::Client::new(), &state.token);
+    // (Dot segments are covered at the unit level: HTTP clients
+    // normalize them before sending, so they never reach the router.)
+    let long = "a".repeat(129);
+    let long_prefix = format!("/repos/{long}/web");
+    for prefix in [
+        "/repos/acme!/web".to_string(),
+        "/repos/acme/web!".to_string(),
+        long_prefix,
+    ] {
+        assert_eq!(
+            lookup_status(&http, &base, &prefix, token, "k", "v").await,
+            400,
+            "prefix: {prefix}"
+        );
+        let res = auth(
+            http.post(format!("{base}{prefix}/_apis/artifactcache/caches")),
+            token,
+        )
+        .json(&serde_json::json!({"key": "k", "version": "v"}))
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(res.status().as_u16(), 400, "prefix: {prefix}");
+    }
+}
+
+#[tokio::test]
+async fn lru_evicts_fairly_across_scopes_over_http() {
+    let (base, state) = spawn_proxy_with_budget(20).await;
+    let (http, token) = (reqwest::Client::new(), &state.token);
+    put(&http, &base, "/repos/a/r", token, "old", "v", b"0123456789").await;
+    put(&http, &base, "/repos/b/r", token, "new", "v", b"0123456789").await;
+    // Touch "old" in a later second so scope B's entry is the LRU
+    // victim when scope C's entry overfills the shared budget.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        lookup_status(&http, &base, "/repos/a/r", token, "old", "v").await,
+        200
+    );
+    put(&http, &base, "/repos/c/r", token, "third", "v", b"01234").await;
+    assert_eq!(
+        lookup_status(&http, &base, "/repos/a/r", token, "old", "v").await,
+        200
+    );
+    assert_eq!(
+        lookup_status(&http, &base, "/repos/b/r", token, "new", "v").await,
+        204
+    );
+    assert_eq!(
+        lookup_status(&http, &base, "/repos/c/r", token, "third", "v").await,
+        200
+    );
+    assert!(state.store.stats().size_bytes <= 20);
 }

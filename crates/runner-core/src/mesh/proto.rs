@@ -57,7 +57,11 @@ pub struct JoinAccept {
     pub reflexive: Option<String>,
 }
 
-/// One job offered for remote execution (encrypted).
+/// One job offered for remote execution (encrypted). `repo` is the
+/// v1.7.0 `owner/name` scope for the peer's cache namespace, optional
+/// so older coordinators still parse; older peers reject v1.7.0 offers
+/// (`deny_unknown_fields`), so wire compat is one-directional by
+/// design — upgrade peers before relying on scoped WAN cache.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobOffer {
@@ -70,6 +74,8 @@ pub struct JobOffer {
     pub jit_blob: String,
     pub worker_version: String,
     pub timeout_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 /// Immediate accept/reject for an offer (encrypted).
@@ -212,6 +218,7 @@ mod tests {
             jit_blob: "BLOB".to_string(),
             worker_version: "2.338.2".to_string(),
             timeout_secs: 60,
+            repo: Some("acme/web".to_string()),
         })
     }
 
@@ -294,6 +301,27 @@ mod tests {
         assert_eq!(decode_message(&frame).unwrap(), accept);
         // Never plaintext: only JoinAnnounce may skip the session.
         assert!(encode_plaintext(&accept).is_err());
+    }
+
+    #[test]
+    fn v16_offer_without_repo_still_parses() {
+        // A pre-v1.7.0 offer (no repo key) parses with repo None;
+        // serializing it omits the key (old peers accept it as-is).
+        let msg = sample_offer();
+        let frame = encode_message(&msg).unwrap();
+        let decoded = decode_message(&frame).unwrap();
+        assert_eq!(decoded, msg);
+        let PeerMessage::JobOffer(offer) = decoded else {
+            panic!("test setup");
+        };
+        assert_eq!(offer.repo.as_deref(), Some("acme/web"));
+        let mut legacy = offer.clone();
+        legacy.repo = None;
+        let json = serde_json::to_vec(&PeerMessage::JobOffer(legacy.clone())).unwrap();
+        let text = String::from_utf8(json).unwrap();
+        assert!(!text.contains("\"repo\""), "{text}");
+        let back: PeerMessage = serde_json::from_slice(text.as_bytes()).unwrap();
+        assert_eq!(back, PeerMessage::JobOffer(legacy));
     }
 
     #[test]

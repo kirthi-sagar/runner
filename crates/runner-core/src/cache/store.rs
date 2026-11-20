@@ -19,11 +19,20 @@ use sha2::{Digest, Sha256};
 
 /// Default budget when `[cache] max_size_gb` is unset.
 pub const DEFAULT_MAX_SIZE_GB: u64 = 10;
+/// Namespace for legacy unscoped entries and clients (`global`).
+pub const GLOBAL_SCOPE: &str = "global";
 
-/// One committed archive.
+fn default_scope() -> String {
+    GLOBAL_SCOPE.to_string()
+}
+
+/// One committed archive. `scope` is the `owner/repo` namespace
+/// (`global` for legacy rows, which predate the field).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntryMeta {
     pub id: u64,
+    #[serde(default = "default_scope")]
+    pub scope: String,
     pub key: String,
     pub version: String,
     pub file: String,
@@ -78,8 +87,8 @@ pub struct CacheStatsSnapshot {
 #[derive(Debug)]
 struct StoreInner {
     entries: HashMap<u64, CacheEntryMeta>,
-    /// Reserved-but-uncommitted uploads: id → (key, version).
-    pending: HashMap<u64, (String, String)>,
+    /// Reserved-but-uncommitted uploads: id → (scope, key, version).
+    pending: HashMap<u64, (String, String, String)>,
     next_id: u64,
     stats: CacheStatsData,
 }
@@ -129,9 +138,11 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Content stem for a (version, key) pair.
-fn entry_filename(version: &str, key: &str) -> String {
+/// Content stem for a (scope, version, key) triple.
+fn entry_filename(scope: &str, version: &str, key: &str) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
     hasher.update(version.as_bytes());
     hasher.update([0]);
     hasher.update(key.as_bytes());
@@ -184,6 +195,27 @@ impl CacheStore {
         };
         // Drop rows whose archives vanished out-of-band.
         index.entries.retain(|e| dir.join(&e.file).is_file());
+        // Sweep archives no row references: pre-v1.7.0 files (hashed
+        // without scope) can never match again after the upgrade.
+        {
+            let live: std::collections::HashSet<&str> =
+                index.entries.iter().map(|e| e.file.as_str()).collect();
+            if let Ok(read) = std::fs::read_dir(dir) {
+                for entry in read.flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if path.is_file()
+                        && name != "index.json"
+                        && name != "index.json.corrupt"
+                        && !name.ends_with(".tmp")
+                        && !live.contains(name.as_ref())
+                    {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
         let store = Self {
             dir: dir.to_path_buf(),
             max_bytes,
@@ -220,17 +252,18 @@ impl CacheStore {
         Ok(())
     }
 
-    /// Look up (version, primary key + restore-key fallbacks). Exact match
-    /// on the primary key; each fallback prefix-matches in order with the
-    /// most-recently-used winner. Records hit/miss + access time.
-    pub fn lookup(&self, version: &str, keys: &[String]) -> Option<CacheEntryMeta> {
+    /// Look up (scope, version, primary key + restore-key fallbacks).
+    /// Exact match on the primary key; each fallback prefix-matches in
+    /// order with the most-recently-used winner. Records hit/miss +
+    /// access time. Scopes never see each other's entries.
+    pub fn lookup(&self, scope: &str, version: &str, keys: &[String]) -> Option<CacheEntryMeta> {
         let mut inner = self.inner.lock().ok()?;
         let mut key_iter = keys.iter();
         let primary = key_iter.next()?;
         let found = inner
             .entries
             .values()
-            .find(|e| e.version == version && e.key == *primary)
+            .find(|e| e.scope == scope && e.version == version && e.key == *primary)
             .map(|e| e.id)
             .or_else(|| {
                 key_iter
@@ -238,7 +271,11 @@ impl CacheStore {
                         inner
                             .entries
                             .values()
-                            .filter(|e| e.version == version && e.key.starts_with(prefix.as_str()))
+                            .filter(|e| {
+                                e.scope == scope
+                                    && e.version == version
+                                    && e.key.starts_with(prefix.as_str())
+                            })
                             .max_by_key(|e| (e.accessed_unix_secs, e.id))
                             .map(|e| e.id)
                     })
@@ -270,9 +307,10 @@ impl CacheStore {
         self.persist()
     }
 
-    /// Reserve an upload slot for (version, key). Returns the new numeric
-    /// cache id, or the existing id when already committed or in flight.
-    pub fn reserve(&self, key: &str, version: &str) -> Result<ReserveOutcome, String> {
+    /// Reserve an upload slot for (scope, version, key). Returns the
+    /// new numeric cache id, or the existing id when already committed
+    /// or in flight. Same key in another scope reserves independently.
+    pub fn reserve(&self, scope: &str, key: &str, version: &str) -> Result<ReserveOutcome, String> {
         let mut inner = self
             .inner
             .lock()
@@ -280,22 +318,23 @@ impl CacheStore {
         if let Some(existing) = inner
             .entries
             .values()
-            .find(|e| e.version == version && e.key == key)
+            .find(|e| e.scope == scope && e.version == version && e.key == key)
         {
             return Ok(ReserveOutcome::Exists(existing.id));
         }
         if let Some((id, _)) = inner
             .pending
             .iter()
-            .find(|(_, (k, v))| k == key && v == version)
+            .find(|(_, (s, k, v))| s == scope && k == key && v == version)
         {
             return Ok(ReserveOutcome::Exists(*id));
         }
         let id = inner.next_id;
         inner.next_id += 1;
-        inner
-            .pending
-            .insert(id, (key.to_string(), version.to_string()));
+        inner.pending.insert(
+            id,
+            (scope.to_string(), key.to_string(), version.to_string()),
+        );
         // No persist: uncommitted ids are safely reusable after a crash
         // (nothing references them; orphans are swept at open), and the
         // next commit persists the advanced counter anyway.
@@ -355,7 +394,7 @@ impl CacheStore {
     /// Commit a staged upload: verify total size, atomically move into the
     /// store, evict LRU over budget. Returns the committed entry.
     pub fn commit(&self, id: u64, size: u64) -> Result<CacheEntryMeta, StoreError> {
-        let (key, version) = {
+        let (scope, key, version) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -387,7 +426,7 @@ impl CacheStore {
                 max: self.max_bytes,
             });
         }
-        let file = entry_filename(&version, &key);
+        let file = entry_filename(&scope, &version, &key);
         std::fs::rename(&tmp, self.dir.join(&file))
             .map_err(|e| StoreError::Io(format!("cannot commit upload {id}: {e}")))?;
         let now = now_unix_secs();
@@ -395,14 +434,25 @@ impl CacheStore {
             .inner
             .lock()
             .map_err(|_| StoreError::Io("cache index lock poisoned".to_string()))?;
-        // Defensive: same (version, key) committed twice keeps one row.
-        inner
+        // Defensive: same (scope, version, key) committed twice keeps
+        // one row (displaced archives are deleted immediately, so a
+        // re-commit never orphans bytes).
+        let displaced: Vec<u64> = inner
             .entries
-            .retain(|_, e| !(e.version == version && e.key == key));
+            .iter()
+            .filter(|(_, e)| e.scope == scope && e.version == version && e.key == key)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in displaced {
+            if let Some(old) = inner.entries.remove(&id) {
+                let _ = std::fs::remove_file(self.dir.join(&old.file));
+            }
+        }
         inner.entries.insert(
             id,
             CacheEntryMeta {
                 id,
+                scope,
                 key,
                 version,
                 file,
@@ -629,8 +679,14 @@ mod tests {
         (dir, store)
     }
 
-    fn commit_bytes(store: &CacheStore, key: &str, version: &str, bytes: &[u8]) -> u64 {
-        let id = match store.reserve(key, version).unwrap() {
+    fn commit_bytes(
+        store: &CacheStore,
+        scope: &str,
+        key: &str,
+        version: &str,
+        bytes: &[u8],
+    ) -> u64 {
+        let id = match store.reserve(scope, key, version).unwrap() {
             ReserveOutcome::Created(id) => id,
             ReserveOutcome::Exists(id) => panic!("unexpected exists for {key}: {id}"),
         };
@@ -643,18 +699,26 @@ mod tests {
     #[test]
     fn lookup_hits_misses_and_restore_prefixes() {
         let (_dir, store) = store(1 << 30);
-        commit_bytes(&store, "npm-abc123", "v1", b"data");
+        commit_bytes(&store, GLOBAL_SCOPE, "npm-abc123", "v1", b"data");
         // Exact primary hit.
         let hit = store
-            .lookup("v1", &["npm-abc123".to_string()])
+            .lookup(GLOBAL_SCOPE, "v1", &["npm-abc123".to_string()])
             .expect("exact hit");
         assert_eq!(hit.key, "npm-abc123");
         // Miss records + unknown version misses.
-        assert!(store.lookup("v1", &["nope".to_string()]).is_none());
-        assert!(store.lookup("v9", &["npm-abc123".to_string()]).is_none());
+        assert!(store
+            .lookup(GLOBAL_SCOPE, "v1", &["nope".to_string()])
+            .is_none());
+        assert!(store
+            .lookup(GLOBAL_SCOPE, "v9", &["npm-abc123".to_string()])
+            .is_none());
         // Restore-key prefix fallback in order.
         let hit = store
-            .lookup("v1", &["npm-zzz".to_string(), "npm-".to_string()])
+            .lookup(
+                GLOBAL_SCOPE,
+                "v1",
+                &["npm-zzz".to_string(), "npm-".to_string()],
+            )
             .expect("prefix hit");
         assert_eq!(hit.key, "npm-abc123");
         let stats = store.stats();
@@ -665,10 +729,13 @@ mod tests {
     #[test]
     fn reserve_conflicts_and_commit_verifies_size() {
         let (_dir, store) = store(1 << 30);
-        let id = commit_bytes(&store, "k", "v", b"0123456789");
-        assert_eq!(store.reserve("k", "v").unwrap(), ReserveOutcome::Exists(id));
+        let id = commit_bytes(&store, GLOBAL_SCOPE, "k", "v", b"0123456789");
+        assert_eq!(
+            store.reserve(GLOBAL_SCOPE, "k", "v").unwrap(),
+            ReserveOutcome::Exists(id)
+        );
         // Out-of-order chunks assemble; size mismatch refuses commit.
-        let ReserveOutcome::Created(id2) = store.reserve("k2", "v").unwrap() else {
+        let ReserveOutcome::Created(id2) = store.reserve(GLOBAL_SCOPE, "k2", "v").unwrap() else {
             panic!("expected created");
         };
         store.write_chunk(id2, 5, b"56789").unwrap();
@@ -682,7 +749,7 @@ mod tests {
             }
         );
         // Failed commit consumed the reservation; re-reserve and retry.
-        let ReserveOutcome::Created(id3) = store.reserve("k2", "v").unwrap() else {
+        let ReserveOutcome::Created(id3) = store.reserve(GLOBAL_SCOPE, "k2", "v").unwrap() else {
             panic!("expected created");
         };
         store.write_chunk(id3, 0, b"0123456789").unwrap();
@@ -698,22 +765,28 @@ mod tests {
     #[test]
     fn lru_evicts_least_recently_accessed_first() {
         let (_dir, store) = store(20);
-        commit_bytes(&store, "old", "v", b"0123456789"); // 10 B
-        commit_bytes(&store, "new", "v", b"0123456789"); // 10 B, total 20
-                                                         // Touch "old" in a later second so "new" is the LRU victim.
+        commit_bytes(&store, GLOBAL_SCOPE, "old", "v", b"0123456789"); // 10 B
+        commit_bytes(&store, GLOBAL_SCOPE, "new", "v", b"0123456789"); // 10 B, total 20
+                                                                       // Touch "old" in a later second so "new" is the LRU victim.
         std::thread::sleep(std::time::Duration::from_secs(1));
-        store.lookup("v", &["old".to_string()]);
-        commit_bytes(&store, "third", "v", b"01234"); // +5 B → evict one
-        assert!(store.lookup("v", &["old".to_string()]).is_some());
-        assert!(store.lookup("v", &["new".to_string()]).is_none());
-        assert!(store.lookup("v", &["third".to_string()]).is_some());
+        store.lookup(GLOBAL_SCOPE, "v", &["old".to_string()]);
+        commit_bytes(&store, GLOBAL_SCOPE, "third", "v", b"01234"); // +5 B → evict one
+        assert!(store
+            .lookup(GLOBAL_SCOPE, "v", &["old".to_string()])
+            .is_some());
+        assert!(store
+            .lookup(GLOBAL_SCOPE, "v", &["new".to_string()])
+            .is_none());
+        assert!(store
+            .lookup(GLOBAL_SCOPE, "v", &["third".to_string()])
+            .is_some());
         assert!(store.stats().size_bytes <= 20);
     }
 
     #[test]
     fn archive_path_resolves_and_served_counts() {
         let (_dir, store) = store(1 << 30);
-        let id = commit_bytes(&store, "k", "v", b"0123456789");
+        let id = commit_bytes(&store, GLOBAL_SCOPE, "k", "v", b"0123456789");
         let path = store.archive_path(id).expect("known id resolves");
         assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
         assert!(store.archive_path(424242).is_none());
@@ -728,8 +801,8 @@ mod tests {
     #[test]
     fn clear_all_and_older_than() {
         let (_dir, store) = store(1 << 30);
-        commit_bytes(&store, "a", "v", b"0123456789");
-        commit_bytes(&store, "b", "v", b"0123456789");
+        commit_bytes(&store, GLOBAL_SCOPE, "a", "v", b"0123456789");
+        commit_bytes(&store, GLOBAL_SCOPE, "b", "v", b"0123456789");
         // Nothing is older than 30 days.
         assert_eq!(store.clear(Some(30)), (0, 0));
         assert_eq!(store.stats().entries, 2);
@@ -739,8 +812,8 @@ mod tests {
         assert_eq!((removed, freed), (2, 20));
         assert_eq!(store.stats().entries, 0);
         // Full clear resets counters.
-        commit_bytes(&store, "c", "v", b"0123456789");
-        store.lookup("v", &["c".to_string()]);
+        commit_bytes(&store, GLOBAL_SCOPE, "c", "v", b"0123456789");
+        store.lookup(GLOBAL_SCOPE, "v", &["c".to_string()]);
         let (removed, _) = store.clear(None);
         assert_eq!(removed, 1);
         let stats = store.stats();
@@ -752,10 +825,10 @@ mod tests {
         let dir = TempDir::new("cache-nopersist").unwrap();
         let cache_dir = dir.path().join("cache");
         let store = CacheStore::open(&cache_dir, 1 << 30).unwrap();
-        commit_bytes(&store, "k", "v", b"0123456789");
+        commit_bytes(&store, GLOBAL_SCOPE, "k", "v", b"0123456789");
         let before = std::fs::read(cache_dir.join("index.json")).unwrap();
-        store.lookup("v", &["k".to_string()]);
-        store.lookup("v", &["miss".to_string()]);
+        store.lookup(GLOBAL_SCOPE, "v", &["k".to_string()]);
+        store.lookup(GLOBAL_SCOPE, "v", &["miss".to_string()]);
         store.record_served(1, 10);
         // Hot read path: zero disk writes.
         assert_eq!(std::fs::read(cache_dir.join("index.json")).unwrap(), before);
@@ -772,7 +845,7 @@ mod tests {
     #[test]
     fn commit_rejects_archives_past_store_budget() {
         let (dir, store) = store(16);
-        let ReserveOutcome::Created(id) = store.reserve("big", "v").unwrap() else {
+        let ReserveOutcome::Created(id) = store.reserve(GLOBAL_SCOPE, "big", "v").unwrap() else {
             panic!("expected created");
         };
         store.write_chunk(id, 0, &[0u8; 20]).unwrap();
@@ -827,7 +900,7 @@ mod tests {
     #[test]
     fn abort_upload_drops_reservation_and_staged_bytes() {
         let (dir, store) = store(1 << 30);
-        let ReserveOutcome::Created(id) = store.reserve("k", "v").unwrap() else {
+        let ReserveOutcome::Created(id) = store.reserve(GLOBAL_SCOPE, "k", "v").unwrap() else {
             panic!("expected created");
         };
         store.write_chunk(id, 0, b"partial").unwrap();
@@ -840,7 +913,7 @@ mod tests {
         store.abort_upload(424242);
         // Reservation released: re-reserve yields a fresh id.
         assert!(matches!(
-            store.reserve("k", "v").unwrap(),
+            store.reserve(GLOBAL_SCOPE, "k", "v").unwrap(),
             ReserveOutcome::Created(_)
         ));
     }
@@ -857,26 +930,32 @@ mod tests {
         assert!(cache_dir.join("index.json.corrupt").is_file());
         assert!(!cache_dir.join("9.tmp").exists());
         // Persisted state reloads across opens.
-        commit_bytes(&store, "k", "v", b"0123456789");
+        commit_bytes(&store, GLOBAL_SCOPE, "k", "v", b"0123456789");
         let reopened = CacheStore::open(&cache_dir, 1 << 30).unwrap();
         assert_eq!(reopened.stats().entries, 1);
-        assert!(reopened.lookup("v", &["k".to_string()]).is_some());
+        assert!(reopened
+            .lookup(GLOBAL_SCOPE, "v", &["k".to_string()])
+            .is_some());
     }
 
     #[test]
     fn ttl_evicts_by_creation_age_not_access() {
         let (_dir, store) = store(1 << 30);
-        commit_bytes(&store, "old", "v", b"0123456789");
+        commit_bytes(&store, GLOBAL_SCOPE, "old", "v", b"0123456789");
         // Fresh access must NOT rescue a creation-aged entry; the 2s
         // sleep plus ttl=1 keeps the fresh commit safe even if the
         // clock crosses a second boundary mid-test.
         std::thread::sleep(std::time::Duration::from_secs(2));
-        assert!(store.lookup("v", &["old".to_string()]).is_some());
-        commit_bytes(&store, "new", "v", b"0123456789");
+        assert!(store
+            .lookup(GLOBAL_SCOPE, "v", &["old".to_string()])
+            .is_some());
+        commit_bytes(&store, GLOBAL_SCOPE, "new", "v", b"0123456789");
         let (removed, freed) = store.evict_expired(1);
         assert_eq!((removed, freed), (1, 10));
         assert_eq!(store.stats().entries, 1);
-        assert!(store.lookup("v", &["new".to_string()]).is_some());
+        assert!(store
+            .lookup(GLOBAL_SCOPE, "v", &["new".to_string()])
+            .is_some());
         // Counters survive a TTL eviction (no reset like full clear).
         assert!(store.stats().hits >= 1);
     }
@@ -890,11 +969,116 @@ mod tests {
     #[tokio::test]
     async fn sweeper_evicts_on_spawn_tick() {
         let (_dir, store) = store(1 << 30);
-        commit_bytes(&store, "stale", "v", b"0123456789");
+        commit_bytes(&store, GLOBAL_SCOPE, "stale", "v", b"0123456789");
         std::thread::sleep(std::time::Duration::from_secs(2));
         let handle = store.spawn_ttl_sweeper(1, u64::MAX).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(store.stats().entries, 0);
         handle.abort();
+    }
+
+    #[test]
+    fn scopes_are_isolated_by_key_and_prefix() {
+        let (_dir, store) = store(1 << 30);
+        commit_bytes(&store, "acme/web", "npm-abc123", "v1", b"web-bytes");
+        // Same key + version in another scope: invisible, independently
+        // reservable, and committed side by side.
+        assert!(store
+            .lookup("acme/api", "v1", &["npm-abc123".to_string()])
+            .is_none());
+        commit_bytes(&store, "acme/api", "npm-abc123", "v1", b"api-bytes");
+        let web = store
+            .lookup("acme/web", "v1", &["npm-abc123".to_string()])
+            .unwrap();
+        let api = store
+            .lookup("acme/api", "v1", &["npm-abc123".to_string()])
+            .unwrap();
+        assert_ne!(web.id, api.id);
+        assert_ne!(web.file, api.file);
+        // Restore-key prefix fallback stays inside the scope.
+        assert!(store
+            .lookup(
+                "acme/api",
+                "v1",
+                &["npm-zzz".to_string(), "npm-".to_string()]
+            )
+            .is_some_and(|e| e.scope == "acme/api"));
+        assert!(store
+            .lookup(
+                "other/repo",
+                "v1",
+                &["npm-zzz".to_string(), "npm-".to_string()]
+            )
+            .is_none());
+        // Duplicate reserve in the same scope still conflicts.
+        assert!(matches!(
+            store.reserve("acme/web", "npm-abc123", "v1").unwrap(),
+            ReserveOutcome::Exists(_)
+        ));
+    }
+
+    #[test]
+    fn lru_eviction_is_scope_blind_and_fair() {
+        let (_dir, store) = store(20);
+        commit_bytes(&store, "a/r", "old", "v", b"0123456789"); // 10 B
+        commit_bytes(&store, "b/r", "new", "v", b"0123456789"); // 10 B, total 20
+                                                                // Touch "old" in a later second so "new" is the LRU victim even
+                                                                // though the entrant belongs to a third scope.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        store.lookup("a/r", "v", &["old".to_string()]);
+        commit_bytes(&store, "c/r", "third", "v", b"01234"); // +5 B → evict one
+        assert!(store.lookup("a/r", "v", &["old".to_string()]).is_some());
+        assert!(store.lookup("b/r", "v", &["new".to_string()]).is_none());
+        assert!(store.lookup("c/r", "v", &["third".to_string()]).is_some());
+        assert!(store.stats().size_bytes <= 20);
+    }
+
+    #[test]
+    fn legacy_rows_default_to_global_and_orphans_sweep() {
+        let dir = TempDir::new("cache-legacy-scope").unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        // Pre-v1.7.0 row: no scope field, archive hashed without scope.
+        let legacy_file = "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567";
+        std::fs::write(cache_dir.join(legacy_file), b"0123456789").unwrap();
+        std::fs::write(
+            cache_dir.join("index.json"),
+            format!(
+                r#"{{"version":1,"next_id":2,"entries":[{{"id":1,"key":"k","version":"v","file":"{legacy_file}","size":10,"created_unix_secs":1,"accessed_unix_secs":1,"hits":0}}],"stats":{{"hits":0,"misses":0,"bytes_served":0,"bytes_uploaded":0}}}}"#
+            ),
+        )
+        .unwrap();
+        // An unreferenced archive (crash debris): swept at open.
+        let orphan = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        std::fs::write(cache_dir.join(orphan), b"0123456789").unwrap();
+        let store = CacheStore::open(&cache_dir, 1 << 30).unwrap();
+        assert!(!cache_dir.join(orphan).exists());
+        // The legacy row survives with its archive, defaulted into the
+        // global scope: pre-upgrade bytes keep serving, no wipe.
+        assert_eq!(store.stats().entries, 1);
+        let hit = store.lookup(GLOBAL_SCOPE, "v", &["k".to_string()]).unwrap();
+        assert_eq!(hit.scope, GLOBAL_SCOPE);
+        assert_eq!(
+            std::fs::read(cache_dir.join(legacy_file)).unwrap(),
+            b"0123456789"
+        );
+        // Same triple re-reserves as Exists (409 upstream), and a scoped
+        // twin coexists independently.
+        assert!(matches!(
+            store.reserve(GLOBAL_SCOPE, "k", "v").unwrap(),
+            ReserveOutcome::Exists(1)
+        ));
+        commit_bytes(&store, "acme/web", "k", "v", b"scoped-bytes");
+        assert_eq!(store.stats().entries, 2);
+        // ...and scopes reload intact.
+        drop(store);
+        let reopened = CacheStore::open(&cache_dir, 1 << 30).unwrap();
+        assert_eq!(reopened.stats().entries, 2);
+        assert!(reopened
+            .lookup(GLOBAL_SCOPE, "v", &["k".to_string()])
+            .is_some());
+        assert!(reopened
+            .lookup("acme/web", "v", &["k".to_string()])
+            .is_some());
     }
 }

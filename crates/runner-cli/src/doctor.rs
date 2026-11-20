@@ -479,6 +479,138 @@ fn afk_verdict(facts: &AfkFacts) -> Check {
     }
 }
 
+/// No-op pump handler: the doctor only needs the transport socket
+/// for STUN, never for mesh traffic.
+struct NoopHandler;
+
+impl runner_core::mesh::transport::PeerHandler for NoopHandler {
+    fn on_announce<'a>(
+        &'a self,
+        _tx: &'a runner_core::mesh::transport::PeerTransport,
+        _announce: runner_core::mesh::proto::JoinAnnounce,
+        _src: std::net::SocketAddr,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {})
+    }
+
+    fn on_established<'a>(
+        &'a self,
+        _tx: &'a runner_core::mesh::transport::PeerTransport,
+        _node_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {})
+    }
+
+    fn on_message<'a>(
+        &'a self,
+        _tx: &'a runner_core::mesh::transport::PeerTransport,
+        _node_id: &'a str,
+        _msg: runner_core::mesh::proto::PeerMessage,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {})
+    }
+}
+
+struct NatFacts {
+    reflexive: Option<std::net::SocketAddr>,
+    /// `direct` (no NAT), `cone`, `symmetric`, or `unknown` (one server).
+    class: Option<String>,
+    error: Option<String>,
+}
+
+/// NAT class name: reflexive == source IP toward the server means no
+/// NAT in the path (`direct`); otherwise the two-server comparison
+/// decides, or `unknown` when only one server answered.
+fn nat_class_name(nat: Option<runner_core::mesh::stun::NatClass>, direct: bool) -> String {
+    if direct {
+        return "direct".to_string();
+    }
+    match nat {
+        Some(runner_core::mesh::stun::NatClass::Cone) => "cone".to_string(),
+        Some(runner_core::mesh::stun::NatClass::Symmetric) => "symmetric".to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+fn nat_verdict(facts: &NatFacts) -> Check {
+    match (&facts.reflexive, &facts.class) {
+        (Some(addr), Some(class)) if class == "symmetric" => Check::warn(
+            "nat",
+            format!(
+                "reflexive {addr}, symmetric NAT — unreachable peers fall back to cloud burst same-tick"
+            ),
+        ),
+        (Some(addr), Some(class)) => {
+            Check::pass("nat", format!("reflexive {addr}, NAT class: {class}"))
+        }
+        (Some(addr), None) => Check::pass("nat", format!("reflexive {addr}")),
+        (None, _) => match &facts.error {
+            Some(error) => Check::warn(
+                "nat",
+                format!("STUN silent ({error}); WAN peers route via observed source only"),
+            ),
+            None => Check::warn(
+                "nat",
+                "STUN disabled or unresolvable; WAN peers route via observed source only".to_string(),
+            ),
+        },
+    }
+}
+
+/// WAN NAT readiness: reflexive address + class via the configured
+/// STUN servers. Warns (never fails) when offline, disabled, or
+/// symmetric — the mesh degrades gracefully in all three cases.
+async fn check_nat(config: &runner_core::config::RunnerConfig) -> Check {
+    use runner_core::mesh::stun::{
+        discover_via_transport, local_addr_for, resolve_stun_servers, stun_servers,
+    };
+    use runner_core::mesh::transport::{PeerTransport, TransportConfig};
+
+    let servers = resolve_stun_servers(&stun_servers(&config.mesh)).await;
+    if servers.is_empty() {
+        return nat_verdict(&NatFacts {
+            reflexive: None,
+            class: None,
+            error: None,
+        });
+    }
+    let tx = match PeerTransport::spawn(
+        TransportConfig {
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            keys: runner_core::mesh::peer::generate_keypair(),
+        },
+        std::sync::Arc::new(NoopHandler),
+    )
+    .await
+    {
+        Ok(tx) => tx,
+        Err(e) => {
+            return nat_verdict(&NatFacts {
+                reflexive: None,
+                class: None,
+                error: Some(e),
+            });
+        }
+    };
+    let source_ip = servers.first().and_then(|s| local_addr_for(*s));
+    match discover_via_transport(&tx, &servers).await {
+        Ok(found) => {
+            let direct = source_ip.is_some_and(|ip| ip == found.reflexive.ip());
+            let class = nat_class_name(found.nat, direct);
+            nat_verdict(&NatFacts {
+                reflexive: Some(found.reflexive),
+                class: Some(class),
+                error: None,
+            })
+        }
+        Err(e) => nat_verdict(&NatFacts {
+            reflexive: None,
+            class: None,
+            error: Some(e),
+        }),
+    }
+}
+
 fn check_afk_boost(config: &runner_core::config::RunnerConfig) -> Check {
     use runner_core::governor::afk::{detector_available, AfkMode};
 
@@ -506,6 +638,7 @@ pub async fn run_all(
         check_cache(config),
         check_workstation_guards(),
         check_afk_boost(config),
+        check_nat(config).await,
     ];
     if enterprise {
         checks.push(check_policy());
@@ -588,6 +721,69 @@ mod tests {
         let healthy = vec![Check::pass("a", "fine".to_string())];
         assert!(overall_ok(&healthy));
         assert!(render_text(&healthy).contains("result: healthy"));
+    }
+
+    #[test]
+    fn nat_class_names_cover_all_paths() {
+        use runner_core::mesh::stun::NatClass;
+        assert_eq!(nat_class_name(None, true), "direct");
+        assert_eq!(nat_class_name(Some(NatClass::Cone), false), "cone");
+        assert_eq!(
+            nat_class_name(Some(NatClass::Symmetric), false),
+            "symmetric"
+        );
+        assert_eq!(nat_class_name(None, false), "unknown");
+    }
+
+    #[test]
+    fn nat_verdict_passes_warns_but_never_fails() {
+        let addr: std::net::SocketAddr = "198.51.100.7:45001".parse().unwrap();
+        // Direct/cone pass with reflexive + class in the detail (the
+        // frozen JSON schema carries it via `detail`).
+        for class in ["direct", "cone", "unknown"] {
+            let check = nat_verdict(&NatFacts {
+                reflexive: Some(addr),
+                class: Some(class.to_string()),
+                error: None,
+            });
+            assert_eq!(check.name, "nat");
+            assert!(matches!(check.status, Status::Pass));
+            assert!(
+                check.detail.contains("198.51.100.7:45001"),
+                "{}",
+                check.detail
+            );
+            assert!(check.detail.contains(class), "{}", check.detail);
+        }
+        // Symmetric warns with cloud-burst advice.
+        let check = nat_verdict(&NatFacts {
+            reflexive: Some(addr),
+            class: Some("symmetric".to_string()),
+            error: None,
+        });
+        assert!(matches!(check.status, Status::Warn));
+        assert!(check.detail.contains("cloud burst"), "{}", check.detail);
+        // Silence and disabled STUN warn, keeping overall_ok green.
+        for facts in [
+            NatFacts {
+                reflexive: None,
+                class: None,
+                error: Some("all STUN servers silent".to_string()),
+            },
+            NatFacts {
+                reflexive: None,
+                class: None,
+                error: None,
+            },
+        ] {
+            let check = nat_verdict(&facts);
+            assert!(matches!(check.status, Status::Warn));
+        }
+        assert!(overall_ok(&[nat_verdict(&NatFacts {
+            reflexive: None,
+            class: None,
+            error: None,
+        })]));
     }
 
     #[test]

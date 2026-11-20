@@ -185,6 +185,7 @@ pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState) {
         runner_sandbox::mounts::probe_userns(),
         Duration::from_secs(config.coordinator.job_timeout_mins.max(1) * 60),
         runner_core::governor::cgroup::CgroupSlice::system_default(),
+        state.clone(),
     ));
     let roles = Arc::new(MeshRoles::new(
         CoordinatorRole::new(authority, state.clone(), RunnerConfig::default_path()),
@@ -497,6 +498,13 @@ async fn spawn_github(
         let guard = state.read().await;
         (guard.cache_base_url(), guard.cache_token())
     };
+    // The polled repo is every job's true source (both JIT scopes).
+    let repo_slug = match (coord.repo_owner.clone(), coord.repo_name.clone()) {
+        (Some(owner), Some(repo)) if !owner.trim().is_empty() && !repo.trim().is_empty() => {
+            Some(format!("{owner}/{repo}"))
+        }
+        _ => None,
+    };
     let dispatch = coord.auto_dispatch.then(|| DispatchContext {
         github,
         scope,
@@ -506,6 +514,7 @@ async fn spawn_github(
         timeout: std::time::Duration::from_secs(coord.job_timeout_mins * 60),
         cache_url,
         cache_token,
+        repo_slug,
     });
     tokio::spawn(run_coordinator(
         poller,

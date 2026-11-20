@@ -563,7 +563,9 @@ mod tests {
 
         let dir = crate::test_support::TempDir::new("ipc-cache").unwrap();
         let store = crate::cache::store::CacheStore::open(&dir.path().join("c"), 1 << 30).unwrap();
-        store.reserve("k", "v").unwrap();
+        store
+            .reserve(crate::cache::store::GLOBAL_SCOPE, "k", "v")
+            .unwrap();
         state
             .write()
             .await

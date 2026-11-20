@@ -4,7 +4,7 @@
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Generally Available (v1.6.x) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Generally Available (v1.7.x) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -154,7 +154,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), or Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)).
 
-Zero-dependency install (downloads the prebuilt v1.6.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v1.7.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -191,7 +191,7 @@ runner top
 ```
 
 ```text
-runner top v1.6.0  (q quit, live cadence)
+runner top v1.7.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -319,7 +319,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "1.6.0", "governor": "normal",
+{"status": "healthy", "version": "1.7.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 

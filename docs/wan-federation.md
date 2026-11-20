@@ -42,7 +42,9 @@ larger offers fail closed rather than fragmenting.
 - `JoinAccept` (encrypted): acceptance + the coordinator's reflexive
   address, sent once per session establishment.
 - `JobOffer` (encrypted): provider, job/run ids, name, labels,
-  JIT blob, worker version, timeout.
+  JIT blob, worker version, timeout, plus the v1.7.0 `repo` scope for
+  the peer's cache namespace (older peers reject v1.7.0 offers;
+  upgrade peers first).
 - `JobAccept` (encrypted): accept flag + reason.
 - `JobResult` (encrypted): exit code + killed flag. Logs stay with
   GitHub (the worker reports directly), so only status crosses.

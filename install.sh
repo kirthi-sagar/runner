@@ -205,8 +205,8 @@ if [ -x ./target/release/runner ]; then
 elif [ -x ./target/debug/runner ]; then
     BIN_SRC="./target/debug/runner"
 elif command -v cargo >/dev/null 2>&1; then
-    log "no prebuilt binary; running cargo build --release"
-    if [ "$DRY_RUN" -eq 0 ]; then cargo build --release -p runner-cli; fi
+    log "no prebuilt binary; running cargo build --locked --release"
+    if [ "$DRY_RUN" -eq 0 ]; then cargo build --locked --release -p runner-cli; fi
     BIN_SRC="./target/release/runner"
 else
     # Zero-dependency fallback: fetch a prebuilt release tarball.

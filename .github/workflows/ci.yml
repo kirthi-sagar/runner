@@ -95,6 +95,7 @@ jobs:
             Write-Error "expected install.sh to refuse the /mnt checkout, got exit=$LASTEXITCODE out=$out"
             exit 1
           }
+          exit 0 # expected refusal observed; do not propagate wsl's nonzero exit
 
       - name: Install inside the distro
         shell: pwsh
@@ -116,3 +117,4 @@ jobs:
             Write-Error "Tier-3 exec failed: $out"
             exit 1
           }
+          exit 0

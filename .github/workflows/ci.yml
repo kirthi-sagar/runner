@@ -72,6 +72,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Ubuntu distro (WSL2)
+        shell: pwsh
+        run: |
+          wsl --set-default-version 2
+          wsl --install -d Ubuntu --no-launch
+          wsl -d Ubuntu -u root echo "distro ready"
+
       - name: Enable systemd in Ubuntu distro
         shell: pwsh
         run: |

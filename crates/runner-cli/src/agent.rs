@@ -1,4 +1,4 @@
-//! Production [`AgentTools`](runner_core::mcp::tools::AgentTools)
+//! Production [`AgentTools`]
 //! implementation: delegates the Phase 8 MCP tools to the existing
 //! `doctor`, `provider`, and local-execution modules (plus Phase 10
 //! cloud management over daemon IPC) so CLI and MCP output can never

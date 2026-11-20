@@ -8,6 +8,9 @@ description = "Unified runner binary entrypoint and service management"
 [[bin]]
 name = "runner"
 path = "src/main.rs"
+# The bin documents no API (see the `runner` facade lib); skipping it
+# also silences the bin/lib `runner/index.html` filename collision.
+doc = false
 
 [dependencies]
 clap.workspace = true

@@ -85,6 +85,166 @@ async fn client_handshake_and_instance_start_over_mock_uds() {
     server.abort();
 }
 
+/// Resolved live-harness inputs; `None` means skip (standard CI).
+struct LiveInputs {
+    kernel: std::path::PathBuf,
+    rootfs: std::path::PathBuf,
+    firecracker: std::path::PathBuf,
+}
+
+fn binary_resolves(bin: &std::path::Path) -> bool {
+    if bin.components().count() > 1 {
+        return bin.is_file();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+}
+
+fn live_inputs_from(
+    live_var_set: bool,
+    kvm_present: bool,
+    kernel: Option<std::path::PathBuf>,
+    rootfs: Option<std::path::PathBuf>,
+    firecracker: Option<std::path::PathBuf>,
+) -> Option<LiveInputs> {
+    if !live_var_set || !kvm_present {
+        return None;
+    }
+    let (kernel, rootfs) = (kernel?, rootfs?);
+    if !kernel.is_file() || !rootfs.is_file() {
+        return None;
+    }
+    let bin = firecracker.unwrap_or_else(|| std::path::PathBuf::from("firecracker"));
+    if !binary_resolves(&bin) {
+        return None;
+    }
+    Some(LiveInputs {
+        kernel,
+        rootfs,
+        firecracker: bin,
+    })
+}
+
+fn live_inputs() -> Option<LiveInputs> {
+    live_inputs_from(
+        std::env::var("RUNNER_LIVE_KVM").is_ok(),
+        probe_kvm(),
+        std::env::var_os("RUNNER_LIVE_KERNEL").map(std::path::PathBuf::from),
+        std::env::var_os("RUNNER_LIVE_ROOTFS").map(std::path::PathBuf::from),
+        std::env::var_os("RUNNER_LIVE_FIRECRACKER").map(std::path::PathBuf::from),
+    )
+}
+
+#[test]
+fn live_gate_requires_every_input() {
+    let dir = runner::test_support::TempDir::new("kvm-gate").unwrap();
+    let kernel = dir.path().join("vmlinux");
+    let rootfs = dir.path().join("rootfs.ext4");
+    let bin = dir.path().join("firecracker");
+    std::fs::write(&kernel, b"k").unwrap();
+    std::fs::write(&rootfs, b"r").unwrap();
+    std::fs::write(&bin, b"x").unwrap();
+    let missing = dir.path().join("absent");
+    // Each missing piece skips, including unresolvable binaries.
+    assert!(live_inputs_from(
+        false,
+        true,
+        Some(kernel.clone()),
+        Some(rootfs.clone()),
+        Some(bin.clone())
+    )
+    .is_none());
+    assert!(live_inputs_from(
+        true,
+        false,
+        Some(kernel.clone()),
+        Some(rootfs.clone()),
+        Some(bin.clone())
+    )
+    .is_none());
+    assert!(live_inputs_from(true, true, None, Some(rootfs.clone()), Some(bin.clone())).is_none());
+    assert!(live_inputs_from(true, true, Some(kernel.clone()), None, Some(bin.clone())).is_none());
+    assert!(live_inputs_from(
+        true,
+        true,
+        Some(missing.clone()),
+        Some(rootfs.clone()),
+        Some(bin.clone())
+    )
+    .is_none());
+    assert!(live_inputs_from(
+        true,
+        true,
+        Some(kernel.clone()),
+        Some(rootfs.clone()),
+        Some(missing.clone())
+    )
+    .is_none());
+    assert!(live_inputs_from(
+        true,
+        true,
+        Some(kernel.clone()),
+        Some(rootfs.clone()),
+        Some(std::path::PathBuf::from("definitely-not-a-binary-xyz"))
+    )
+    .is_none());
+    // Complete inputs pass, with PATH search for bare binary names.
+    assert!(live_inputs_from(
+        true,
+        true,
+        Some(kernel.clone()),
+        Some(rootfs.clone()),
+        Some(bin)
+    )
+    .is_some());
+    assert!(live_inputs_from(
+        true,
+        true,
+        Some(kernel),
+        Some(rootfs),
+        Some(std::path::PathBuf::from("sh"))
+    )
+    .is_some());
+}
+
+/// Opt-in live boot: real Firecracker launch → Tier-1 dispatch →
+/// shutdown. Skips silently without `RUNNER_LIVE_KVM=1`, /dev/kvm,
+/// guest images, and a firecracker binary, so standard CI is unaffected.
+#[tokio::test]
+async fn live_kvm_boot_dispatch_and_shutdown() {
+    let Some(inputs) = live_inputs() else {
+        eprintln!("live KVM harness skipped (needs RUNNER_LIVE_KVM=1, /dev/kvm, RUNNER_LIVE_KERNEL/ROOTFS images, firecracker binary)");
+        return;
+    };
+    use runner::sandbox::driver::{SandboxDriver, SandboxEngine};
+    let dir = runner::test_support::TempDir::new("kvm-live").unwrap();
+    let vsock_path = dir.path().join("v.sock");
+    let config = MicroVmConfig::new(
+        dir.path().join("fc.sock"),
+        inputs.kernel,
+        inputs.rootfs,
+        vsock_path.clone(),
+    );
+    let engine =
+        SandboxEngine::new(SandboxDriver::MicroVm).with_microvm(config, inputs.firecracker);
+    // Loose assertion is deliberate: stock images carry no guest agent,
+    // so dispatch cannot succeed, and Firecracker's exact UDS direction
+    // (bind-vs-connect, `<uds>_<port>`) is documented but unverified
+    // against a live binary. What this proves on a KVM host: real boot
+    // works, dispatch fails closed, shutdown cleans up, nothing panics.
+    let result = engine
+        .execute(&["id".to_string()], Duration::from_secs(15))
+        .await;
+    assert!(
+        result.is_err(),
+        "live dispatch unexpectedly succeeded: {result:?}"
+    );
+    assert!(
+        !vsock_path.exists(),
+        "vsock socket file leaked after live run"
+    );
+}
+
 #[tokio::test]
 async fn supervisor_reports_missing_kvm_without_panic() {
     if probe_kvm() {

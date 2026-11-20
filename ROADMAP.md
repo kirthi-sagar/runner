@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.3.0 and prior)
+## Shipped (v1.3.1 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -15,8 +15,14 @@ services or heavyweight frameworks.
   cloud lifecycle harness.
 - Real `runner init` onboarding (config merge, token store, layout seed).
 - Tier-1 vsock guest dispatch (`runner-guest-agent`, loopback-gated).
+- Zero-flake spawn retry, zero doc warnings, opt-in live-KVM harness.
 
-## Current: v1.3.0 (Tier-1 vsock Guest Dispatch)
+## Current: v1.3.1 (Zero-Flake Hardening & Test Harness)
+
+- Transient spawn retry, zero doc warnings, opt-in live-KVM harness.
+- No behavior change beyond reliability; patch release.
+
+## Shipped in v1.3.0: Tier-1 vsock Guest Dispatch
 
 - `exec --driver microvm` runs workloads via the in-guest agent over
   vsock (shared NDJSON protocol, streamed stdio, exit codes).

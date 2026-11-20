@@ -133,6 +133,34 @@ fn next_engine_job_id() -> String {
     )
 }
 
+/// Spawn errors worth one retry: the observed `pre_exec` unshare-race
+/// ENOENT (flakes spawning on-PATH binaries under test concurrency)
+/// plus the classic transient spawn errnos. Genuine failures surface
+/// unchanged after the single backoff. Deliberately broader than
+/// worker.rs's busy-only policy, which stays pinned by its own test.
+fn is_transient_spawn_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        NotFound | ExecutableFileBusy | ResourceBusy | OutOfMemory | WouldBlock
+    )
+}
+
+/// Spawn with one retry on transient errors (10ms backoff); every other
+/// error — and the second transient failure — returns immediately.
+async fn spawn_with_transient_retry(
+    cmd: &mut TokioCommand,
+) -> std::io::Result<tokio::process::Child> {
+    match cmd.spawn() {
+        Ok(child) => Ok(child),
+        Err(e) if is_transient_spawn_error(&e) => {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cmd.spawn()
+        }
+        Err(e) => Err(e),
+    }
+}
+
 async fn execute_process(command: &[String], timeout: Duration) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command to execute".to_string());
@@ -157,8 +185,8 @@ async fn execute_process(command: &[String], timeout: Duration) -> Result<i32, S
         cmd.current_dir(workspace.path());
     }
 
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_with_transient_retry(&mut cmd)
+        .await
         .map_err(|e| format!("failed to spawn command: {e}"))?;
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => status,
@@ -208,6 +236,60 @@ mod tests {
             .unwrap();
         assert_ne!(fail, 0);
         assert!(engine.execute(&[], Duration::from_secs(5)).await.is_err());
+    }
+
+    #[test]
+    fn transient_spawn_errors_cover_flake_kinds() {
+        use std::io::{Error, ErrorKind::*};
+        // Retried: observed pre_exec-race ENOENT plus the classic
+        // transient spawn errnos.
+        for kind in [
+            NotFound,
+            ExecutableFileBusy,
+            ResourceBusy,
+            OutOfMemory,
+            WouldBlock,
+        ] {
+            assert!(
+                is_transient_spawn_error(&Error::new(kind, "x")),
+                "{kind:?} should retry"
+            );
+        }
+        // Never retried: genuine failures stay loud and fast.
+        for kind in [
+            PermissionDenied,
+            InvalidInput,
+            TimedOut,
+            BrokenPipe,
+            AlreadyExists,
+            InvalidData,
+            UnexpectedEof,
+            AddrInUse,
+            ConnectionRefused,
+        ] {
+            assert!(
+                !is_transient_spawn_error(&Error::new(kind, "x")),
+                "{kind:?} should not retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_retry_surfaces_persistent_errors_fast() {
+        // A genuinely missing binary still errors (after one bounded
+        // retry), with no long backoff loop.
+        let engine = SandboxEngine::new(SandboxDriver::Process);
+        let start = std::time::Instant::now();
+        let err = engine
+            .execute(&["/no/such/binary-xyz".to_string()], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.contains("failed to spawn"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "retry took too long: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

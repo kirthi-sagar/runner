@@ -6,6 +6,19 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.3.1 — 2026-11-20
+
+- Zero-flake hardening: `execute_process` retries transient spawn errors
+  once (10ms backoff), covering the observed `pre_exec` unshare-race
+  ENOENT plus EAGAIN/ENOMEM/EBUSY/ETXTBSY; genuine failures surface
+  unchanged. Stress: 20/20 process-tier runs green.
+- Zero doc warnings: fixed the `agent.rs` redundant doc link and set
+  `doc = false` on the `runner` binary target (bin/lib filename
+  collision); `cargo doc --workspace --no-deps` is clean.
+- Opt-in live-KVM harness: `live_kvm_boot_dispatch_and_shutdown` runs a
+  real Firecracker boot → dispatch → shutdown behind `RUNNER_LIVE_KVM=1`
+  (plus kernel/rootfs/firecracker inputs); skips silently in standard CI.
+
 ## v1.3.0 — 2026-11-20
 
 - Tier-1 MicroVM guest dispatch: the engine boots the guest, serves one

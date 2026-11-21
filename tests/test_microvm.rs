@@ -284,20 +284,25 @@ async fn live_kvm_boot_dispatch_and_shutdown() {
     );
     let engine =
         SandboxEngine::new(SandboxDriver::MicroVm).with_microvm(config, inputs.firecracker);
-    // Loose assertion is deliberate: stock images carry no guest agent,
-    // so dispatch cannot succeed, and Firecracker's exact UDS direction
-    // (bind-vs-connect, `<uds>_<port>`) is documented but unverified
-    // against a live binary. What this proves on a KVM host: real boot
-    // works, dispatch fails closed, shutdown cleans up, nothing panics.
-    let result = engine
-        .execute(&["id".to_string()], Duration::from_secs(15))
-        .await;
+    // End-to-end Tier-1 proof: the guest agent (injected as /init) dials
+    // out over vsock, serves the exec session, and reports the exit
+    // code. The mock suite covers stdio streaming shapes hermetically;
+    // this asserts the live round trip plus a clean teardown.
+    let code = engine
+        .execute(
+            &["/bin/echo".to_string(), "tier1-live-ok".to_string()],
+            Duration::from_secs(15),
+        )
+        .await
+        .expect("live in-guest dispatch");
+    assert_eq!(code, 0);
+    // The host listener is the suffixed path (Firecracker owns bare `v.sock`).
+    #[cfg(unix)]
+    let leak_path = runner::sandbox::vsock::guest_listen_path(&vsock_path);
+    #[cfg(windows)]
+    let leak_path = vsock_path.clone();
     assert!(
-        result.is_err(),
-        "live dispatch unexpectedly succeeded: {result:?}"
-    );
-    assert!(
-        !vsock_path.exists(),
+        !leak_path.exists(),
         "vsock socket file leaked after live run"
     );
 }

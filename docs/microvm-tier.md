@@ -42,42 +42,39 @@ conventional exit code `124` for overruns it kills itself).
 vsock assumptions: the agent dials host CID `2`, port `5000`
 (`HOST_CID` / `GUEST_VSOCK_PORT`).
 
-> **Firecracker UDS direction contract (unverified live):** per the
-> Firecracker API model docs, for host-initiated connections Firecracker
-> itself binds/listens on `uds_path`, and the host connects and sends
-> `CONNECT <port>\n`; guest-initiated dials surface at
-> `<uds_path>_<PORT>` on a host-listening socket. Our dispatcher
-> currently binds the bare `vsock_path`, which likely mismatches a live
-> Firecracker (expect a clean bind/timeout error, never silent
-> misbehavior). Tracked for a targeted v1.3.2 patch once a live
-> Firecracker environment is available; the UDS loopback contract used
-> by the CI gates is unchanged.
+> **Firecracker UDS direction contract (verified live on v1.18.0):**
+> for host-initiated connections Firecracker itself binds/listens on
+> `uds_path` (host connects); guest-initiated dials surface at
+> `<uds_path>_<PORT>` on a host-listening socket. The dispatcher
+> binds the suffixed path. Verified end to end with a live guest
+> agent dialing host CID 2 port 5000.
 
 ## Baking the agent into the rootfs
 
-Build a static binary (musl target + a `*-musl` toolchain, e.g. via
-`rustup target add x86_64-unknown-linux-musl`):
+Build a static binary (musl target; no musl toolchain needed —
+self-contained link via the toolchain's `rust-lld`):
 
 ```bash
-cargo build --release -p runner-guest-agent --target x86_64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-musl
+RUSTFLAGS="-C link-self-contained=yes -C linker=<toolchain>/bin/rust-lld" \
+  cargo build --release -p runner-guest-agent --target x86_64-unknown-linux-musl
 ```
 
-Copy it into the image and start it on guest boot:
+Inject without root via `debugfs` (no loop mount needed):
 
 ```bash
-mount -o loop rootfs.ext4 /mnt/guest
-cp target/x86_64-unknown-linux-musl/release/runner-guest-agent /mnt/guest/usr/local/bin/
-umount /mnt/guest
+debugfs -w -f inject.txt rootfs.ext4  # mkdir /bin; write agent /init;
+                                      # write busybox /bin/busybox; link echo;
+                                      # mknod /dev/{null,zero,console}; sif modes
 ```
 
-Guest boot hook (run once per boot, before jobs arrive; the agent serves
-one session per connection and exits, so supervise or loop it):
-
-```bash
-#!/bin/sh
-# /usr/local/bin/runner-guest.sh
-while true; do /usr/local/bin/runner-guest-agent; sleep 1; done
-```
+Run the agent as `/init` (kernel needs `init=/init`, shipped in the
+harness boot args). Notes: the agent serves one session per
+connection and exits, so multi-dispatch guests need supervision (a
+one-shot harness plus the `panic=1` reboot loop suffices for tests);
+spawned commands need `/dev/null`, so the image must carry device
+nodes. Firecracker floor is v1.18.0 — v1.7.0 silently skips
+virtio-mmio enumeration on modern kernels.
 
 ## Test posture
 

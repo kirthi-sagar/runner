@@ -76,8 +76,10 @@ pub fn action_payload(action_type: &str) -> serde_json::Value {
     serde_json::json!({ "action_type": action_type })
 }
 
-/// Default guest kernel cmdline.
-pub const DEFAULT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off";
+/// Default guest kernel cmdline. `init=/init` is required: the kernel's
+/// built-in init search does not include `/init`, where the injected
+/// guest agent lives. (`root=/dev/vda` is appended by Firecracker.)
+pub const DEFAULT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1 pci=off init=/init";
 
 /// Minimal HTTP/1.1 client over a Unix socket for the Firecracker API.
 pub struct FirecrackerClient {

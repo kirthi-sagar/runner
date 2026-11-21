@@ -53,10 +53,15 @@ async fn cloud_ipc_and_mcp_reach_live_daemon_state() {
     assert_eq!(res["result"]["nodes"].as_array().unwrap().len(), 1);
     assert_eq!(res["result"]["max_monthly_spend_usd"], 25.0);
 
-    // Phase 2: the real MCP agent impl resolves the same socket.
+    // Phase 2: the real MCP agent impl reaches the same server. On
+    // unix it resolves the HOME-isolated socket implicitly; Windows
+    // has no HOME-derived pipe (production is a fixed name), so the
+    // isolated endpoint is passed explicitly instead.
     let config = runner::config::RunnerConfig::default();
-    let ctx = ToolContext::new(new_shared_state(), config.clone())
-        .with_agent(Arc::new(CliAgentTools::new(config)));
+    let agent = CliAgentTools::new(config.clone());
+    #[cfg(windows)]
+    let agent = agent.with_sock_path(sock.clone());
+    let ctx = ToolContext::new(new_shared_state(), config).with_agent(Arc::new(agent));
     let out = execute_tool(
         TOOL_MANAGE_CLOUD_CAPACITY,
         Some(&serde_json::json!({ "action": "list" })),

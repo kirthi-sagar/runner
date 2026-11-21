@@ -12,7 +12,7 @@ use runner::guest_agent::{
     decode_line, encode_line, run_agent, ExecChunk, ExecRequest, ExecResult, STREAM_STDERR,
     STREAM_STDOUT,
 };
-use runner::sandbox::vsock::dispatch;
+use runner::sandbox::vsock::{dispatch, guest_listen_path};
 use runner::test_support::TempDir;
 
 fn b64(data: &[u8]) -> String {
@@ -29,13 +29,16 @@ fn request() -> ExecRequest {
 }
 
 fn connect_retry(path: &std::path::Path, attempts: u32) -> UnixStream {
+    // Mock guests dial where Firecracker would forward them: the host
+    // listens on the suffixed path, never the bare device path.
+    let listen_path = guest_listen_path(path);
     for _ in 0..attempts {
-        if let Ok(stream) = UnixStream::connect(path) {
+        if let Ok(stream) = UnixStream::connect(&listen_path) {
             return stream;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("mock guest could not connect to {}", path.display());
+    panic!("mock guest could not connect to {}", listen_path.display());
 }
 
 fn chunk_line(stream: u8, data: &[u8]) -> String {
@@ -141,6 +144,10 @@ async fn dispatcher_times_out_when_no_guest_connects() {
     let msg = result.unwrap_err();
     assert!(msg.contains("timed out"), "error: {msg}");
     assert!(!path.exists(), "stale socket file left behind");
+    assert!(
+        !guest_listen_path(&path).exists(),
+        "stale listener socket left behind"
+    );
 }
 
 #[tokio::test]
@@ -177,7 +184,9 @@ async fn dispatcher_errors_when_guest_disconnects_early() {
 fn run_agent_against(argv: Vec<String>, timeout_secs: u64) -> (Vec<u8>, Vec<u8>, i32) {
     let dir = TempDir::new("vsock-agent").unwrap();
     let path = dir.path().join("vsock.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // Mock host plays Firecracker's forwarding endpoint: guest dials
+    // arrive on the suffixed path, never the bare device path.
+    let listener = std::os::unix::net::UnixListener::bind(guest_listen_path(&path)).unwrap();
     let agent_path = path.clone();
     let agent = std::thread::spawn(move || {
         let stream = connect_retry(&agent_path, 100);

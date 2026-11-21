@@ -1,12 +1,16 @@
 //! Host side of Tier-1 guest dispatch: serve one exec session over the
 //! Firecracker UDS-backed vsock socket.
 //!
-//! The guest agent dials out; the host binds `uds_path`, waits for the
-//! connection, sends the [`ExecRequest`],
-//! streams stdio chunks into the caller's writers, and returns the exit
-//! code. The socket file is removed on every path.
+//! The guest agent dials out; Firecracker forwards guest dials to a host
+//! listener at `<uds_path>_<PORT>`, so the host binds that suffixed path
+//! (never the bare `uds_path`, which is Firecracker's own listener),
+//! waits for the connection, sends the [`ExecRequest`], streams stdio
+//! chunks into the caller's writers, and returns the exit code. The
+//! socket file is removed on every path.
 
 use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -24,6 +28,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[cfg(unix)]
 const MAX_LINE_BYTES: usize = 256 * 1024;
 
+/// Host listener path for guest-initiated vsock: Firecracker forwards
+/// guest dials to `<uds_path>_<PORT>` (verified against live v1.18.0;
+/// the bare path is Firecracker's own host-initiated listener).
+#[cfg(unix)]
+pub fn guest_listen_path(uds_path: &Path) -> PathBuf {
+    let mut listen = uds_path.as_os_str().to_owned();
+    listen.push(format!("_{}", runner_guest_agent::GUEST_VSOCK_PORT));
+    PathBuf::from(listen)
+}
+
 /// Dispatch one command to the guest agent and return its exit code.
 /// `timeout` bounds both the guest connect wait and the whole session.
 #[cfg(unix)]
@@ -38,8 +52,9 @@ where
     W1: tokio::io::AsyncWrite + Unpin,
     W2: tokio::io::AsyncWrite + Unpin,
 {
-    let outcome = dispatch_inner(uds_path, request, timeout, stdout, stderr).await;
-    let _ = std::fs::remove_file(uds_path);
+    let listen_path = guest_listen_path(uds_path);
+    let outcome = dispatch_inner(&listen_path, request, timeout, stdout, stderr).await;
+    let _ = std::fs::remove_file(&listen_path);
     outcome
 }
 

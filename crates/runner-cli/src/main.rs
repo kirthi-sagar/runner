@@ -668,10 +668,11 @@ fn cmd_stop(force: bool) -> Result<()> {
         return Ok(());
     }
     signal_daemon(pid, force).map_err(|e| anyhow::anyhow!(e))?;
-    eprintln!(
-        "sent {} to daemon pid {pid}",
-        if force { "SIGKILL" } else { "SIGTERM" }
-    );
+    #[cfg(windows)]
+    let signame = "stop signal (TerminateProcess)";
+    #[cfg(not(windows))]
+    let signame = if force { "SIGKILL" } else { "SIGTERM" };
+    eprintln!("sent {signame} to daemon pid {pid}");
     if !force && !wait_for_exit(pid, std::time::Duration::from_secs(10)) {
         anyhow::bail!("daemon pid {pid} did not exit in 10s; retry with --force");
     }

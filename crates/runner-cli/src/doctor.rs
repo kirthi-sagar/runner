@@ -241,33 +241,48 @@ fn check_ebpf() -> Check {
 }
 
 async fn check_daemon() -> Check {
-    let path = runner_core::ipc::resolve_sock_path();
-    if !path.exists() {
-        return Check::warn(
-            "daemon",
-            format!("socket {} absent; daemon not running?", path.display()),
-        );
-    }
-    #[cfg(unix)]
-    let mode_ok = std::fs::metadata(&path)
-        .map(|m| m.permissions().mode() & 0o777 == 0o600)
-        .unwrap_or(false);
-    // No POSIX modes on Windows; the socket is absent there anyway
-    // (IPC is unsupported), so the warn path below always applies.
+    check_daemon_at(&runner_core::ipc::resolve_sock_path()).await
+}
+
+/// Daemon liveness against one endpoint (split for tests, which bind
+/// an isolated server instead of the production socket).
+async fn check_daemon_at(sock: &std::path::Path) -> Check {
     #[cfg(windows)]
-    let mode_ok = false;
-    match runner_core::ipc::ipc_call(&path, "ping").await {
-        Ok(_) if mode_ok => {
-            Check::pass("daemon", format!("IPC alive at {} (0600)", path.display()))
-        }
-        Ok(_) => Check::warn(
-            "daemon",
-            format!(
-                "IPC alive at {} but permissions are not 0600",
-                path.display()
+    {
+        // Pipes have no filesystem presence or POSIX modes: a live
+        // ping is the whole signal.
+        return match runner_core::ipc::ipc_call(sock, "ping").await {
+            Ok(_) => Check::pass(
+                "daemon",
+                format!("IPC alive at {} (named pipe)", sock.display()),
             ),
-        ),
-        Err(e) => Check::warn("daemon", format!("socket present but ping failed: {e}")),
+            Err(_) => Check::warn("daemon", "daemon not responding".to_string()),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        if !sock.exists() {
+            return Check::warn(
+                "daemon",
+                format!("socket {} absent; daemon not running?", sock.display()),
+            );
+        }
+        let mode_ok = std::fs::metadata(sock)
+            .map(|m| m.permissions().mode() & 0o777 == 0o600)
+            .unwrap_or(false);
+        match runner_core::ipc::ipc_call(sock, "ping").await {
+            Ok(_) if mode_ok => {
+                Check::pass("daemon", format!("IPC alive at {} (0600)", sock.display()))
+            }
+            Ok(_) => Check::warn(
+                "daemon",
+                format!(
+                    "IPC alive at {} but permissions are not 0600",
+                    sock.display()
+                ),
+            ),
+            Err(e) => Check::warn("daemon", format!("socket present but ping failed: {e}")),
+        }
     }
 }
 
@@ -1184,5 +1199,30 @@ mod tests {
             "{}",
             degraded.detail
         );
+    }
+
+    // Windows daemon check against an isolated pipe server: pass when
+    // the ping lands, warn (never fail or panic) when nothing listens.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn daemon_check_probes_named_pipe() {
+        let dir = runner_core::test_support::TempDir::new("doctor-daemon").unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let server = std::sync::Arc::new(
+            runner_core::ipc::IpcServer::bind(
+                &sock,
+                runner_core::governor::supervisor::new_shared_state(),
+            )
+            .await
+            .unwrap(),
+        );
+        let task = tokio::spawn(async move { server.serve().await });
+        let up = check_daemon_at(&sock).await;
+        assert_eq!(up.name, "daemon");
+        assert!(matches!(up.status, Status::Pass));
+        task.abort();
+        let dead = dir.path().join("absent.sock");
+        let down = check_daemon_at(&dead).await;
+        assert!(matches!(down.status, Status::Warn));
     }
 }

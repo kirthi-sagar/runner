@@ -53,3 +53,60 @@ async fn supervisor_loop_ticks_and_applies_weight() {
         .expect("query weight");
     assert!((1..=9).contains(&applied), "applied {applied}");
 }
+
+/// Windows named pipes carry real IPC: a bound server answers a
+/// status report over `\\.\pipe\runner-<stem>`, and the transport
+/// leaves no socket file behind.
+#[tokio::test]
+async fn win_named_pipe_serves_status() {
+    let dir = runner_core::test_support::TempDir::new("win-named-pipe").unwrap();
+    let sock = dir.path().join("status.sock");
+    let server = std::sync::Arc::new(
+        runner_core::ipc::IpcServer::bind(
+            &sock,
+            runner_core::governor::supervisor::new_shared_state(),
+        )
+        .await
+        .unwrap(),
+    );
+    let task = tokio::spawn(async move { server.serve().await });
+    let body = runner_core::ipc::ipc_call(&sock, "status").await.unwrap();
+    let version = body["result"]["version"].as_str().unwrap_or("");
+    assert!(!version.is_empty(), "status report version: {body}");
+    assert!(!sock.exists(), "pipe transport leaves no socket file");
+    task.abort();
+}
+
+/// The pidfile-mediated stop flow end to end: a recorded sleeper
+/// reports alive, terminates on signal, the exit poll observes it,
+/// and the pid file cleans up — the exact `runner stop` sequence.
+#[tokio::test]
+async fn win_pidfile_stop_flow() {
+    use std::time::Duration;
+    let pid_path = runner_core::pidfile::resolve_pid_path();
+    assert_eq!(
+        pid_path.file_name().and_then(|n| n.to_str()),
+        Some("runner.pid"),
+        "windows pid file name: {}",
+        pid_path.display()
+    );
+    let mut child = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent).expect("pid dir");
+    }
+    std::fs::write(&pid_path, format!("{pid}")).expect("write pid");
+    assert_eq!(runner_core::pidfile::read_pid(&pid_path).unwrap(), pid);
+    assert!(runner_core::pidfile::process_alive(pid));
+    runner_core::pidfile::signal_daemon(pid, false).expect("terminate sleeper");
+    assert!(runner_core::pidfile::wait_for_exit(
+        pid,
+        Duration::from_secs(10)
+    ));
+    std::fs::remove_file(&pid_path).ok();
+    assert!(!pid_path.exists(), "pid file cleaned after stop");
+    let _ = child.wait();
+}

@@ -1,7 +1,8 @@
 //! Daemon PID file tracking (`runner stop`).
 //!
 //! Records the supervisor PID in `/run/runner.pid`, falling back to
-//! `~/.runner/runner.pid` when unprivileged.
+//! `~/.runner/runner.pid` when unprivileged (on Windows:
+//! `%LOCALAPPDATA%\runner\runner.pid`, falling back to the temp dir).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ pub fn fallback_pid_path() -> Option<PathBuf> {
 }
 
 /// Pick the privileged path when its parent is writable, else the fallback.
+#[cfg(not(windows))]
 pub fn resolve_pid_path() -> PathBuf {
     let primary = PathBuf::from(PID_PATH);
     if let Some(parent) = primary.parent() {
@@ -30,6 +32,15 @@ pub fn resolve_pid_path() -> PathBuf {
         }
     }
     fallback_pid_path().unwrap_or(primary)
+}
+
+/// Windows PID file: `%LOCALAPPDATA%\runner\runner.pid` (always
+/// writable), falling back to the temp dir only if unset.
+#[cfg(windows)]
+pub fn resolve_pid_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|dir| PathBuf::from(dir).join("runner").join("runner.pid"))
+        .unwrap_or_else(|| std::env::temp_dir().join("runner.pid"))
 }
 
 /// Write the current process id.
@@ -58,12 +69,29 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
-/// Windows has no signal-0 probe; report not-alive (`stop` fails
-/// earlier with the unsupported message from `signal_daemon`).
+/// True if the process exists: open with query rights and check for
+/// `STILL_ACTIVE`. Access-denied counts as alive (exists but
+/// unqueryable), mirroring the unix EPERM rule. (A foreign process
+/// that exited with code 259 would misread as alive; our own kills
+/// use exit code 1, and daemon exits are 0/1, so this never bites.)
 #[cfg(windows)]
-pub fn process_alive(_pid: u32) -> bool {
-    eprintln!("[runner] unsupported on Windows: pidfile (POSIX lock)");
-    false
+pub fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    let handle =
+        match crate::governor::windows::open_process_with(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+            Ok(handle) => handle,
+            // Access-denied means the pid exists but is unqueryable
+            // (same rule as the unix EPERM branch).
+            Err(e) => return e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32),
+        };
+    let mut code = 0u32;
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: live handle plus a valid out-word.
+    let ok = unsafe { GetExitCodeProcess(handle.as_raw_handle() as _, &mut code) };
+    ok != 0 && code == STILL_ACTIVE as u32
 }
 
 /// Send SIGTERM (or SIGKILL when `force`) to the recorded daemon.
@@ -78,11 +106,22 @@ pub fn signal_daemon(pid: u32, force: bool) -> Result<(), String> {
         .map_err(|e| format!("failed to signal daemon pid {pid}: {e}"))
 }
 
-/// Windows has no POSIX signals; stopping the daemon is unsupported.
+/// Terminate the recorded daemon. Windows has no TERM/KILL
+/// distinction, so `force` is accepted and ignored: every stop is an
+/// unconditional terminate with exit code 1.
 #[cfg(windows)]
-pub fn signal_daemon(_pid: u32, _force: bool) -> Result<(), String> {
-    eprintln!("[runner] unsupported on Windows: pidfile (POSIX lock)");
-    Err("unsupported on Windows: pidfile (POSIX lock)".to_string())
+pub fn signal_daemon(pid: u32, _force: bool) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
+    let handle = crate::governor::windows::open_process_with(pid, PROCESS_TERMINATE)
+        .map_err(|e| format!("failed to open daemon pid {pid}: {e}"))?;
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: live handle; exit code 1 (never STILL_ACTIVE, so the
+    // alive probe can never misread our own kills).
+    let ok = unsafe { TerminateProcess(handle.as_raw_handle() as _, 1) };
+    if ok == 0 {
+        return Err(format!("failed to terminate daemon pid {pid}"));
+    }
+    Ok(())
 }
 
 /// Wait up to `timeout` for the process to exit.
@@ -113,13 +152,23 @@ mod tests {
         write_current_pid(&path).unwrap();
         let pid = read_pid(&path).unwrap();
         assert_eq!(pid, std::process::id());
-        if cfg!(windows) {
-            // No signal-0 probe on Windows: the stub always
-            // reports not-alive (callers fail earlier, loudly).
-            assert!(!process_alive(pid));
-        } else {
-            assert!(process_alive(pid));
-            assert!(!process_alive(u32::MAX - 100));
-        }
+        assert!(process_alive(pid));
+        assert!(!process_alive(u32::MAX - 100));
+    }
+
+    // Windows stop path end to end: a live sleeper reports alive,
+    // terminates on signal, and the exit poll observes it.
+    #[cfg(windows)]
+    #[test]
+    fn signal_daemon_terminates_and_wait_observes_exit() {
+        let mut child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = child.id();
+        assert!(process_alive(pid));
+        signal_daemon(pid, false).expect("terminate sleeper");
+        assert!(wait_for_exit(pid, std::time::Duration::from_secs(10)));
+        let _ = child.wait();
     }
 }

@@ -333,9 +333,17 @@ fn create_system_job() -> io::Result<JobObject> {
 /// for `IsProcessInJob` (without it the query fails with
 /// access-denied — observed live on windows-latest).
 fn open_process(pid: u32) -> io::Result<OwnedHandle> {
+    let rights = PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    open_process_with(pid, rights)
+}
+
+/// Open a process with exactly `rights` (least-privilege callers
+/// such as the pidfile alive probe pass only what they need: extra
+/// rights can turn an unqueryable-but-alive process into a false
+/// "not running").
+pub(crate) fn open_process_with(pid: u32, rights: u32) -> io::Result<OwnedHandle> {
     // SAFETY: no handle to close on failure (null return); on
     // success ownership moves into `OwnedHandle` exactly once.
-    let rights = PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
     let raw = unsafe { OpenProcess(rights, 0, pid) };
     if raw.is_null() {
         return Err(last_error("OpenProcess"));

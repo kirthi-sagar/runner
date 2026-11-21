@@ -166,7 +166,12 @@ mod tests {
         let msg = dispatch(&path, &request, Duration::from_secs(5), &mut out, &mut err)
             .await
             .unwrap_err();
-        assert!(msg.contains("no command"), "error: {msg}");
+        // The Windows stub refuses before argv validation runs.
+        if cfg!(windows) {
+            assert!(msg.contains("unsupported on Windows"), "error: {msg}");
+        } else {
+            assert!(msg.contains("no command"), "error: {msg}");
+        }
         assert!(!path.exists());
     }
 }

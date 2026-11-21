@@ -340,7 +340,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code, 0);
-        assert_eq!(std::fs::read_to_string(&log).unwrap(), "process\n");
+        // The QoS log is written by the pre_exec child hook, which has
+        // no Windows counterpart (no fork); spawns proceed unhooked.
+        if cfg!(unix) {
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), "process\n");
+        }
         // A failing backend never fails the spawn.
         let failing = Arc::new(MockQos::new());
         failing.set_failing();

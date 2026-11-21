@@ -71,11 +71,15 @@ impl SandboxSpec {
 /// map our own UID/GID 1:1, mount tmpfs over the workspace, chdir into it.
 ///
 /// Returns `Err` (aborting the spawn) when any step fails. On macOS this
-/// applies the Seatbelt profile instead (soft-fail: a failed apply logs
-/// and continues unsandboxed). Elsewhere a no-op (callers gate on
-/// [`probe_userns`], always false there), kept so `pre_exec` closures
-/// compile on every Unix.
-pub fn sandbox_pre_exec(spec: &SandboxSpec) -> io::Result<()> {
+/// applies the Seatbelt profile instead: a failed apply (or nesting)
+/// logs and continues unsandboxed, unless `strict`, which fails the
+/// spawn. Elsewhere a no-op (callers gate on [`probe_userns`], always
+/// false there), kept so `pre_exec` closures compile on every Unix.
+pub fn sandbox_pre_exec(spec: &SandboxSpec, strict: bool) -> io::Result<()> {
+    // Linux and fallback builds never consult the flag (their steps
+    // already fail the spawn on error); the binding keeps every
+    // platform warning-free.
+    let _ = strict;
     #[cfg(target_os = "linux")]
     {
         use nix::mount::{mount, MsFlags};
@@ -120,6 +124,12 @@ pub fn sandbox_pre_exec(spec: &SandboxSpec) -> io::Result<()> {
             .map(std::path::PathBuf::from)
             .and_then(|tmp| std::fs::canonicalize(&tmp).ok());
         if crate::seatbelt::is_sandboxed() {
+            if strict {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "seatbelt: already sandboxed; --strict refuses nested spawn",
+                ));
+            }
             eprintln!("[runner] seatbelt: already sandboxed, skipping nested profile");
             return Ok(());
         }
@@ -127,9 +137,16 @@ pub fn sandbox_pre_exec(spec: &SandboxSpec) -> io::Result<()> {
             crate::seatbelt::build_profile(&workspace, home.as_deref(), tmpdir.as_deref());
         match crate::seatbelt::apply_profile(&profile) {
             Ok(()) => eprintln!("[runner] seatbelt: Tier-2 sandbox active"),
-            // Soft-fail (same posture as the Linux userns probe):
-            // `--strict` will harden this in a future milestone.
             Err(e) => {
+                if strict {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "seatbelt: sandbox_init failed ({e}); \
+                             --strict refuses unsandboxed execution"
+                        ),
+                    ));
+                }
                 eprintln!("[runner] seatbelt: sandbox_init failed ({e}); continuing unsandboxed")
             }
         }
@@ -156,7 +173,7 @@ pub fn probe_userns() -> bool {
     let mut cmd = std::process::Command::new("true");
     unsafe {
         use std::os::unix::process::CommandExt;
-        cmd.pre_exec(move || sandbox_pre_exec(&spec));
+        cmd.pre_exec(move || sandbox_pre_exec(&spec, false));
     }
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
     let _ = std::fs::remove_dir_all(&dir);

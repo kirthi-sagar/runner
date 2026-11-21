@@ -25,7 +25,7 @@ async fn echo_succeeds_with_zero() {
     let argv = cmd(&["echo", "hello"]);
     #[cfg(windows)]
     let argv = cmd(&["cmd", "/c", "echo", "hello"]);
-    let code = execute_local_sandboxed(&argv, false, Duration::from_secs(30))
+    let code = execute_local_sandboxed(&argv, false, Duration::from_secs(30), false)
         .await
         .unwrap();
     assert_eq!(code, 0);
@@ -38,7 +38,7 @@ async fn python_computation_succeeds() {
     let argv = cmd(&["python3", "-c", "print(2+2)"]);
     #[cfg(windows)]
     let argv = cmd(&["python", "-c", "print(2+2)"]);
-    let code = execute_local_sandboxed(&argv, false, Duration::from_secs(30))
+    let code = execute_local_sandboxed(&argv, false, Duration::from_secs(30), false)
         .await
         .unwrap();
     assert_eq!(code, 0);
@@ -50,7 +50,7 @@ async fn exit_code_propagates_on_failure() {
     let argv = cmd(&["python3", "-c", "import sys; sys.exit(7)"]);
     #[cfg(windows)]
     let argv = cmd(&["python", "-c", "import sys; sys.exit(7)"]);
-    let code = execute_local_sandboxed(&argv, true, Duration::from_secs(30))
+    let code = execute_local_sandboxed(&argv, true, Duration::from_secs(30), false)
         .await
         .unwrap();
     assert_eq!(code, 7);
@@ -70,7 +70,7 @@ async fn timeout_kills_and_errors() {
         "-Command",
         "Start-Sleep -Seconds 30",
     ]);
-    let err = execute_local_sandboxed(&argv, true, Duration::from_millis(300))
+    let err = execute_local_sandboxed(&argv, true, Duration::from_millis(300), false)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("timed out"), "{err:#}");
@@ -78,9 +78,11 @@ async fn timeout_kills_and_errors() {
 
 #[tokio::test]
 async fn empty_command_is_rejected() {
-    assert!(execute_local_sandboxed(&[], true, Duration::from_secs(5))
-        .await
-        .is_err());
+    assert!(
+        execute_local_sandboxed(&[], true, Duration::from_secs(5), false)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -99,7 +101,7 @@ async fn direct_mode_inherits_caller_cwd() {
     let argv = cmd(&["sh", "-c", &format!("pwd > {marker}")]);
     #[cfg(windows)]
     let argv = cmd(&["cmd", "/c", &format!("cd > {marker}")]);
-    let code = execute_local_sandboxed(&argv, true, Duration::from_secs(30))
+    let code = execute_local_sandboxed(&argv, true, Duration::from_secs(30), false)
         .await
         .unwrap();
     assert_eq!(code, 0);

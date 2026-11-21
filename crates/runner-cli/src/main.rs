@@ -52,6 +52,9 @@ enum Commands {
         /// systemd/setsid to detach).
         #[arg(long)]
         daemon: bool,
+        /// Refuse to start when Tier-2 sandboxing is unavailable
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
     /// Stop the daemon (SIGTERM, graceful; --force for SIGKILL)
     Stop {
@@ -160,6 +163,9 @@ enum Commands {
         /// Output format: text or json
         #[arg(long, default_value = "text")]
         format: String,
+        /// Treat sandbox-guardrail warnings as fatal errors
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
     /// Provider credential and connectivity checks
     Provider {
@@ -195,6 +201,9 @@ enum Commands {
         /// Isolation tier: process (community namespaces) or microvm (enterprise Firecracker)
         #[arg(long, default_value = "process")]
         driver: String,
+        /// Fail closed instead of running unsandboxed when Tier-2 is unavailable
+        #[arg(long, default_value_t = false)]
+        strict: bool,
     },
 }
 
@@ -944,10 +953,20 @@ async fn cmd_doctor(
     enterprise: bool,
     egress: bool,
     format: &str,
+    strict: bool,
 ) -> Result<()> {
-    use runner_cli::doctor::{overall_ok, render_json, render_text, run_all};
+    use runner_cli::doctor::{apply_strict, overall_ok, render_json, render_text, run_all};
 
-    let checks = run_all(config, enterprise, egress).await;
+    let strict = runner_core::config::is_strict(strict, config);
+    if strict {
+        eprintln!("[runner doctor] strict mode active: warnings treated as fatal errors");
+    }
+    let mut checks = run_all(config, enterprise, egress).await;
+    if strict {
+        // Fail-closed guardrails: sandbox defenses must be proven
+        // present, not merely warned about.
+        apply_strict(&mut checks);
+    }
     match format.trim().to_ascii_lowercase().as_str() {
         "text" => print!("{}", render_text(&checks)),
         "json" => println!("{}", render_json(&checks)),
@@ -1164,7 +1183,23 @@ async fn main() -> Result<()> {
         Commands::Init { org, repo, token } => {
             cmd_init(&config, org, repo, token)?;
         }
-        Commands::Start { daemon } => {
+        Commands::Start { daemon, strict } => {
+            let strict = runner_core::config::is_strict(strict, &config);
+            // Fail-closed boot: a strict daemon refuses to supervise
+            // workers it cannot sandbox.
+            #[cfg(target_os = "macos")]
+            let tier2 = runner_sandbox::seatbelt::probe_seatbelt();
+            #[cfg(target_os = "linux")]
+            let tier2 = runner_sandbox::mounts::probe_userns();
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let tier2 = false;
+            if strict && !tier2 {
+                eprintln!(
+                    "runner start failed: sandbox unavailable: \
+                     --strict refuses to supervise unsandboxed workers"
+                );
+                std::process::exit(1);
+            }
             if daemon {
                 eprintln!("runner: --daemon accepted; launch under systemd/setsid to detach");
             }
@@ -1450,8 +1485,9 @@ async fn main() -> Result<()> {
             enterprise,
             egress,
             format,
+            strict,
         } => {
-            cmd_doctor(&config, enterprise, egress, &format).await?;
+            cmd_doctor(&config, enterprise, egress, &format, strict).await?;
         }
         Commands::Provider { command } => match command {
             ProviderCommands::Test { provider } => {
@@ -1490,8 +1526,10 @@ async fn main() -> Result<()> {
             no_sandbox,
             timeout_mins,
             driver,
+            strict,
         } => {
             let timeout = std::time::Duration::from_secs(timeout_mins.max(1) * 60);
+            let strict = runner_core::config::is_strict(strict, &config);
             let tier = match runner_sandbox::driver::SandboxDriver::from_name(&driver) {
                 Ok(tier) => tier,
                 Err(e) => {
@@ -1504,7 +1542,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             match runner_providers::providers::local::execute_local_sandboxed(
-                &command, no_sandbox, timeout,
+                &command, no_sandbox, timeout, strict,
             )
             .await
             {

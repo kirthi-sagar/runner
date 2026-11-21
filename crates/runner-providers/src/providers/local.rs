@@ -73,26 +73,45 @@ async fn govern_slice_while_running(_slice: CgroupSlice) {
     std::future::pending::<()>().await;
 }
 
+/// Tier-2 availability for this host: the Seatbelt facility on
+/// macOS, the unprivileged userns probe elsewhere (always false off
+/// Linux — Windows has no Tier-2).
+fn can_sandbox() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        runner_sandbox::seatbelt::probe_seatbelt()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        probe_userns()
+    }
+}
+
 /// Execute a command under zero-freeze governance, returning its exit code.
 ///
 /// Sandboxing: tmpfs user namespace when available (unless `no_sandbox`);
 /// otherwise direct spawn still governed by the cgroup slice + PSI loop.
 /// Stdout/stderr stream to the terminal in real time. Timeout kills the
-/// child and returns an error (never a freeze).
+/// child and returns an error (never a freeze). `strict` fails closed
+/// instead of running unsandboxed.
 pub async fn execute_local_sandboxed(
     command: &[String],
     no_sandbox: bool,
     timeout: Duration,
+    strict: bool,
 ) -> Result<i32> {
     if command.is_empty() {
         anyhow::bail!("no command to execute");
     }
     reject_blocked_ip_literals(command)?;
+    if strict && (!can_sandbox() || no_sandbox) {
+        anyhow::bail!("sandbox unavailable or disabled: --strict refuses unsandboxed execution");
+    }
 
     // Workspace lifetime spans the run so Drop scrubs it after exit.
     let workspace =
         Workspace::create(&sanitize_job_id(&next_job_id())).context("workspace setup failed")?;
-    let sandboxed = !no_sandbox && probe_userns();
+    let sandboxed = !no_sandbox && can_sandbox();
 
     let mut cmd = TokioCommand::new(&command[0]);
     cmd.args(&command[1..])
@@ -111,7 +130,7 @@ pub async fn execute_local_sandboxed(
     runner_core::governor::darwin::install_child_hook(
         &mut cmd,
         std::sync::Arc::new(runner_core::governor::darwin::DarwinQos),
-        spec.map(|spec| move || runner_sandbox::mounts::sandbox_pre_exec(&spec)),
+        spec.map(|spec| move || runner_sandbox::mounts::sandbox_pre_exec(&spec, strict)),
     );
 
     let slice = CgroupSlice::system_default();
@@ -181,7 +200,8 @@ pub async fn execute_captured(
     runner_core::governor::darwin::install_child_hook(
         &mut cmd,
         std::sync::Arc::new(runner_core::governor::darwin::DarwinQos),
-        spec.map(|spec| move || runner_sandbox::mounts::sandbox_pre_exec(&spec)),
+        // Captured execution stays soft-fail (no strict tier here).
+        spec.map(|spec| move || runner_sandbox::mounts::sandbox_pre_exec(&spec, false)),
     );
 
     let slice = CgroupSlice::system_default();
@@ -306,6 +326,7 @@ mod tests {
             &["ping".to_string(), "10.0.0.5".to_string()],
             true,
             Duration::from_secs(5),
+            false,
         )
         .await
         .unwrap_err();

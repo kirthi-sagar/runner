@@ -205,6 +205,9 @@ pub struct WorkerLaunch {
     /// Sandbox workspace setup for the child (mount namespaces + tmpfs).
     /// `None` runs unsandboxed (hosts blocking unprivileged userns).
     pub sandbox: Option<crate::mounts::SandboxSpec>,
+    /// Fail the spawn when the pre-exec sandbox setup fails, instead
+    /// of running the worker unsandboxed.
+    pub strict: bool,
     /// Extra environment for the child (e.g. cache endpoint injection).
     pub env: Vec<(String, String)>,
 }
@@ -215,6 +218,7 @@ impl WorkerLaunch {
             work_dir,
             jit_config: jit_config.into(),
             sandbox: None,
+            strict: false,
             env: Vec::new(),
         }
     }
@@ -317,14 +321,16 @@ pub async fn run_supervised(
         cmd.env(key, value);
     }
     // QoS hook always installed (no-op off macOS); sandbox setup rides
-    // along only when the launch carries a spec.
+    // along only when the launch carries a spec. A strict pre-exec
+    // failure aborts the spawn (the error below), never soft-fails.
+    let strict = launch.strict;
     runner_core::governor::darwin::install_child_hook(
         &mut cmd,
         qos,
         launch
             .sandbox
             .clone()
-            .map(|spec| move || crate::mounts::sandbox_pre_exec(&spec)),
+            .map(|spec| move || crate::mounts::sandbox_pre_exec(&spec, strict)),
     );
     let mut child = spawn_with_busy_retry(&mut cmd).await?;
     if let (Some(pid), Some(slice)) = (child.id(), slice) {

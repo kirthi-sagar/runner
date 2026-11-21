@@ -6,6 +6,17 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.3.0 — 2026-11-21
+
+- Strict sandbox mode: `--strict` (or `sandbox.strict`, or
+  `RUNNER_STRICT=1`) fails closed with exit 1 instead of running
+  unsandboxed when Tier-2 is unavailable or disabled.
+- `runner exec --strict` refuses up front; `runner start --strict`
+  refuses to boot without Tier-2; `runner doctor --strict`
+  escalates `userns`/`ebpf`/`cgroupsv2` warnings to failures.
+- macOS Tier-2 gap fix: local execution detects Seatbelt via
+  `probe_seatbelt` instead of the Linux-only userns probe.
+
 ## v2.2.0 — 2026-11-21
 
 - Windows hardening: real multi-core topology via `GetSystemInfo` +

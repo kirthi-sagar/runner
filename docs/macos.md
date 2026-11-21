@@ -55,8 +55,9 @@ Behavioral notes:
   sandbox stays in force.
 - **Soft-fail**: if `sandbox_init` itself fails, the error message is
   logged and the job continues unsandboxed (same posture as the
-  Linux userns probe). `--strict` will convert this to a hard
-  failure in a future milestone.
+  Linux userns probe) — unless `--strict` is active (flag,
+  `sandbox.strict`, or `RUNNER_STRICT=1`), which fails the spawn
+  with exit 1 instead. Nesting refusals behave the same way.
 - **Deprecation risk**: `sandbox_init` is marked deprecated by Apple
   (in favor of the entitled App Sandbox, which cannot confine
   arbitrary CLI job processes). It remains functional on current

@@ -134,7 +134,7 @@ fn live_sandbox_or_fallback_spawn() {
         let mut cmd = std::process::Command::new("true");
         unsafe {
             use std::os::unix::process::CommandExt;
-            cmd.pre_exec(move || sandbox_pre_exec(&spec));
+            cmd.pre_exec(move || sandbox_pre_exec(&spec, false));
         }
         assert!(cmd.status().unwrap().success());
     } else {

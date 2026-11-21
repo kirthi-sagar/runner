@@ -798,6 +798,19 @@ pub fn overall_ok(checks: &[Check]) -> bool {
     !checks.iter().any(|c| c.status == Status::Fail)
 }
 
+/// Strict-mode escalation: warnings on the sandbox-guardrail checks
+/// (`userns`, `ebpf`, `cgroupsv2`) become failures. Everything else
+/// keeps its verdict.
+pub fn apply_strict(checks: &mut [Check]) {
+    for check in checks {
+        if matches!(check.name.as_str(), "userns" | "ebpf" | "cgroupsv2")
+            && check.status == Status::Warn
+        {
+            check.status = Status::Fail;
+        }
+    }
+}
+
 /// Human-readable checklist.
 pub fn render_text(checks: &[Check]) -> String {
     let mut out = String::from("runner doctor\n");
@@ -1199,6 +1212,31 @@ mod tests {
             "{}",
             degraded.detail
         );
+    }
+
+    #[test]
+    fn strict_escalates_guardrail_warnings_only() {
+        let mut checks = vec![
+            Check::warn("userns", "no userns".to_string()),
+            Check::warn("ebpf", "no ebpf".to_string()),
+            Check::warn("cgroupsv2", "no cgroup".to_string()),
+            Check::warn("daemon", "down".to_string()),
+            Check::pass("kernel", "ok".to_string()),
+            Check::fail("kvm", "absent".to_string()),
+        ];
+        apply_strict(&mut checks);
+        for check in &checks[0..3] {
+            assert!(
+                matches!(check.status, Status::Fail),
+                "{} should escalate: {:?}",
+                check.name,
+                check.status
+            );
+        }
+        assert!(matches!(checks[3].status, Status::Warn));
+        assert!(matches!(checks[4].status, Status::Pass));
+        assert!(matches!(checks[5].status, Status::Fail));
+        assert!(!overall_ok(&checks));
     }
 
     // Windows daemon check against an isolated pipe server: pass when

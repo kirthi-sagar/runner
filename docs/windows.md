@@ -71,6 +71,12 @@ IPC over the named pipe and supervising workers governed by Job
 Objects. `runner stop` ends it via the `%LOCALAPPDATA%` PID file
 and Win32 `TerminateProcess`.
 
+Strict mode: Windows has no Tier-2 sandbox, so `--strict` (flag,
+`sandbox.strict`, or `RUNNER_STRICT=1`) always fails closed here:
+`runner exec --strict` and `runner start --strict` refuse with
+exit 1, and `runner doctor --strict` escalates guardrail warnings
+to failures.
+
 Future (v2.3+): WFP egress filtering and a native sandbox backend.
 Every remaining stub logs its feature name so the work can be
 harvested by grep.

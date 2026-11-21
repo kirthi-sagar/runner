@@ -60,6 +60,7 @@ pub struct SandboxEngine {
     driver: SandboxDriver,
     microvm: Option<MicroVmConfig>,
     firecracker_bin: PathBuf,
+    strict: bool,
 }
 
 impl SandboxEngine {
@@ -68,6 +69,7 @@ impl SandboxEngine {
             driver,
             microvm: None,
             firecracker_bin: PathBuf::from("firecracker"),
+            strict: false,
         }
     }
 
@@ -75,6 +77,13 @@ impl SandboxEngine {
     pub fn with_microvm(mut self, config: MicroVmConfig, firecracker_bin: PathBuf) -> Self {
         self.microvm = Some(config);
         self.firecracker_bin = firecracker_bin;
+        self
+    }
+
+    /// Fail closed instead of running unsandboxed when Tier-2 is
+    /// unavailable (see [`is_strict`](runner_core::config::is_strict)).
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
         self
     }
 
@@ -96,6 +105,7 @@ impl SandboxEngine {
                     command,
                     timeout,
                     Arc::new(runner_core::governor::darwin::DarwinQos),
+                    self.strict,
                 )
                 .await
             }
@@ -176,9 +186,17 @@ async fn execute_process(
     command: &[String],
     timeout: Duration,
     qos: Arc<dyn QosBackend>,
+    strict: bool,
 ) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command to execute".to_string());
+    }
+    // No Tier-2 on Windows: strict fails here, before any spawn.
+    #[cfg(windows)]
+    if strict {
+        return Err(
+            "sandbox unavailable on Windows: --strict refuses unsandboxed execution".to_string(),
+        );
     }
     #[cfg(windows)]
     eprintln!("governor disabled: Windows Tier-3 mode");
@@ -190,6 +208,9 @@ async fn execute_process(
     let sandboxed = true;
     #[cfg(not(target_os = "macos"))]
     let sandboxed = probe_userns();
+    if strict && !sandboxed {
+        return Err("sandbox unavailable: --strict refuses unsandboxed execution".to_string());
+    }
 
     let mut cmd = TokioCommand::new(&command[0]);
     cmd.args(&command[1..])
@@ -210,7 +231,7 @@ async fn execute_process(
     runner_core::governor::darwin::install_child_hook(
         &mut cmd,
         qos,
-        spec.map(|spec| move || crate::mounts::sandbox_pre_exec(&spec)),
+        spec.map(|spec| move || crate::mounts::sandbox_pre_exec(&spec, strict)),
     );
 
     let mut child = spawn_with_transient_retry(&mut cmd)
@@ -344,7 +365,7 @@ mod tests {
         let dir = runner_core::test_support::TempDir::new("driver-qos").unwrap();
         let log = dir.path().join("qos.log");
         let mock = Arc::new(MockQos::with_log(log.clone()));
-        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), mock)
+        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), mock, false)
             .await
             .unwrap();
         assert_eq!(code, 0);
@@ -356,7 +377,7 @@ mod tests {
         // A failing backend never fails the spawn.
         let failing = Arc::new(MockQos::new());
         failing.set_failing();
-        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), failing)
+        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), failing, false)
             .await
             .unwrap();
         assert_eq!(code, 0);

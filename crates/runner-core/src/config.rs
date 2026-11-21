@@ -393,6 +393,8 @@ pub struct SandboxProfile {
     pub rootfs_path: Option<PathBuf>,
     #[serde(default)]
     pub firecracker_bin: Option<PathBuf>,
+    #[serde(default)]
+    pub strict: Option<bool>,
 }
 
 /// Intuitive security knobs.
@@ -469,6 +471,9 @@ impl RunnerProfile {
                 }
                 if let Some(path) = &sandbox.firecracker_bin {
                     config.sandbox.firecracker_bin = Some(path.clone());
+                }
+                if let Some(strict) = sandbox.strict {
+                    config.sandbox.strict = strict;
                 }
             }
             None => {
@@ -667,6 +672,10 @@ pub struct SandboxConfig {
     /// Firecracker binary (default: `firecracker` on PATH).
     #[serde(default)]
     pub firecracker_bin: Option<PathBuf>,
+    /// Fail closed instead of running unsandboxed when Tier-2 is
+    /// unavailable (see [`is_strict`]).
+    #[serde(default)]
+    pub strict: bool,
 }
 
 fn default_sandbox_driver() -> String {
@@ -680,8 +689,19 @@ impl Default for SandboxConfig {
             kernel_path: None,
             rootfs_path: None,
             firecracker_bin: None,
+            strict: false,
         }
     }
+}
+
+/// Effective strict mode: the explicit CLI flag, the sandbox config,
+/// or the `RUNNER_STRICT` environment override (`1`/`true`).
+pub fn is_strict(explicit_flag: bool, config: &RunnerConfig) -> bool {
+    explicit_flag
+        || config.sandbox.strict
+        || std::env::var("RUNNER_STRICT")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false)
 }
 
 /// Zero-trust security posture.

@@ -204,8 +204,8 @@ pub fn detect_slots(afk_boost: bool) -> io::Result<SlotReport> {
 }
 
 /// Windows has no sysfs/NUMA topology wired; report a static
-/// single-core topology so slot math still resolves. Tier-3 needs no
-/// real slots; the governor never runs here.
+/// single-core topology so slot math still resolves. (The governor
+/// loop sizes from `available_parallelism` instead.)
 #[cfg(windows)]
 fn windows_slots(afk_boost: bool) -> io::Result<SlotReport> {
     eprintln!("NUMA topology unavailable on Windows");

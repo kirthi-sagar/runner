@@ -626,14 +626,116 @@ pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
     run_supervisor_inner(state).await
 }
 
-/// Windows has no governor (no PSI, no cgroups); the daemon does not
-/// start. Tier-3 direct dispatch (`runner exec`) is the supported path.
+/// Windows governor loop: Win32 sensor → shared ladder → Job Object
+/// limits. Mirrors the unix loop; shutdown via `ctrl_c`.
 #[cfg(windows)]
-pub async fn run_supervisor(_state: SharedState) -> anyhow::Result<()> {
-    eprintln!("[runner] unsupported on Windows: governor (cgroups)");
-    Err(anyhow::anyhow!(
-        "unsupported on Windows: governor (cgroups)"
-    ))
+pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
+    run_supervisor_inner_windows(state).await
+}
+
+/// Weight for one Windows tick: worst pressure level through the
+/// 9/5/1 ladder, honoring throttle overrides and the thermal latch
+/// like [`tick_weight`].
+#[cfg(windows)]
+pub fn tick_weight_windows(
+    state: &SupervisorState,
+    snapshot: &super::psi::PsiSnapshot,
+    now: Instant,
+) -> u32 {
+    use super::psi::PressureLevel;
+    fn worst(a: PressureLevel, b: PressureLevel) -> PressureLevel {
+        use PressureLevel::*;
+        match (a, b) {
+            (Critical, _) | (_, Critical) => Critical,
+            (Warning, _) | (_, Warning) => Warning,
+            _ => Normal,
+        }
+    }
+    let mut level = worst(snapshot.cpu_pressure(), snapshot.mem_pressure());
+    // Throttle overrides arrive cgroup-scale (100/25/1): map onto the
+    // ladder before composing so a remote throttle still bites.
+    if let Some(o) = state.throttle_weight(now) {
+        let override_level = if o <= 1 {
+            PressureLevel::Critical
+        } else if o < 100 {
+            PressureLevel::Warning
+        } else {
+            PressureLevel::Normal
+        };
+        level = worst(level, override_level);
+    }
+    if state.thermal_throttled {
+        level = PressureLevel::Critical;
+    }
+    super::windows::weight_for_level(level)
+}
+
+#[cfg(windows)]
+async fn run_supervisor_inner_windows(state: SharedState) -> anyhow::Result<()> {
+    let job = match super::windows::JobObject::system_default() {
+        Ok(job) => Some(job),
+        Err(e) => {
+            eprintln!("[runner] job object unavailable ({e}); running poll-only");
+            None
+        }
+    };
+    // Static memory backstop (90% of RAM), applied once: per-tick
+    // dynamics ride weights, not moving ceilings.
+    if let (Some(job), Ok((_, total, _))) = (job, super::windows::read_memory()) {
+        let cap = (total as f64 * 0.9) as u64;
+        if let Err(e) = job.set_memory_cap(cap) {
+            eprintln!("[runner] failed to apply memory cap: {e}");
+        }
+    }
+    let mut sensor = super::windows::WindowsSensor::default();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+        super::psi::POLL_INTERVAL_MS,
+    ));
+    eprintln!("runner: supervisor loop started (250ms Win32 cadence)");
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("runner: shutdown signal received");
+                if let Some(store) = state.read().await.cache_store() {
+                    if let Err(e) = store.flush() {
+                        eprintln!("runner: cache index flush failed: {e}");
+                    }
+                }
+                break;
+            }
+            _ = tick.tick() => {
+                let snapshot = match sensor.sample() {
+                    Ok(Some(snapshot)) => snapshot,
+                    Ok(None) => continue, // baseline seeding tick
+                    Err(e) => {
+                        eprintln!("[runner] sensor read failed: {e}");
+                        continue;
+                    }
+                };
+                let now = Instant::now();
+                let mut guard = state.write().await;
+                guard.prune_expired(now);
+                guard.last_snapshot = snapshot;
+                guard.poll_workstation_guards();
+                guard.poll_afk();
+                let weight = tick_weight_windows(&guard, &snapshot, now);
+                guard.last_weight = Some(weight);
+                let base = std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(1);
+                let slots = guard.clamp_slots(effective_slots(base, &snapshot));
+                guard.last_slots =
+                    apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging);
+                drop(guard);
+                if let Some(job) = job {
+                    if let Err(e) = job.set_cpu_weight(weight) {
+                        eprintln!("[runner] failed to apply cpu weight={weight}: {e}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -940,6 +1042,33 @@ mod tests {
         // ... but critical pressure still wins over a warning override.
         // (95 exceeds the critical band on every platform.)
         assert_eq!(tick_weight(&state, &snapshot_with(95.0, 1.0, 1.0), now), 1);
+    }
+
+    // Windows tick: worst level through the 9/5/1 ladder (%-scale
+    // snapshots), throttle override composing downward.
+    #[cfg(windows)]
+    #[test]
+    fn windows_tick_maps_levels_through_ladder() {
+        let state = SupervisorState::new();
+        let now = Instant::now();
+        assert_eq!(
+            tick_weight_windows(&state, &snapshot_with(10.0, 10.0, 0.0), now),
+            9
+        );
+        assert_eq!(
+            tick_weight_windows(&state, &snapshot_with(80.0, 10.0, 0.0), now),
+            5
+        );
+        assert_eq!(
+            tick_weight_windows(&state, &snapshot_with(10.0, 96.0, 0.0), now),
+            1
+        );
+        let mut throttled = SupervisorState::new();
+        throttled.set_throttle(25, Duration::from_secs(60), now);
+        assert_eq!(
+            tick_weight_windows(&throttled, &snapshot_with(10.0, 10.0, 0.0), now),
+            5
+        );
     }
 
     #[test]

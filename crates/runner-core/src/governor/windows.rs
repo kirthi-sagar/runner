@@ -29,14 +29,15 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{GetLastError, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
-    QueryInformationJobObject, SetInformationJobObject, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
-    JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, JOB_OBJECT_LIMIT_JOB_MEMORY,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectCpuRateControlInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetSystemTimes;
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
 
 /// One Windows Job Object, closed on drop. Handles are never leaked:
 /// every constructor funnels through [`JobObject::create`], and
@@ -168,6 +169,33 @@ impl JobObject {
         Ok(unsafe { info.Anonymous.Weight })
     }
 
+    /// Assign a process (by pid) to this job. Grandchildren inherit
+    /// membership automatically. Nesting under an outer job (CI
+    /// agents, services) is the default on Windows 8+; a genuine
+    /// refusal surfaces as an error and callers soft-fail.
+    pub fn assign(&self, pid: u32) -> io::Result<()> {
+        let process = open_process(pid)?;
+        // SAFETY: both handles are live (`OwnedHandle` + `&self`).
+        let ok = unsafe { AssignProcessToJobObject(self.raw(), process.as_raw_handle() as _) };
+        if ok == 0 {
+            return Err(last_error("AssignProcessToJobObject"));
+        }
+        Ok(())
+    }
+
+    /// True when `pid` is currently a member of this job
+    /// (round-trip verification for [`Self::assign`]).
+    pub fn contains(&self, pid: u32) -> io::Result<bool> {
+        let process = open_process(pid)?;
+        let mut member = 0i32;
+        // SAFETY: both handles live; `member` is a valid out-word.
+        let ok = unsafe { IsProcessInJob(process.as_raw_handle() as _, self.raw(), &mut member) };
+        if ok == 0 {
+            return Err(last_error("IsProcessInJob"));
+        }
+        Ok(member != 0)
+    }
+
     /// The daemon-wide job all worker trees join (mirrors
     /// [`super::cgroup::CgroupSlice::system_default`]). Created once
     /// with the kill-on-close baseline (no orphaned workers when the
@@ -295,6 +323,24 @@ fn create_system_job() -> io::Result<JobObject> {
         info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
     })?;
     Ok(job)
+}
+
+/// Open a process with exactly the rights assignment needs
+/// (`PROCESS_SET_QUOTA | PROCESS_TERMINATE`, per the API docs).
+fn open_process(pid: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: no handle to close on failure (null return); on
+    // success ownership moves into `OwnedHandle` exactly once.
+    let raw = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+    if raw.is_null() {
+        return Err(last_error("OpenProcess"));
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+/// Assign `pid` to the daemon job: the worker spawn path's
+/// one-liner for automatic containment.
+pub fn assign_to_system_job(pid: u32) -> io::Result<()> {
+    JobObject::system_default()?.assign(pid)
 }
 
 /// CPU weight for a pressure level (Normal → 9, Warning → 5,

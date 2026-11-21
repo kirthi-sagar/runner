@@ -330,6 +330,14 @@ pub async fn run_supervised(
     if let (Some(pid), Some(slice)) = (child.id(), slice) {
         attach_to_slice(slice, pid);
     }
+    // Automatic containment in the daemon job; a refusal (rare:
+    // nesting covers CI-agent jobs) logs and continues governed-direct.
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        if let Err(e) = runner_core::governor::windows::assign_to_system_job(pid) {
+            eprintln!("[runner] worker pid {pid} not governed: {e}");
+        }
+    }
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => Ok(WorkerOutcome {
             exit_code: status.code(),

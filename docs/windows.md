@@ -29,10 +29,11 @@ hypervisor. Three layers, mirroring the Linux governor:
   `GetSystemTimes` deltas across two samples. Readings map onto the
   existing `Normal`/`Warning`/`Critical` ladder and feed the shared
   `tick_weight` policy unchanged — only the numbers are Windows'.
-- **Actuator.** One Job Object per worker tree: processes are
-  assigned post-spawn (grandchildren inherit membership), memory
-  ceilings ride `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, and CPU
-  share rides weight-based rate control. Throttling model:
+- **Actuator.** A single daemon-wide job all worker trees join
+  (mirroring the Linux system slice): processes are assigned
+  post-spawn (grandchildren inherit membership), memory ceilings
+  ride `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, and CPU share rides
+  weight-based rate control. Throttling model:
   Normal → weight 9, Warning → weight 5, Critical → weight 1
   (trickle, never zero — the never-freeze invariant holds: weights
   only matter under contention and can never starve a job the way

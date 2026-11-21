@@ -182,6 +182,11 @@ async fn execute_process(
     eprintln!("governor disabled: Windows Tier-3 mode");
     let workspace = Workspace::create(&sanitize_job_id(&next_engine_job_id()))
         .map_err(|e| format!("workspace setup failed: {e}"))?;
+    // macOS Tier-2 is Seatbelt, applied in `sandbox_pre_exec`; the
+    // userns probe is Linux-only.
+    #[cfg(target_os = "macos")]
+    let sandboxed = true;
+    #[cfg(not(target_os = "macos"))]
     let sandboxed = probe_userns();
 
     let mut cmd = TokioCommand::new(&command[0]);
@@ -191,8 +196,9 @@ async fn execute_process(
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
     // QoS hook always installed (no-op off macOS); the sandbox setup
-    // rides along only when namespaces probed usable. Unsandboxed runs
-    // inherit the caller's cwd so repo-relative commands resolve.
+    // rides along when Tier-2 is available (userns on Linux, Seatbelt
+    // on macOS). The job cwd is the workspace either way (child-side
+    // chdir when sandboxed, parent-side otherwise).
     let spec = if sandboxed {
         Some(workspace.sandbox_spec()?)
     } else {

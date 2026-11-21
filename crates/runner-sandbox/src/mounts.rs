@@ -70,9 +70,11 @@ impl SandboxSpec {
 /// Child-side setup for `Command::pre_exec`: enter unprivileged namespaces,
 /// map our own UID/GID 1:1, mount tmpfs over the workspace, chdir into it.
 ///
-/// Returns `Err` (aborting the spawn) when any step fails. Off Linux this
-/// is a no-op (callers gate on [`probe_userns`], always false there), kept
-/// so `pre_exec` closures compile on every Unix.
+/// Returns `Err` (aborting the spawn) when any step fails. On macOS this
+/// applies the Seatbelt profile instead (soft-fail: a failed apply logs
+/// and continues unsandboxed). Elsewhere a no-op (callers gate on
+/// [`probe_userns`], always false there), kept so `pre_exec` closures
+/// compile on every Unix.
 pub fn sandbox_pre_exec(spec: &SandboxSpec) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -102,7 +104,32 @@ pub fn sandbox_pre_exec(spec: &SandboxSpec) -> io::Result<()> {
         std::env::set_current_dir(&spec.workspace)?;
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // Mirror the Linux cwd contract (the parent skips
+        // `current_dir` when a spec rides along).
+        std::env::set_current_dir(&spec.workspace)?;
+        // Seatbelt matches resolved paths; canonicalize so a
+        // `/tmp`-style workspace matches kernel-side checks.
+        let workspace =
+            std::fs::canonicalize(&spec.workspace).unwrap_or_else(|_| spec.workspace.clone());
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        if crate::seatbelt::is_sandboxed() {
+            eprintln!("[runner] seatbelt: already sandboxed, skipping nested profile");
+            return Ok(());
+        }
+        let profile = crate::seatbelt::build_profile(&workspace, home.as_deref());
+        match crate::seatbelt::apply_profile(&profile) {
+            Ok(()) => eprintln!("[runner] seatbelt: Tier-2 sandbox active"),
+            // Soft-fail (same posture as the Linux userns probe):
+            // `--strict` will harden this in a future milestone.
+            Err(e) => {
+                eprintln!("[runner] seatbelt: sandbox_init failed ({e}); continuing unsandboxed")
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = spec;
         Ok(())

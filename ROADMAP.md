@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.0.1 and prior)
+## Shipped (v2.1.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -30,16 +30,17 @@ services or heavyweight frameworks.
 - Seatbelt TMPDIR carve-out + doctor Tier-2 verdict fix (v1.9.1).
 - Native Windows Job Objects governor: Win32 sensing, weight ladder (v2.0.0).
 - Firecracker HTTP framing fix: header/Content-Length reads (v2.0.1).
+- Tier-1 in-guest dispatch: vsock suffix, musl agent, live success (v2.1.0).
 
-## Current: v2.0.1 (Firecracker Framing Fix)
+## Current: v2.1.0 (Tier-1 In-Guest Dispatch)
+
+- Host listens on `<uds>_<port>`; agent runs as guest `/init`.
+- Live harness executes in-guest and asserts exit 0 on real KVM.
+
+## Shipped in v2.0.1: Firecracker Framing Fix
 
 - `put_inner` frames responses; keep-alive no longer hangs Tier-1.
 - Live KVM harness verified green on real hardware.
-
-## Next: v2.1.0 (Tier-1 vsock In-Guest Dispatch Verification)
-
-- Verify the Firecracker UDS direction contract on live KVM.
-- Guest agent in-image; live harness asserts success end to end.
 
 ## Future: v2.2.0 (Windows Hardening)
 

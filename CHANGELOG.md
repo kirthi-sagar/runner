@@ -6,6 +6,15 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.1.0 — 2026-11-21
+
+- Tier-1 dispatch verified end to end on live KVM: host listens on
+  `<uds>_<port>` per the Firecracker vsock contract; musl-static
+  guest agent runs as guest `/init` with a busybox `/bin/echo`.
+- Live harness executes in-guest and asserts exit 0 (was fail-closed
+  only); Firecracker floor is v1.18.0 (v1.7.0 skips virtio-mmio on
+  modern kernels).
+
 ## v2.0.1 — 2026-11-21
 
 - Fix Firecracker API client hang: frame HTTP responses by headers

@@ -12,7 +12,12 @@ $dir = Join-Path $env:LOCALAPPDATA 'runner'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $exe = Join-Path $dir 'runner.exe'
 Invoke-WebRequest "https://github.com/$repo/releases/download/$tag/runner-windows-x86_64.exe" -OutFile $exe
-$want = (Invoke-WebRequest "https://github.com/$repo/releases/download/$tag/runner-windows-x86_64.exe.sha256").Content.Split()[0]
+# Fetch the sidecar to a file: `.Content` is a byte array (not a
+# string) when the response content-type isn't text, and `[byte]`
+# has no `.Split` (PowerShell 7 member enumeration fails loudly).
+$shaFile = Join-Path $dir 'runner.exe.sha256'
+Invoke-WebRequest "https://github.com/$repo/releases/download/$tag/runner-windows-x86_64.exe.sha256" -OutFile $shaFile
+$want = (Get-Content $shaFile -Raw).Split()[0]
 $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
 if ($got -ne $want.ToLower()) { throw "SHA-256 mismatch for runner.exe" }
 $path = [Environment]::GetEnvironmentVariable('PATH', 'User')

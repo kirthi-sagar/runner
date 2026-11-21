@@ -2,7 +2,7 @@
 //!
 //! Listens on [`SOCK_PATH`] (`/run/runner.sock`), falling back to
 //! `~/.runner/runner.sock` when unprivileged; on Windows it listens on
-//! [`PIPE_NAME`]. Unix sockets are created with `0600` owner-only
+//! `PIPE_NAME`. Unix sockets are created with `0600` owner-only
 //! permissions. Requests are newline-delimited JSON-RPC either way:
 //! `ping` (liveness), `status` (host telemetry), `peers`, `join`,
 //! `snapshot` (daemon state for `runner top`), and `poll_now` (wake the

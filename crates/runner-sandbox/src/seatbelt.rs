@@ -14,7 +14,7 @@
 //!   SANDBOX_NAMED-only note covers the canned `kSBXProfile*`
 //!   constants instead). If the process is already sandboxed the new
 //!   profile is ignored and `sandbox_init` returns an error —
-//!   hence the [`is_sandboxed`] guard before every apply.
+//!   hence the `is_sandboxed()` guard before every apply.
 //! * `sandbox_check` itself is *not* deprecated. The canonical
 //!   nesting probe is `sandbox_check(getpid(), NULL,
 //!   SANDBOX_FILTER_NONE)` which returns 1 when sandboxed

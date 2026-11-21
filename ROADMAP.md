@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.7.2 and prior)
+## Shipped (v1.8.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -24,8 +24,14 @@ services or heavyweight frameworks.
   fallback) + doctor NAT diagnostics.
 - Supply-chain gates, pruned tokio, IPv6 eBPF walk, docs truth (v1.7.1).
 - WSL2 supported path: preflights, smoke CI, doctor expectation (v1.7.2).
+- Native Windows Tier-3 MVP: cross-compiled exe, shims, install.ps1 (v1.8.0).
 
-## Current: v1.7.2 (WSL2 Supported Path)
+## Current: v1.8.0 (Native Windows Tier-3 MVP)
+
+- `cfg(windows)` shims with loud unsupported logging; MinGW cross job.
+- `install.ps1`, `docs/windows.md`, platform badge + support table.
+
+## Shipped in v1.7.2: WSL2 Supported Path
 
 - `docs/windows.md`, installer preflights, `wsl2-smoke` CI job.
 - `doctor` reports WSL2 identity + systemd readiness.

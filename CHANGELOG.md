@@ -6,6 +6,17 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.8.0 — 2026-11-20
+
+- Native Windows Tier-3 MVP (degraded-but-honest): the workspace
+  cross-compiles to `x86_64-pc-windows-gnu` via a MinGW CI job, and
+  releases ship `runner-windows-x86_64.exe` (+ sha256). Every
+  Linux-only subsystem carries a `cfg(windows)` stub that logs its
+  feature name and fails loudly — governor, Tier-2 sandbox, Tier-1
+  microVMs, IPC, `top` — while Tier-3 dispatch, mesh transport, and
+  STUN work unchanged. New `install.ps1` (no admin), `docs/windows.md`
+  native section, platform badge, and per-OS support table.
+
 ## v1.7.2 — 2026-11-20
 
 - WSL2 supported path: new `docs/windows.md` (systemd, NAT-vs-mirrored,

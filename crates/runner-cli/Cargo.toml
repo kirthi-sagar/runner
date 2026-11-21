@@ -23,3 +23,6 @@ runner-core.workspace = true
 runner-sandbox.workspace = true
 runner-providers.workspace = true
 runner-enterprise.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

@@ -2,16 +2,14 @@
 //! slots, in-flight jobs, and fleet summary. Rendering is pure (and
 //! unit-tested); only [`run`] touches the terminal.
 
-#[cfg(unix)]
 use std::io::Write;
 use std::path::Path;
-#[cfg(unix)]
 use std::time::Duration;
 
 use runner_core::governor::psi::PressureLevel;
 use runner_core::governor::psi::{cpu_level_with, CPU_CRIT, CPU_WARN};
 use runner_core::ipc::ipc_call;
-use runner_core::status::status_report;
+use runner_core::status::{status_report, StatusReport};
 
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
@@ -185,13 +183,92 @@ fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
     value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
-/// Gather one frame: live local PSI plus best-effort daemon snapshot.
+/// Local CPU/MEM/IO gauges: PSI averages on unix.
+#[cfg(not(windows))]
+fn local_gauges(report: &StatusReport) -> (f64, f64, f64) {
+    (
+        report.host.psi_pressure.cpu_some_avg10,
+        report.host.psi_pressure.memory_some_avg10,
+        report.host.psi_pressure.io_full_avg10,
+    )
+}
+
+/// Local gauges on Windows: no PSI exists, so CPU comes from the
+/// kernel/idle tick delta and memory from the OS load percentage
+/// (see `win_metrics`). No honest IO source exists without PDH/ETW,
+/// so IO reads 0 rather than a fabricated number.
+#[cfg(windows)]
+fn local_gauges(_report: &StatusReport) -> (f64, f64, f64) {
+    (
+        win_metrics::sample_cpu_pct().unwrap_or(0.0),
+        win_metrics::sample_mem_pct(),
+        0.0,
+    )
+}
+
+/// Windows-local gauges: system CPU via kernel/idle tick deltas,
+/// memory via the OS load percentage. Unprivileged kernel32 calls.
+#[cfg(windows)]
+mod win_metrics {
+    use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+
+    static PREV_TICKS: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+    fn filetime_to_u64(ft: &FILETIME) -> u64 {
+        (ft.dwLowDateTime as u64) | ((ft.dwHighDateTime as u64) << 32)
+    }
+
+    /// System CPU busy % since the previous call; `None` on the
+    /// first call (seeds the baseline) or when the query fails.
+    pub fn sample_cpu_pct() -> Option<f64> {
+        // SAFETY: FILETIMEs are plain out-structs.
+        let (mut idle, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) =
+            unsafe { std::mem::zeroed() };
+        // SAFETY: three valid out-pointers for the call duration.
+        if unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) } == 0 {
+            return None;
+        }
+        let idle = filetime_to_u64(&idle);
+        // NOTE: kernel time already includes idle on Windows.
+        let total = filetime_to_u64(&kernel) + filetime_to_u64(&user);
+        let mut prev = PREV_TICKS.lock().unwrap_or_else(|e| e.into_inner());
+        let pct = prev.map(|(p_idle, p_total)| {
+            let idle_d = idle.saturating_sub(p_idle);
+            let total_d = total.saturating_sub(p_total);
+            if total_d == 0 {
+                0.0
+            } else {
+                100.0 * (1.0 - idle_d as f64 / total_d as f64)
+            }
+        });
+        *prev = Some((idle, total));
+        pct.map(|p| p.clamp(0.0, 100.0))
+    }
+
+    /// System memory load % (always live, no delta needed).
+    pub fn sample_mem_pct() -> f64 {
+        // SAFETY: plain out-struct; dwLength set before the call.
+        let mut mem: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: valid struct pointer with dwLength set.
+        if unsafe { GlobalMemoryStatusEx(&mut mem) } == 0 {
+            return 0.0;
+        }
+        mem.dwMemoryLoad as f64
+    }
+}
+
+/// Gather one frame: live local gauges plus best-effort daemon snapshot.
 pub async fn fetch(sock_path: &Path) -> TopData {
     let report = status_report();
+    let (cpu_some, mem_some, io_full) = local_gauges(&report);
     let mut data = TopData {
-        cpu_some: report.host.psi_pressure.cpu_some_avg10,
-        mem_some: report.host.psi_pressure.memory_some_avg10,
-        io_full: report.host.psi_pressure.io_full_avg10,
+        cpu_some,
+        mem_some,
+        io_full,
         warn: CPU_WARN,
         crit: CPU_CRIT,
         weight: report.host.cgroup_weight,
@@ -325,6 +402,113 @@ impl Drop for RawGuard {
     }
 }
 
+/// Key-poll sink for the redraw loop: raw-mode stdin bytes on unix,
+/// console input records on Windows.
+trait QuitPoll {
+    fn quit_requested(&self) -> bool;
+}
+
+#[cfg(unix)]
+impl QuitPoll for RawGuard {
+    fn quit_requested(&self) -> bool {
+        self.quit_pressed()
+    }
+}
+
+/// Windows key poll: drains pending console input records, true on
+/// a `q`/`Q`/Ctrl-C key-down. `None` when stdin is not a console
+/// (piped use): signals remain the exit path there.
+#[cfg(windows)]
+struct KeyPoll {
+    stdin: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl KeyPoll {
+    fn enter() -> Option<Self> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
+        // SAFETY: GetStdHandle takes a standard-handle id.
+        let stdin = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if stdin.is_null() || stdin == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut mode = 0u32;
+        // SAFETY: live handle plus a valid out-word; fails when
+        // stdin is piped rather than a console.
+        if unsafe { GetConsoleMode(stdin, &mut mode) } == 0 {
+            return None;
+        }
+        Some(Self { stdin })
+    }
+
+    fn quit_pressed(&self) -> bool {
+        use windows_sys::Win32::System::Console::{
+            GetNumberOfConsoleInputEvents, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT,
+        };
+        let mut pending = 0u32;
+        // SAFETY: live console handle plus a valid out-word.
+        if unsafe { GetNumberOfConsoleInputEvents(self.stdin, &mut pending) } == 0 || pending == 0 {
+            return false;
+        }
+        for _ in 0..pending {
+            // SAFETY: INPUT_RECORD is a plain record; zeroed first,
+            // then filled by the read below.
+            let mut rec: INPUT_RECORD = unsafe { std::mem::zeroed() };
+            let mut read = 0u32;
+            // SAFETY: live console handle with a valid record plus a
+            // valid count out-word.
+            if unsafe { ReadConsoleInputW(self.stdin, &mut rec, 1, &mut read) } == 0 || read == 0 {
+                return false;
+            }
+            if rec.EventType as u32 != KEY_EVENT {
+                continue;
+            }
+            // SAFETY: the KeyEvent union arm is read only for records
+            // whose EventType says key event (checked above).
+            let down = unsafe { rec.Event.KeyEvent.bKeyDown } != 0;
+            if !down {
+                continue;
+            }
+            let ch = unsafe { rec.Event.KeyEvent.uChar.UnicodeChar };
+            if ch == b'q' as u16 || ch == b'Q' as u16 || ch == 0x03 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(windows)]
+impl QuitPoll for KeyPoll {
+    fn quit_requested(&self) -> bool {
+        self.quit_pressed()
+    }
+}
+
+/// Best-effort virtual-terminal processing so ANSI redraw works on
+/// legacy conhost too (Windows Terminal already enables it).
+#[cfg(windows)]
+fn enable_vt() {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+    // SAFETY: GetStdHandle takes a standard-handle id.
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if stdout.is_null() || stdout == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut mode = 0u32;
+    // SAFETY: live handle plus a valid out-word.
+    if unsafe { GetConsoleMode(stdout, &mut mode) } == 0 {
+        return;
+    }
+    // SAFETY: live console handle; OR-ing one documented flag.
+    let _ = unsafe { SetConsoleMode(stdout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) };
+}
+
 #[cfg(unix)]
 fn stdout_is_tty() -> bool {
     use std::os::unix::io::AsRawFd;
@@ -349,6 +533,16 @@ async fn shutdown_signal() {
     }
 }
 
+/// Ctrl-C on Windows (no SIGTERM there); on registration failure
+/// degrade to "no signal handling" like the unix path below.
+#[cfg(windows)]
+async fn shutdown_signal() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        eprintln!("runner: signal registration failed; signals ignored");
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Run the monitor: redraw every `interval_ms` until `q`/signal.
 /// `--once` prints a single frame (scripts/CI).
 #[cfg(unix)]
@@ -363,26 +557,46 @@ pub async fn run(sock_path: &Path, interval_ms: u64, once: bool) -> anyhow::Resu
     let interval = Duration::from_millis(interval_ms.clamp(100, 60_000));
     let mut stdout = std::io::stdout();
     write!(stdout, "\x1b[?25l\x1b[2J")?;
-    let result = top_loop(sock_path, interval, color).await;
+    // Single raw-mode owner: restores termios on drop (all exit paths).
+    // None on non-TTY stdin: signals remain the exit path there.
+    let result = top_loop(sock_path, interval, color, RawGuard::enter()).await;
     writeln!(stdout, "\x1b[?25h")?;
     stdout.flush()?;
     result
 }
 
-/// Windows has no `/proc` telemetry to monitor; `top` exits loudly.
+/// Windows monitor: same frames and loop as unix, with console
+/// input polling for `q` and Ctrl-C for signals.
 #[cfg(windows)]
-pub async fn run(_sock_path: &Path, _interval_ms: u64, _once: bool) -> anyhow::Result<()> {
-    eprintln!("[runner] unsupported on Windows: runner top (/proc)");
-    Err(anyhow::anyhow!(
-        "unsupported on Windows: runner top (/proc)"
-    ))
+pub async fn run(sock_path: &Path, interval_ms: u64, once: bool) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    let color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    enable_vt();
+    if once {
+        // Seed the CPU delta so the single frame carries a live
+        // reading over a 120ms window (memory needs no delta).
+        let _ = win_metrics::sample_cpu_pct();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let data = fetch(sock_path).await;
+        print!("{}", render(&data, color));
+        std::io::stdout().flush()?;
+        return Ok(());
+    }
+    let interval = Duration::from_millis(interval_ms.clamp(100, 60_000));
+    let mut stdout = std::io::stdout();
+    write!(stdout, "\x1b[?25l\x1b[2J")?;
+    let result = top_loop(sock_path, interval, color, KeyPoll::enter()).await;
+    writeln!(stdout, "\x1b[?25h")?;
+    stdout.flush()?;
+    result
 }
 
-#[cfg(unix)]
-async fn top_loop(sock_path: &Path, interval: Duration, color: bool) -> anyhow::Result<()> {
-    // Single raw-mode owner: restores termios on drop (all exit paths).
-    // None on non-TTY stdin: signals remain the exit path there.
-    let guard = RawGuard::enter();
+async fn top_loop(
+    sock_path: &Path,
+    interval: Duration,
+    color: bool,
+    guard: Option<impl QuitPoll>,
+) -> anyhow::Result<()> {
     loop {
         let data = fetch(sock_path).await;
         let mut stdout = std::io::stdout();
@@ -392,7 +606,7 @@ async fn top_loop(sock_path: &Path, interval: Duration, color: bool) -> anyhow::
             _ = tokio::time::sleep(interval) => {},
             _ = shutdown_signal() => break,
         }
-        if guard.as_ref().is_some_and(|g| g.quit_pressed()) {
+        if guard.as_ref().is_some_and(|g| g.quit_requested()) {
             break;
         }
     }
@@ -494,5 +708,20 @@ mod tests {
         let frame = render(&data, false);
         assert!(frame.contains("…and 2 more"));
         assert!(!frame.contains("job-11"));
+    }
+
+    // Windows `--once` renders a frame (offline daemon, live local
+    // gauges) without error; the samplers stay within 0-100.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_once_renders_with_live_gauges() {
+        let dir = runner_core::test_support::TempDir::new("top-once").unwrap();
+        let sock = dir.path().join("absent.sock");
+        run(&sock, 1000, true).await.expect("once renders");
+        assert!((0.0..=100.0).contains(&win_metrics::sample_mem_pct()));
+        let _ = win_metrics::sample_cpu_pct();
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let pct = win_metrics::sample_cpu_pct().expect("second sample live");
+        assert!((0.0..=100.0).contains(&pct), "cpu {pct}");
     }
 }

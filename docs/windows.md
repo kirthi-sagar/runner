@@ -14,10 +14,14 @@ Supported: Tier-3 dispatch (direct unprivileged subprocess), the
 WireGuard mesh transport (UDP + STUN work unchanged on Windows),
 and the Job Objects governor (v2.0.0 — see "Windows governor").
 
+`runner top` renders live frames: system CPU/memory gauges come
+from Win32 (`GetSystemTimes`, `GlobalMemoryStatusEx`), and daemon
+state flows over the named-pipe snapshot when a daemon runs.
+Daemon IPC runs over Windows named pipes (`\\.\pipe\runner-*`).
+
 Unsupported — every item logs loudly at the point of use, never
-silently: Tier-2 sandboxing (no Linux namespaces), Tier-1 microVMs
-(no Firecracker/KVM), daemon IPC (no Unix domain sockets), and
-`runner top` (no `/proc` telemetry).
+silently: Tier-2 sandboxing (no Linux namespaces) and Tier-1
+microVMs (no Firecracker/KVM).
 
 ## Windows governor (Job Objects, v2.0.0)
 
@@ -64,7 +68,6 @@ are normal on this tier, not defects.
 
 Known limitations:
 
-- `runner top` exits with an `unsupported on Windows` message.
 - `runner start` (daemon) refuses to start: without IPC sockets
   there is nothing useful to supervise. `runner exec` is the
   supported entry point.

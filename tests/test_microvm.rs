@@ -201,14 +201,14 @@ fn live_gate_requires_every_input() {
         Some(bin)
     )
     .is_some());
-    assert!(live_inputs_from(
-        true,
-        true,
-        Some(kernel),
-        Some(rootfs),
-        Some(std::path::PathBuf::from("sh"))
-    )
-    .is_some());
+    // PATH search for bare binary names: `sh` on Unix CI,
+    // `cmd.exe` (always on PATH via SystemRoot; the extension is
+    // required since resolution is a plain file probe) on Windows.
+    #[cfg(unix)]
+    let path_probe = std::path::PathBuf::from("sh");
+    #[cfg(windows)]
+    let path_probe = std::path::PathBuf::from("cmd.exe");
+    assert!(live_inputs_from(true, true, Some(kernel), Some(rootfs), Some(path_probe)).is_some());
 }
 
 /// Opt-in live boot: real Firecracker launch → Tier-1 dispatch →

@@ -146,17 +146,50 @@ fn check_cgroup() -> Check {
     }
 }
 
-fn check_userns() -> Check {
-    if runner_sandbox::mounts::probe_userns() {
+/// macOS Tier-2 facility probe result (pure input for the verdict).
+#[cfg(any(test, target_os = "macos"))]
+struct SeatbeltFacts {
+    available: bool,
+}
+
+/// Pure Tier-2 verdict for macOS. The check keeps the `"userns"` name
+/// for JSON stability; only the verdict text is platform-aware.
+#[cfg(any(test, target_os = "macos"))]
+fn seatbelt_verdict(facts: &SeatbeltFacts) -> Check {
+    if facts.available {
         Check::pass(
             "userns",
-            "unprivileged user+mount namespaces work (Tier-2)".to_string(),
+            "active (Seatbelt): sandbox will apply to job children".to_string(),
         )
     } else {
         Check::warn(
             "userns",
-            "user namespaces unavailable; jobs run governed-direct (Tier-2 degraded)".to_string(),
+            "Seatbelt unavailable: jobs run governed-direct (Tier-2 degraded)".to_string(),
         )
+    }
+}
+
+fn check_userns() -> Check {
+    #[cfg(target_os = "macos")]
+    {
+        seatbelt_verdict(&SeatbeltFacts {
+            available: runner_sandbox::seatbelt::probe_seatbelt(),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if runner_sandbox::mounts::probe_userns() {
+            Check::pass(
+                "userns",
+                "unprivileged user+mount namespaces work (Tier-2)".to_string(),
+            )
+        } else {
+            Check::warn(
+                "userns",
+                "user namespaces unavailable; jobs run governed-direct (Tier-2 degraded)"
+                    .to_string(),
+            )
+        }
     }
 }
 
@@ -1087,5 +1120,26 @@ mod tests {
         });
         assert!(matches!(env_only.status, Status::Pass));
         assert!(env_only.detail.contains("Debian"), "{}", env_only.detail);
+    }
+
+    #[test]
+    fn seatbelt_verdict_covers_available_and_unavailable() {
+        let active = seatbelt_verdict(&SeatbeltFacts { available: true });
+        assert_eq!(active.name, "userns");
+        assert!(matches!(active.status, Status::Pass));
+        assert!(
+            active.detail.contains("active (Seatbelt)"),
+            "{}",
+            active.detail
+        );
+
+        let degraded = seatbelt_verdict(&SeatbeltFacts { available: false });
+        assert_eq!(degraded.name, "userns");
+        assert!(matches!(degraded.status, Status::Warn));
+        assert!(
+            degraded.detail.contains("governed-direct"),
+            "{}",
+            degraded.detail
+        );
     }
 }

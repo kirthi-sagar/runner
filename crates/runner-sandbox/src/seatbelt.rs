@@ -171,6 +171,27 @@ pub fn apply_profile(profile: &str) -> Result<(), String> {
     Err(message)
 }
 
+/// Probe the Seatbelt facility end to end: apply a trivial
+/// permissive profile in a forked child and confirm via
+/// `sandbox_check`. True when a job child would sandbox
+/// successfully (mirrors `probe_userns`/`probe_kvm`).
+#[cfg(target_os = "macos")]
+pub fn probe_seatbelt() -> bool {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("/usr/bin/true");
+    // SAFETY: the closure only applies a profile and inspects.
+    unsafe {
+        cmd.pre_exec(|| {
+            apply_profile("(version 1)\n(allow default)\n").map_err(std::io::Error::other)?;
+            if !is_sandboxed() {
+                return Err(std::io::Error::other("profile applied but probe disagrees"));
+            }
+            Ok(())
+        });
+    }
+    cmd.status().map(|status| status.success()).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +260,13 @@ mod tests {
     #[test]
     fn nesting_detection_false_in_unsandboxed_test_process() {
         assert!(!is_sandboxed());
+    }
+
+    // The facility probe must succeed on a real Mac.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_probe_succeeds_on_macos_runner() {
+        assert!(probe_seatbelt());
     }
 
     // Live FFI through a real child: `sandbox_init` is irreversible

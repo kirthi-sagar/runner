@@ -112,7 +112,8 @@ impl TokenStore {
     }
 
     /// Write or update a provider token, creating parents as needed and
-    /// forcing `0600` permissions. Returns the store path.
+    /// forcing `0600` permissions (owner-only DACL on Windows).
+    /// Returns the store path.
     pub fn set_token(&self, slot: ProviderSlot, token: &str) -> std::io::Result<PathBuf> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -125,9 +126,7 @@ impl TokenStore {
         #[cfg(unix)]
         std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))?;
         #[cfg(windows)]
-        eprintln!(
-            "[runner] unsupported on Windows: POSIX file modes (token store saved with default ACLs)"
-        );
+        crate::winacl::restrict_to_owner(&self.path)?;
         Ok(self.path.clone())
     }
 
@@ -184,6 +183,12 @@ mod tests {
         {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+        // Windows proves the same privacy via DACL, not modes.
+        #[cfg(windows)]
+        {
+            use crate::winacl::{read_dacl_sids, DaclTarget};
+            assert_eq!(read_dacl_sids(DaclTarget::File(&path)).unwrap().len(), 2);
         }
         // Rotation replaces without duplicating.
         store.set_token(ProviderSlot::Github, "ghp_next").unwrap();

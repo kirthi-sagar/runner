@@ -514,13 +514,19 @@ impl IpcServer {
     /// first instance is created (and held) here with first-pipe-
     /// instance exclusivity: a taken name fails the bind (pipes
     /// leave no stale files, so taken always means a live daemon),
-    /// and holding it closes the dial-before-serve race.
+    /// and holding it closes the dial-before-serve race. The pipe
+    /// then gets an owner + SYSTEM DACL (the unix `0600`); a DACL
+    /// failure fails the bind rather than serving world-dialable.
     #[cfg(windows)]
     pub async fn bind(path: &Path, state: SharedState) -> io::Result<Self> {
         let pipe_name = pipe_name_for(path);
         let first = ServerOptions::new()
             .first_pipe_instance(true)
             .create(&pipe_name)?;
+        // Synchronous with creation (no await between): the default
+        // DACL window is microseconds at bind, and the pipe DACL
+        // then covers every instance the accept loop creates.
+        crate::winacl::restrict_pipe_dacl(&pipe_name)?;
         Ok(Self {
             path: path.to_path_buf(),
             pipe_name,

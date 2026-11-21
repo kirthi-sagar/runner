@@ -11,3 +11,5 @@ pub mod mesh;
 pub mod pidfile;
 pub mod status;
 pub mod test_support;
+#[cfg(windows)]
+pub(crate) mod winacl;

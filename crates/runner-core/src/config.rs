@@ -786,7 +786,8 @@ impl RunnerConfig {
         toml::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
     }
 
-    /// Persist to an explicit path with `0600` permissions.
+    /// Persist to an explicit path with `0600` permissions
+    /// (owner-only DACL on Windows).
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -797,9 +798,7 @@ impl RunnerConfig {
         #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         #[cfg(windows)]
-        eprintln!(
-            "[runner] unsupported on Windows: POSIX file modes (config saved with default ACLs)"
-        );
+        crate::winacl::restrict_to_owner(path)?;
         Ok(())
     }
 
@@ -831,6 +830,12 @@ mod tests {
         {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+        // Windows proves the same privacy via DACL, not modes.
+        #[cfg(windows)]
+        {
+            use crate::winacl::{read_dacl_sids, DaclTarget};
+            assert_eq!(read_dacl_sids(DaclTarget::File(&path)).unwrap().len(), 2);
         }
         // Re-saving over the file keeps working (the `init` merge path).
         config.coordinator.repo_name = Some("web".to_string());

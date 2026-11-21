@@ -442,6 +442,31 @@ pub(crate) async fn request_cloud_with(
             ),
         }));
     }
+    // Ledger gate: month-to-date spend is read from the shared spend
+    // file on every call (no cached totals anywhere), so both the
+    // daemon arm and the offline MCP fallback enforce the same cap
+    // and neither can provision off-ledger. Unreadable ledgers deny
+    // rather than spending blind.
+    match pool.month_spend() {
+        Ok(spend) if spend < cap_usd => {}
+        Ok(spend) => {
+            return Ok(serde_json::json!({
+                "approved": false,
+                "reason": format!(
+                    "monthly cloud spend ${spend:.2} has reached the ${cap_usd:.2} cap; \
+                     Super Admin must raise cloud.max_monthly_spend",
+                ),
+            }));
+        }
+        Err(e) => {
+            return Ok(serde_json::json!({
+                "approved": false,
+                "reason": format!(
+                    "cannot verify cloud spend against the ledger ({e}); refusing to provision blind"
+                ),
+            }));
+        }
+    }
     // Provision live within budget, one instance per call. The
     // caller repeats the call (bounded by max_instances) as the backlog
     // persists; each node self-terminates after 5 idle minutes.
@@ -883,6 +908,77 @@ mod tests {
 
     fn ctx() -> ToolContext {
         ToolContext::new(new_shared_state(), RunnerConfig::default())
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    // Month-to-date spend at the cap denies before any provisioning
+    // (no provider traffic: hermetic). The seed terminates in the
+    // future so it stays in-month with fixed cost whatever the wall
+    // clock says — no month-boundary flake.
+    #[tokio::test]
+    async fn cloud_spend_gate_denies_exhausted_ledger() {
+        use crate::mesh::cloud::digitalocean::DoClient;
+        use crate::mesh::cloud::ledger::{LedgerEntry, SpendLedger, RATE_DIGITALOCEAN_PER_HOUR};
+
+        let dir = crate::test_support::TempDir::new("spend-gate").unwrap();
+        let ledger = SpendLedger::new(dir.path().join("ledger.json"));
+        let now = now_secs();
+        ledger
+            .store(&[LedgerEntry {
+                node_id: "i-1".to_string(),
+                provider: "digitalocean".to_string(),
+                launched_at: now,
+                terminated_at: Some(now + 7200),
+            }])
+            .unwrap();
+        let pool =
+            CloudPool::from_clients(Some(DoClient::new("fake").unwrap()), None).with_ledger(ledger);
+        let out = request_cloud_with(
+            &pool,
+            RATE_DIGITALOCEAN_PER_HOUR,
+            &new_shared_state(),
+            "digitalocean",
+            1,
+            1.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["approved"], false);
+        assert!(
+            out["reason"].as_str().unwrap().contains("has reached the"),
+            "wrong denial arm: {out}"
+        );
+    }
+
+    // An unreadable ledger denies rather than spending blind (also
+    // provision-free: hermetic).
+    #[tokio::test]
+    async fn cloud_spend_gate_denies_unreadable_ledger() {
+        use crate::mesh::cloud::digitalocean::DoClient;
+        use crate::mesh::cloud::ledger::SpendLedger;
+
+        let dir = crate::test_support::TempDir::new("spend-gate-corrupt").unwrap();
+        let path = dir.path().join("ledger.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let pool = CloudPool::from_clients(Some(DoClient::new("fake").unwrap()), None)
+            .with_ledger(SpendLedger::new(path));
+        let out = request_cloud_with(&pool, 25.0, &new_shared_state(), "digitalocean", 1, 1.0)
+            .await
+            .unwrap();
+        assert_eq!(out["approved"], false);
+        assert!(
+            out["reason"]
+                .as_str()
+                .unwrap()
+                .contains("refusing to provision blind"),
+            "wrong denial arm: {out}"
+        );
     }
 
     #[tokio::test]

@@ -656,6 +656,23 @@ async fn cmd_listen(port: u16, secret: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Double-start verdict for a pidfile: refuse when the recorded PID
+/// is alive, reap when dead, boot when absent or unreadable (a torn
+/// write heals when this boot records its own PID).
+enum BootPidAction {
+    AlreadyRunning(u32),
+    ReapStale(u32),
+    Proceed,
+}
+
+fn check_double_start(pid_path: &std::path::Path) -> BootPidAction {
+    match read_pid(pid_path) {
+        Ok(pid) if process_alive(pid) => BootPidAction::AlreadyRunning(pid),
+        Ok(pid) => BootPidAction::ReapStale(pid),
+        Err(_) => BootPidAction::Proceed,
+    }
+}
+
 fn cmd_stop(force: bool) -> Result<()> {
     let pid_path = resolve_pid_path();
     let sock_path = resolve_sock_path();
@@ -1190,6 +1207,22 @@ async fn main() -> Result<()> {
             cmd_init(&config, org, repo, token)?;
         }
         Commands::Start { daemon, strict } => {
+            // Double-start prevention first: never hijack a live
+            // daemon's socket and pidfile.
+            match check_double_start(&resolve_pid_path()) {
+                BootPidAction::AlreadyRunning(pid) => {
+                    eprintln!(
+                        "runner start failed: daemon already running with PID {pid}; \
+                         refuse double-start"
+                    );
+                    std::process::exit(1);
+                }
+                BootPidAction::ReapStale(pid) => {
+                    eprintln!("runner: removing stale pidfile for dead PID {pid}");
+                    remove_pidfile(&resolve_pid_path());
+                }
+                BootPidAction::Proceed => {}
+            }
             let strict = runner_core::config::is_strict(strict, &config);
             // Fail-closed boot: a strict daemon refuses to supervise
             // workers it cannot sandbox.
@@ -1568,6 +1601,32 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    // Alive PID refuses boot; dead PID reaps; absent or torn files
+    // proceed (the write later in boot heals them).
+    #[test]
+    fn double_start_verdicts() {
+        let dir = runner_core::test_support::TempDir::new("boot-pid").unwrap();
+        let live = dir.path().join("live.pid");
+        std::fs::write(&live, std::process::id().to_string()).unwrap();
+        assert!(matches!(
+            check_double_start(&live),
+            BootPidAction::AlreadyRunning(_)
+        ));
+        let stale = dir.path().join("stale.pid");
+        std::fs::write(&stale, (u32::MAX - 100).to_string()).unwrap();
+        assert!(matches!(
+            check_double_start(&stale),
+            BootPidAction::ReapStale(_)
+        ));
+        assert!(matches!(
+            check_double_start(&dir.path().join("absent.pid")),
+            BootPidAction::Proceed
+        ));
+        let torn = dir.path().join("torn.pid");
+        std::fs::write(&torn, "not-a-pid").unwrap();
+        assert!(matches!(check_double_start(&torn), BootPidAction::Proceed));
+    }
 
     #[test]
     fn root_version_flags_print_runner_version() {

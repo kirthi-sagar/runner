@@ -135,8 +135,10 @@ async fn capture_caps_runaway_output_at_ten_mib() {
 async fn capture_keeps_small_output_intact() {
     #[cfg(unix)]
     let argv = cmd(&["sh", "-c", "echo out; echo err >&2"]);
+    // No space before `>&2`: cmd would echo it (`echo err >&2`
+    // writes "err \r\n").
     #[cfg(windows)]
-    let argv = cmd(&["cmd", "/c", "echo out& echo err >&2"]);
+    let argv = cmd(&["cmd", "/c", "echo out& echo err>&2"]);
     let out = execute_captured(&argv, &[], true, Duration::from_secs(30))
         .await
         .unwrap();

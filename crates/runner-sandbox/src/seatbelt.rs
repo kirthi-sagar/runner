@@ -144,3 +144,113 @@ pub fn apply_profile(profile: &str) -> Result<(), String> {
     unsafe { sandbox_free_error(errorbuf) };
     Err(message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_builder_embeds_workspace_and_home_rules() {
+        let ws = std::path::Path::new("/private/tmp/ws-1");
+        let home = std::path::Path::new("/Users/test");
+        let profile = build_profile(ws, Some(home));
+        assert!(!profile.is_empty());
+        assert!(profile.contains("(version 1)"));
+        assert!(profile.contains("(allow default)"));
+        assert!(profile.contains("/private/tmp/ws-1"));
+        for leaf in [".ssh", ".gnupg", ".config/runner", ".runner"] {
+            assert!(
+                profile.contains(&format!("/Users/test/{leaf}")),
+                "missing home rule for {leaf}:\n{profile}"
+            );
+        }
+        // Paths with quotes stay syntactically intact.
+        let quoted = build_profile(
+            std::path::Path::new("/tmp/we\"ird"),
+            Some(std::path::Path::new("/Users/q\"x")),
+        );
+        assert!(quoted.contains("/tmp/we\\\"ird"));
+        assert!(quoted.contains("/Users/q\\\"x/.ssh"));
+    }
+
+    #[test]
+    fn profile_builder_omits_home_rules_without_home() {
+        let profile = build_profile(std::path::Path::new("/private/tmp/ws-2"), None);
+        assert!(!profile.is_empty());
+        assert!(profile.contains("/private/tmp/ws-2"));
+        assert!(!profile.contains(".ssh"));
+    }
+
+    // The test runner itself is never sandboxed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nesting_detection_false_in_unsandboxed_test_process() {
+        assert!(!is_sandboxed());
+    }
+
+    // Live FFI through a real child: `sandbox_init` is irreversible
+    // per-process, so the apply runs in a forked child (never in the
+    // test process, which would pollute every other test here).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn permissive_profile_applies_in_child_process() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("/usr/bin/true");
+        // SAFETY: the closure only applies a profile and inspects.
+        unsafe {
+            cmd.pre_exec(|| {
+                apply_profile("(version 1)\n(allow default)\n").map_err(std::io::Error::other)?;
+                assert!(is_sandboxed(), "profile applied but probe disagrees");
+                Ok(())
+            });
+        }
+        assert!(cmd.status().expect("spawn /usr/bin/true").success());
+    }
+
+    // The REAL builder output must compile on the real kernel and
+    // actually enforce: writes land inside the workspace, writes
+    // outside and credential reads fail, plain reads pass.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_profile_compiles_and_enforces_via_sandbox_exec() {
+        let ws_dir = runner_core::test_support::TempDir::new("seatbelt-ws").unwrap();
+        let ws = std::fs::canonicalize(ws_dir.path()).unwrap();
+        let outside_dir = runner_core::test_support::TempDir::new("seatbelt-out").unwrap();
+        let outside = std::fs::canonicalize(outside_dir.path()).unwrap();
+        let home_dir = runner_core::test_support::TempDir::new("seatbelt-home").unwrap();
+        let home = std::fs::canonicalize(home_dir.path()).unwrap();
+        let ssh_dir = home.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        std::fs::write(ssh_dir.join("sentinel"), "secret").unwrap();
+        std::fs::write(outside.join("sentinel"), "public").unwrap();
+
+        let profile = build_profile(&ws, Some(&home));
+        let run = |argv: &[&str]| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(&profile)
+                .args(argv)
+                .output()
+                .expect("spawn sandbox-exec")
+        };
+
+        // Write inside the workspace: allowed.
+        let out = run(&["/usr/bin/touch", ws.join("ok").to_str().unwrap()]);
+        assert!(out.status.success(), "workspace write denied: {out:?}");
+        assert!(ws.join("ok").exists());
+
+        // Write outside the workspace: denied.
+        let out = run(&["/usr/bin/touch", outside.join("nope").to_str().unwrap()]);
+        assert!(!out.status.success(), "outside write allowed: {out:?}");
+        assert!(!outside.join("nope").exists());
+
+        // Credential read: denied.
+        let out = run(&["/bin/cat", ssh_dir.join("sentinel").to_str().unwrap()]);
+        assert!(!out.status.success(), "credential read allowed: {out:?}");
+
+        // Plain read outside the workspace: allowed (permissive base).
+        let out = run(&["/bin/cat", outside.join("sentinel").to_str().unwrap()]);
+        assert!(out.status.success(), "plain read denied: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "public");
+    }
+}

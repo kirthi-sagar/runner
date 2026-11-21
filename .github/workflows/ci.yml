@@ -67,6 +67,10 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test -p runner-core --lib governor::darwin
 
+      - name: Seatbelt tests (macOS live)
+        if: runner.os == 'macOS'
+        run: cargo test -p runner-sandbox --lib seatbelt
+
   wsl2-smoke:
     name: WSL2 smoke (windows-latest)
     runs-on: windows-latest

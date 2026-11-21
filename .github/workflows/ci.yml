@@ -53,6 +53,12 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo doc --workspace --no-deps
 
+      - name: Seatbelt probe (sandbox-exec availability)
+        if: runner.os == 'macOS'
+        run: |
+          command -v sandbox-exec
+          sandbox-exec -p '(version 1) (allow default)' /usr/bin/true
+
       - name: Build all targets (macOS link check)
         if: runner.os == 'macOS'
         run: cargo build --workspace --all-targets

@@ -55,24 +55,35 @@ const SANDBOX_PROFILE_STRING: u64 = 0;
 #[cfg(target_os = "macos")]
 const SANDBOX_FILTER_NONE: c_int = 0;
 
+/// System temporary directories: always writable under Tier-2
+/// (linker tempfiles, build caches, and tool scratch space live
+/// here; restricting them breaks real jobs).
+const SYSTEM_TMPDIRS: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
+
 /// Build the Tier-2 job profile as an in-memory string (never
 /// written to disk). Permissive base with targeted denies:
 ///
 /// * `~/.ssh`, `~/.gnupg`, `~/.config/runner`, `~/.runner`: no
 ///   read, no write (credentials and runner state stay private).
-/// * writes anywhere outside `workspace`: denied.
-/// * `workspace`: full read/write.
-/// * `/usr`, `/System`, `/Library`, `/private/tmp`: explicit read
-///   allows (documents the allow-default base).
+/// * writes anywhere outside `workspace` and the temp roots
+///   (`/private/tmp`, `/private/var/tmp`, `tmpdir`): denied.
+/// * `workspace` and the temp roots: full read/write.
+/// * `/usr`, `/System`, `/Library`, `/private/tmp`,
+///   `/private/var/tmp`: explicit read allows (documents the
+///   allow-default base).
 /// * network: untouched by any rule, so outbound stays open (CI jobs
 ///   fetch dependencies; egress filtering arrives in v1.10.0).
 ///
-/// `home` is a parameter (not read here) so the builder stays pure
-/// and deterministic; pass `None` when HOME is unavailable and the
-/// home-relative rules are omitted. Paths are Seatbelt-escaped
-/// (`"`/`\`); callers should canonicalize `workspace` first so
-/// `/tmp`-style symlinks match the kernel's resolved-path checks.
-pub fn build_profile(workspace: &std::path::Path, home: Option<&std::path::Path>) -> String {
+/// `home`/`tmpdir` are parameters (not read here) so the builder
+/// stays pure and deterministic; pass `None` when unavailable and
+/// those rules are omitted. Paths are Seatbelt-escaped (`"`/`\`);
+/// callers should canonicalize first so `/tmp`-style symlinks match
+/// the kernel's resolved-path checks.
+pub fn build_profile(
+    workspace: &std::path::Path,
+    home: Option<&std::path::Path>,
+    tmpdir: Option<&std::path::Path>,
+) -> String {
     fn esc(path: &std::path::Path) -> String {
         path.to_string_lossy()
             .replace('\\', "\\\\")
@@ -87,11 +98,26 @@ pub fn build_profile(workspace: &std::path::Path, home: Option<&std::path::Path>
             profile.push_str(&format!("(deny file-write* (subpath \"{dir}\"))\n"));
         }
     }
-    let ws = esc(workspace);
+    let mut writable = vec![esc(workspace)];
+    writable.extend(SYSTEM_TMPDIRS.iter().map(|dir| dir.to_string()));
+    if let Some(tmpdir) = tmpdir {
+        writable.push(esc(tmpdir));
+    }
+    let roots = writable
+        .iter()
+        .map(|root| format!("(subpath \"{root}\")"))
+        .collect::<Vec<_>>()
+        .join(" ");
     profile.push_str(&format!(
-        "(deny file-write* (require-not (subpath \"{ws}\")))\n"
+        "(deny file-write* (require-not (require-any {roots})))\n"
     ));
-    for dir in ["/usr", "/System", "/Library", "/private/tmp"] {
+    for dir in [
+        "/usr",
+        "/System",
+        "/Library",
+        "/private/tmp",
+        "/private/var/tmp",
+    ] {
         profile.push_str(&format!("(allow file-read* (subpath \"{dir}\"))\n"));
     }
     profile
@@ -163,11 +189,13 @@ mod tests {
     fn profile_builder_embeds_workspace_and_home_rules() {
         let ws = std::path::Path::new("/private/tmp/ws-1");
         let home = std::path::Path::new("/Users/test");
-        let profile = build_profile(ws, Some(home));
+        let tmp = std::path::Path::new("/var/folders/xx/T");
+        let profile = build_profile(ws, Some(home), Some(tmp));
         assert!(!profile.is_empty());
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(allow default)"));
         assert!(profile.contains(&esc(ws)), "missing workspace:\n{profile}");
+        assert!(profile.contains(&esc(tmp)), "missing tmpdir:\n{profile}");
         for leaf in [".ssh", ".gnupg", ".config/runner", ".runner"] {
             let expect = esc(&home.join(leaf));
             assert!(
@@ -175,10 +203,14 @@ mod tests {
                 "missing home rule for {leaf}:\n{profile}"
             );
         }
+        // System temp roots are always carved out.
+        for dir in ["/private/tmp", "/private/var/tmp"] {
+            assert!(profile.contains(dir), "missing {dir}:\n{profile}");
+        }
         // Paths with quotes stay syntactically intact.
         let qws = std::path::Path::new("/tmp/we\"ird");
         let qhome = std::path::Path::new("/Users/q\"x");
-        let quoted = build_profile(qws, Some(qhome));
+        let quoted = build_profile(qws, Some(qhome), None);
         assert!(quoted.contains(&esc(qws)));
         assert!(quoted.contains(&esc(&qhome.join(".ssh"))));
     }
@@ -186,10 +218,20 @@ mod tests {
     #[test]
     fn profile_builder_omits_home_rules_without_home() {
         let ws = std::path::Path::new("/private/tmp/ws-2");
-        let profile = build_profile(ws, None);
+        let profile = build_profile(ws, None, None);
         assert!(!profile.is_empty());
         assert!(profile.contains(&esc(ws)));
         assert!(!profile.contains(".ssh"));
+    }
+
+    #[test]
+    fn profile_builder_tmpdir_carve_out_is_optional() {
+        let ws = std::path::Path::new("/private/tmp/ws-3");
+        let tmp = std::path::Path::new("/var/folders/xx/T");
+        let with = build_profile(ws, None, Some(tmp));
+        assert!(with.contains(&esc(tmp)));
+        let without = build_profile(ws, None, None);
+        assert!(!without.contains("folders"));
     }
 
     // The test runner itself is never sandboxed.
@@ -219,8 +261,9 @@ mod tests {
     }
 
     // The REAL builder output must compile on the real kernel and
-    // actually enforce: writes land inside the workspace, writes
-    // outside and credential reads fail, plain reads pass.
+    // actually enforce: writes land inside the workspace and temp
+    // roots, writes elsewhere and credential reads fail, plain
+    // reads pass.
     #[cfg(target_os = "macos")]
     #[test]
     fn real_profile_compiles_and_enforces_via_sandbox_exec() {
@@ -230,12 +273,14 @@ mod tests {
         let outside = std::fs::canonicalize(outside_dir.path()).unwrap();
         let home_dir = runner_core::test_support::TempDir::new("seatbelt-home").unwrap();
         let home = std::fs::canonicalize(home_dir.path()).unwrap();
+        let tmp_dir = runner_core::test_support::TempDir::new("seatbelt-tmp").unwrap();
+        let tmp = std::fs::canonicalize(tmp_dir.path()).unwrap();
         let ssh_dir = home.join(".ssh");
         std::fs::create_dir_all(&ssh_dir).unwrap();
         std::fs::write(ssh_dir.join("sentinel"), "secret").unwrap();
         std::fs::write(outside.join("sentinel"), "public").unwrap();
 
-        let profile = build_profile(&ws, Some(&home));
+        let profile = build_profile(&ws, Some(&home), Some(&tmp));
         let run = |argv: &[&str]| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-p")
@@ -254,6 +299,11 @@ mod tests {
         let out = run(&["/usr/bin/touch", outside.join("nope").to_str().unwrap()]);
         assert!(!out.status.success(), "outside write allowed: {out:?}");
         assert!(!outside.join("nope").exists());
+
+        // Write to the temp carve-out (outside the workspace): allowed.
+        let out = run(&["/usr/bin/touch", tmp.join("ok").to_str().unwrap()]);
+        assert!(out.status.success(), "temp write denied: {out:?}");
+        assert!(tmp.join("ok").exists());
 
         // Credential read: denied.
         let out = run(&["/bin/cat", ssh_dir.join("sentinel").to_str().unwrap()]);

@@ -114,11 +114,17 @@ pub fn sandbox_pre_exec(spec: &SandboxSpec) -> io::Result<()> {
         let workspace =
             std::fs::canonicalize(&spec.workspace).unwrap_or_else(|_| spec.workspace.clone());
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        // Per-user temp (macOS: /var/folders/...) stays writable; an
+        // unset or unresolvable TMPDIR simply omits the carve-out.
+        let tmpdir = std::env::var_os("TMPDIR")
+            .map(std::path::PathBuf::from)
+            .and_then(|tmp| std::fs::canonicalize(&tmp).ok());
         if crate::seatbelt::is_sandboxed() {
             eprintln!("[runner] seatbelt: already sandboxed, skipping nested profile");
             return Ok(());
         }
-        let profile = crate::seatbelt::build_profile(&workspace, home.as_deref());
+        let profile =
+            crate::seatbelt::build_profile(&workspace, home.as_deref(), tmpdir.as_deref());
         match crate::seatbelt::apply_profile(&profile) {
             Ok(()) => eprintln!("[runner] seatbelt: Tier-2 sandbox active"),
             // Soft-fail (same posture as the Linux userns probe):

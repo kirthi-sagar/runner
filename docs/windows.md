@@ -63,16 +63,15 @@ irm https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.ps1 | iex
 Then restart the terminal and run `runner doctor`. Expected output
 marks the unsupported subsystems explicitly — `kernel` reports
 `feature unavailable on Windows`, `cgroupsv2` reports the governor
-`active (Job Objects)`, and daemon IPC shows absent. Those entries
-are normal on this tier, not defects.
+`active (Job Objects)`, and `daemon` confirms IPC over Windows
+named pipes (`\\.\pipe\runner-*`) while the daemon runs.
 
-Known limitations:
+Daemon: `runner start` runs the coordinator on Windows, serving
+IPC over the named pipe and supervising workers governed by Job
+Objects. `runner stop` ends it via the `%LOCALAPPDATA%` PID file
+and Win32 `TerminateProcess`.
 
-- `runner start` (daemon) refuses to start: without IPC sockets
-  there is nothing useful to supervise. `runner exec` is the
-  supported entry point.
-
-Future (v2.1+): WFP egress filtering and a native sandbox backend.
+Future (v2.3+): WFP egress filtering and a native sandbox backend.
 Every remaining stub logs its feature name so the work can be
 harvested by grep.
 

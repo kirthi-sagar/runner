@@ -144,7 +144,7 @@ pub const ANNOUNCE_INTERVAL_SECS: u64 = 60;
 /// join-announce loop when coordinator coordinates are configured. Runs
 /// even with zero forges: donor-only nodes still serve peers. Silent
 /// when unset; misconfiguration logs loudly and disables the transport.
-pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState) {
+pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState, strict: bool) {
     use runner_core::mesh::invite::{secret_from_hex, InviteAuthority};
     use runner_core::mesh::peer::ensure_node_keypair;
     use runner_core::mesh::roles::{CoordinatorRole, MeshRoles, PeerRole};
@@ -182,7 +182,8 @@ pub async fn spawn_peer_transport(config: &RunnerConfig, state: SharedState) {
     };
     let executor = Arc::new(WorkerExecutor::new(
         config.coordinator.worker_version.clone(),
-        runner_sandbox::mounts::probe_userns(),
+        runner_sandbox::mounts::can_sandbox(),
+        strict,
         Duration::from_secs(config.coordinator.job_timeout_mins.max(1) * 60),
         runner_core::governor::cgroup::CgroupSlice::system_default(),
         state.clone(),
@@ -383,6 +384,7 @@ async fn announce_loop(
 pub async fn spawn_coordinator(
     config: &RunnerConfig,
     state: runner_core::governor::supervisor::SharedState,
+    strict: bool,
 ) {
     let tokens = resolve_tokens(config);
     let forges = enabled_forges(config, &tokens);
@@ -402,15 +404,23 @@ pub async fn spawn_coordinator(
         eprintln!("runner: no CI providers enabled; governor-only mode");
         return;
     }
-    let sandboxed = runner_sandbox::mounts::probe_userns();
+    let sandboxed = runner_sandbox::mounts::can_sandbox();
     if !sandboxed {
-        eprintln!("runner: unprivileged userns blocked; dispatches run unsandboxed");
+        eprintln!("runner: Tier-2 sandbox unavailable; dispatches run unsandboxed");
     }
     // One kill ceiling for every forge (GitLab/Bitbucket configs carry
     // no per-forge timeout).
     let timeout = Duration::from_secs(config.coordinator.job_timeout_mins * 60);
     if forges.contains(&Forge::Github) {
-        spawn_github(config, &tokens, cloud.clone(), state.clone(), sandboxed).await;
+        spawn_github(
+            config,
+            &tokens,
+            cloud.clone(),
+            state.clone(),
+            sandboxed,
+            strict,
+        )
+        .await;
     }
     if forges.contains(&Forge::Gitlab) {
         // Defensive: `enabled_forges` guarantees the token, but a
@@ -467,6 +477,7 @@ async fn spawn_github(
     cloud: Option<CloudPool>,
     state: runner_core::governor::supervisor::SharedState,
     sandboxed: bool,
+    strict: bool,
 ) {
     let coord = &config.coordinator;
     let Some(token) = tokens.github.clone() else {
@@ -511,6 +522,7 @@ async fn spawn_github(
         runner_group_id: coord.runner_group_id,
         worker_version: coord.worker_version.clone(),
         sandboxed,
+        strict,
         timeout: std::time::Duration::from_secs(coord.job_timeout_mins * 60),
         cache_url,
         cache_token,

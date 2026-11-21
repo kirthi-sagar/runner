@@ -223,7 +223,7 @@ async fn spawn_coordinator_supervises_forges_without_github() {
     assert_eq!(enabled_forges(&config, &tokens), vec![Forge::Gitlab]);
 
     let state = new_shared_state();
-    spawn_coordinator(&config, state.clone()).await;
+    spawn_coordinator(&config, state.clone(), false).await;
     assert!(
         state.read().await.cloud_pool().is_some(),
         "pool must attach with a forge enabled"

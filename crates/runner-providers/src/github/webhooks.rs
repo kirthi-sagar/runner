@@ -233,6 +233,7 @@ pub struct DispatchContext {
     pub runner_group_id: u64,
     pub worker_version: String,
     pub sandboxed: bool,
+    pub strict: bool,
     pub timeout: Duration,
     /// LAN cache proxy base URL (None when the proxy failed to bind).
     pub cache_url: Option<String>,
@@ -253,6 +254,7 @@ pub(crate) struct WorkerRunConfig {
     pub job_tag: String,
     pub job_name: String,
     pub sandboxed: bool,
+    pub strict: bool,
     pub cache: Option<(String, String)>,
     pub timeout: Duration,
 }
@@ -279,11 +281,19 @@ pub(crate) async fn run_worker_with_jit(
     use runner_sandbox::mounts::Workspace;
     use runner_sandbox::worker::{ensure_cached, run_supervised, WorkerLaunch};
 
+    // Fail closed before any download or spawn: strict dispatches
+    // never run unsandboxed (mirrors execute_local_sandboxed).
+    if cfg.strict && !cfg.sandboxed {
+        return Err(
+            "sandbox unavailable or disabled: --strict refuses unsandboxed execution".to_string(),
+        );
+    }
     super::jit::decode_jit_config(&cfg.jit_blob)?;
     let work_dir = ensure_cached(&cfg.worker_version).await?;
     let workspace = Workspace::create(&format!("job-{}", cfg.job_tag))
         .map_err(|e| format!("workspace: {e}"))?;
     let mut launch = WorkerLaunch::new(work_dir, cfg.jit_blob.clone());
+    launch.strict = cfg.strict;
     if cfg.sandboxed {
         let spec = workspace.sandbox_spec()?;
         launch = launch.sandboxed(spec);
@@ -344,6 +354,7 @@ pub async fn dispatch_local(
             job_tag: job.id.to_string(),
             job_name: job.name.clone(),
             sandboxed: ctx.sandboxed,
+            strict: ctx.strict,
             cache,
             timeout: ctx.timeout,
         },
@@ -721,6 +732,29 @@ mod tests {
             launched_at: 0,
             name: String::new(),
         }
+    }
+
+    // Strict dispatch refuses before any download or spawn when the
+    // launch would run unsandboxed (mirrors the exec-tier refusal).
+    #[tokio::test]
+    async fn strict_worker_dispatch_refuses_unsandboxed() {
+        let cfg = WorkerRunConfig {
+            worker_version: "0.0.0-test".to_string(),
+            jit_blob: "invalid-blob".to_string(),
+            job_tag: "strict-test".to_string(),
+            job_name: "strict test".to_string(),
+            sandboxed: false,
+            strict: true,
+            cache: None,
+            timeout: Duration::from_secs(5),
+        };
+        let err = run_worker_with_jit(&cfg, None)
+            .await
+            .expect_err("strict + unsandboxed dispatch must fail closed");
+        assert!(
+            err.contains("--strict refuses unsandboxed execution"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

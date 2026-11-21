@@ -17,7 +17,7 @@ use super::{JobPayload, ProviderAdapter, ProviderJob};
 use runner_core::governor::cgroup::CgroupSlice;
 #[cfg(unix)]
 use runner_core::governor::psi::PsiPoller;
-use runner_sandbox::mounts::{probe_userns, sanitize_job_id, Workspace};
+use runner_sandbox::mounts::{can_sandbox, sanitize_job_id, Workspace};
 
 /// Refuse commands carrying a literal blocked egress IP in any argument.
 /// (Full packet-level enforcement is the nftables ruleset in
@@ -71,20 +71,6 @@ async fn govern_slice_while_running(slice: CgroupSlice) {
 async fn govern_slice_while_running(_slice: CgroupSlice) {
     eprintln!("governor disabled: Windows Tier-3 mode");
     std::future::pending::<()>().await;
-}
-
-/// Tier-2 availability for this host: the Seatbelt facility on
-/// macOS, the unprivileged userns probe elsewhere (always false off
-/// Linux — Windows has no Tier-2).
-fn can_sandbox() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        runner_sandbox::seatbelt::probe_seatbelt()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        probe_userns()
-    }
 }
 
 /// Execute a command under zero-freeze governance, returning its exit code.
@@ -182,7 +168,7 @@ pub async fn execute_captured(
 
     let workspace =
         Workspace::create(&sanitize_job_id(&next_job_id())).context("workspace setup failed")?;
-    let sandboxed = !no_sandbox && probe_userns();
+    let sandboxed = !no_sandbox && can_sandbox();
 
     let mut cmd = TokioCommand::new(&command[0]);
     cmd.args(&command[1..])

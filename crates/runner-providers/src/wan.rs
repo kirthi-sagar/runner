@@ -59,6 +59,7 @@ pub async fn dispatch_to_peer(
 pub struct WorkerExecutor {
     worker_version: String,
     sandboxed: bool,
+    strict: bool,
     timeout_cap: Duration,
     slice: CgroupSlice,
     state: SharedState,
@@ -68,6 +69,7 @@ impl WorkerExecutor {
     pub fn new(
         worker_version: String,
         sandboxed: bool,
+        strict: bool,
         timeout_cap: Duration,
         slice: CgroupSlice,
         state: SharedState,
@@ -75,6 +77,7 @@ impl WorkerExecutor {
         Self {
             worker_version,
             sandboxed,
+            strict,
             timeout_cap,
             slice,
             state,
@@ -111,6 +114,7 @@ impl PeerExecutor for WorkerExecutor {
                 job_tag: format!("peer-{}", offer.job_id),
                 job_name: offer.name.clone(),
                 sandboxed: self.sandboxed,
+                strict: self.strict,
                 cache,
                 timeout,
             };

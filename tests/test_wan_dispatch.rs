@@ -551,6 +551,7 @@ async fn loopback_coordinator_loop_dispatches_to_peer() {
         runner_group_id: 1,
         worker_version: "2.338.2".to_string(),
         sandboxed: false,
+        strict: false,
         timeout: Duration::from_secs(60),
         cache_url: None,
         cache_token: None,

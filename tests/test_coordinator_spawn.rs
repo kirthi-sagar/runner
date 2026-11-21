@@ -30,7 +30,7 @@ async fn spawn_with_cloud_cap_attaches_pool_without_panic() {
     let state = new_shared_state();
 
     // Would panic (blocking_write inside the runtime) before the fix.
-    spawn_coordinator(&config, state.clone()).await;
+    spawn_coordinator(&config, state.clone(), false).await;
 
     let guard = state.read().await;
     assert!(

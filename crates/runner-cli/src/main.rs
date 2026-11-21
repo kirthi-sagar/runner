@@ -1142,7 +1142,12 @@ fn cmd_hook_uninstall() -> Result<()> {
 /// `runner exec --driver microvm`: route through the Tier-1 engine.
 /// Kernel/rootfs come from the sandbox config; exits nonzero with a clean
 /// message when KVM, images, or the Firecracker binary are unavailable.
-async fn cmd_exec_microvm(config: &RunnerConfig, command: &[String], timeout: std::time::Duration) {
+async fn cmd_exec_microvm(
+    config: &RunnerConfig,
+    command: &[String],
+    timeout: std::time::Duration,
+    strict: bool,
+) {
     use runner_sandbox::driver::{SandboxDriver, SandboxEngine};
     use runner_sandbox::microvm::MicroVmConfig;
 
@@ -1162,7 +1167,8 @@ async fn cmd_exec_microvm(config: &RunnerConfig, command: &[String], timeout: st
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("firecracker"));
     let engine = SandboxEngine::new(SandboxDriver::MicroVm)
-        .with_microvm(MicroVmConfig::new(socket, kernel, rootfs, vsock), bin);
+        .with_microvm(MicroVmConfig::new(socket, kernel, rootfs, vsock), bin)
+        .with_strict(strict);
     match engine.execute(command, timeout).await {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -1313,8 +1319,9 @@ async fn main() -> Result<()> {
                     eprintln!("runner: failed to save mesh identity ({e}); WAN federation off");
                 }
             }
-            runner_cli::coordinator::spawn_peer_transport(&mesh_config, state.clone()).await;
-            spawn_coordinator(&config, state.clone()).await;
+            runner_cli::coordinator::spawn_peer_transport(&mesh_config, state.clone(), strict)
+                .await;
+            spawn_coordinator(&config, state.clone(), strict).await;
             spawn_embedded_listener(&config, state.clone()).await;
             run_supervisor(state).await?;
             remove_pidfile(&pid_path);
@@ -1538,7 +1545,7 @@ async fn main() -> Result<()> {
                 }
             };
             if tier == runner_sandbox::driver::SandboxDriver::MicroVm {
-                cmd_exec_microvm(&config, &command, timeout).await;
+                cmd_exec_microvm(&config, &command, timeout, strict).await;
                 return Ok(());
             }
             match runner_providers::providers::local::execute_local_sandboxed(

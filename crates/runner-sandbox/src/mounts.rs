@@ -187,6 +187,22 @@ pub fn probe_userns() -> bool {
     false
 }
 
+/// Tier-2 availability for this host: the Seatbelt facility on
+/// macOS, the unprivileged userns probe elsewhere (always false off
+/// Linux — Windows has no Tier-2). The single probe every dispatch
+/// path consults; never call `probe_userns` directly for sandbox
+/// decisions.
+pub fn can_sandbox() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::seatbelt::probe_seatbelt()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        probe_userns()
+    }
+}
+
 /// Overwrite a file's bytes with OS randomness (best-effort per file).
 fn scrub_file(path: &Path) -> io::Result<()> {
     use rand::RngCore;

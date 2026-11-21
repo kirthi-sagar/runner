@@ -55,6 +55,48 @@ const SANDBOX_PROFILE_STRING: u64 = 0;
 #[cfg(target_os = "macos")]
 const SANDBOX_FILTER_NONE: c_int = 0;
 
+/// Build the Tier-2 job profile as an in-memory string (never
+/// written to disk). Permissive base with targeted denies:
+///
+/// * `~/.ssh`, `~/.gnupg`, `~/.config/runner`, `~/.runner`: no
+///   read, no write (credentials and runner state stay private).
+/// * writes anywhere outside `workspace`: denied.
+/// * `workspace`: full read/write.
+/// * `/usr`, `/System`, `/Library`, `/private/tmp`: explicit read
+///   allows (documents the allow-default base).
+/// * network: untouched by any rule, so outbound stays open (CI jobs
+///   fetch dependencies; egress filtering arrives in v1.10.0).
+///
+/// `home` is a parameter (not read here) so the builder stays pure
+/// and deterministic; pass `None` when HOME is unavailable and the
+/// home-relative rules are omitted. Paths are Seatbelt-escaped
+/// (`"`/`\`); callers should canonicalize `workspace` first so
+/// `/tmp`-style symlinks match the kernel's resolved-path checks.
+pub fn build_profile(workspace: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    fn esc(path: &std::path::Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
+    let mut profile = String::from("(version 1)\n(allow default)\n");
+    if let Some(home) = home {
+        for leaf in [".ssh", ".gnupg", ".config/runner", ".runner"] {
+            let dir = esc(&home.join(leaf));
+            profile.push_str(&format!("(deny file-read* (subpath \"{dir}\"))\n"));
+            profile.push_str(&format!("(deny file-write* (subpath \"{dir}\"))\n"));
+        }
+    }
+    let ws = esc(workspace);
+    profile.push_str(&format!(
+        "(deny file-write* (require-not (subpath \"{ws}\")))\n"
+    ));
+    for dir in ["/usr", "/System", "/Library", "/private/tmp"] {
+        profile.push_str(&format!("(allow file-read* (subpath \"{dir}\"))\n"));
+    }
+    profile
+}
+
 /// True when the current process is already inside a Seatbelt sandbox.
 /// Never fails; a NULL operation probe only inspects, never confines.
 #[cfg(target_os = "macos")]

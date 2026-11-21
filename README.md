@@ -26,10 +26,12 @@
 | WireGuard transport | ✅ | ✅ | ✅ |
 | STUN NAT traversal | ✅ | ✅ | ✅ |
 
-Windows runs Tier-3 dispatch natively (`runner.exe`); every
-unsupported subsystem logs `unsupported on Windows` at the point of
-use — see [`docs/windows.md`](docs/windows.md). Full Linux
-capabilities (governor, sandbox) are available on Windows via WSL2.
+Windows runs Tier-3 dispatch natively (`runner.exe`) and features a
+native zero-freeze governor backed by Win32 Job Objects. Subsystems
+without native Windows equivalents (Linux namespaces, Firecracker)
+log `unsupported on Windows` at the point of use — see
+[`docs/windows.md`](docs/windows.md). Linux namespace sandboxing is
+available on Windows via WSL2.
 
 ## 1. Executive Summary
 

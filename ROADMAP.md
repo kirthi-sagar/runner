@@ -36,6 +36,15 @@ services or heavyweight frameworks.
 - `put_inner` frames responses; keep-alive no longer hangs Tier-1.
 - Live KVM harness verified green on real hardware.
 
+## Next: v2.1.0 (Tier-1 vsock In-Guest Dispatch Verification)
+
+- Verify the Firecracker UDS direction contract on live KVM.
+- Guest agent in-image; live harness asserts success end to end.
+
+## Future: v2.2.0 (Windows Hardening)
+
+- Win32 multi-core topology, named-pipe IPC, top telemetry.
+
 ## Shipped in v2.0.0: Windows Job Objects Governor
 
 - `governor::windows`: sensor, RAII job manager, 9/5/1 weights.
@@ -105,13 +114,6 @@ it is fully provable on hosted runners.
 
 - Coordinator dispatches to `active` peers over Noise-encrypted UDP.
 - Join-announce onboarding, donor caps, leases, loopback gates.
-
-## Next: v1.4.1 (targeted patch, unscheduled)
-
-- Verify the Firecracker UDS direction contract (`<uds>_<port>` listen
-  + `CONNECT` handshake) against a live binary; rework the Tier-1
-  dispatcher path and tighten the live harness assertion accordingly.
-- Blocked on a live Firecracker environment; not started.
 
 ## Shipped in v1.3.1: Zero-Flake Hardening & Test Harness
 

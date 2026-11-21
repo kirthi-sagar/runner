@@ -29,8 +29,11 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{GetLastError, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
-    CreateJobObjectW, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    CreateJobObjectW, JobObjectCpuRateControlInformation, JobObjectExtendedLimitInformation,
+    QueryInformationJobObject, SetInformationJobObject, JOBOBJECT_CPU_RATE_CONTROL_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_CPU_RATE_CONTROL_ENABLE,
+    JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetSystemTimes;
@@ -85,6 +88,97 @@ impl JobObject {
             return Err(last_error("SetInformationJobObject"));
         }
         Ok(())
+    }
+
+    /// Read-modify-write helper: preserves flags set by other calls
+    /// (e.g. the baseline kill-on-close) instead of clobbering them.
+    fn modify_extended_limits(
+        &self,
+        f: impl FnOnce(&mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION),
+    ) -> io::Result<()> {
+        let mut info = self.query_extended_limits()?;
+        f(&mut info);
+        self.set_extended_limits(&info)
+    }
+
+    /// Cap the whole job tree at `bytes` (must be positive). Fails
+    /// closed on nonsense input rather than bricking the job.
+    pub fn set_memory_cap(&self, bytes: u64) -> io::Result<()> {
+        if bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "memory cap must be positive",
+            ));
+        }
+        self.modify_extended_limits(|info| {
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.JobMemoryLimit = bytes as usize;
+        })
+    }
+
+    /// Set the CPU weight (1-9, 9 = largest share). Out-of-range
+    /// values fail fast like [`super::cgroup::CgroupSlice::set_weight`].
+    pub fn set_cpu_weight(&self, weight: u32) -> io::Result<()> {
+        if !(1..=9).contains(&weight) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cpu weight {weight} outside [1,9]"),
+            ));
+        }
+        let mut info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        info.ControlFlags =
+            JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED;
+        // Writing a union field is safe (only reads are `unsafe`);
+        // `Weight` is the live arm under WEIGHT_BASED control.
+        info.Anonymous.Weight = weight;
+        // SAFETY: `info` matches the info class exactly.
+        let ok = unsafe {
+            SetInformationJobObject(
+                self.raw(),
+                JobObjectCpuRateControlInformation,
+                &info as *const _ as _,
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as _,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error("SetInformationJobObject(cpu rate)"));
+        }
+        Ok(())
+    }
+
+    /// Read back the current CPU weight (round-trip verification).
+    pub fn query_cpu_weight(&self) -> io::Result<u32> {
+        let mut info: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut returned = 0u32;
+        // SAFETY: valid out-struct of exactly the queried class size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.raw(),
+                JobObjectCpuRateControlInformation,
+                &mut info as *mut _ as _,
+                std::mem::size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as _,
+                &mut returned,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error("QueryInformationJobObject(cpu rate)"));
+        }
+        // SAFETY: the job was weight-managed, so `Weight` is the live
+        // union arm.
+        Ok(unsafe { info.Anonymous.Weight })
+    }
+
+    /// The daemon-wide job all worker trees join (mirrors
+    /// [`super::cgroup::CgroupSlice::system_default`]). Created once
+    /// with the kill-on-close baseline (no orphaned workers when the
+    /// runner exits); the first outcome is cached (`OnceLock` has no
+    /// stable fallible-retry, and creation effectively never fails —
+    /// use [`probe_jobs`] for facility checks).
+    pub fn system_default() -> io::Result<&'static JobObject> {
+        static JOB: std::sync::OnceLock<Result<JobObject, String>> = std::sync::OnceLock::new();
+        JOB.get_or_init(|| create_system_job().map_err(|e| e.to_string()))
+            .as_ref()
+            .map_err(|e| io::Error::other(e.clone()))
     }
 
     /// Read back the current extended limits (round-trip verification).
@@ -195,6 +289,25 @@ impl WindowsSensor {
     }
 }
 
+fn create_system_job() -> io::Result<JobObject> {
+    let job = JobObject::create()?;
+    job.modify_extended_limits(|info| {
+        info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    })?;
+    Ok(job)
+}
+
+/// CPU weight for a pressure level (Normal → 9, Warning → 5,
+/// Critical → 1): the Windows analog of the Linux 100/25/1 ladder.
+/// Weights never starve, so the never-freeze invariant holds.
+pub fn weight_for_level(level: super::psi::PressureLevel) -> u32 {
+    match level {
+        super::psi::PressureLevel::Normal => 9,
+        super::psi::PressureLevel::Warning => 5,
+        super::psi::PressureLevel::Critical => 1,
+    }
+}
+
 /// Probe the Job Objects facility end to end: create a job, apply
 /// empty extended limits, and read them back. True when a governed
 /// worker tree would work on this host (mirrors `probe_userns`).
@@ -251,6 +364,52 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let b = read_system_times().expect("times re-read");
         assert!(b.0 >= a.0 && b.1 >= a.1 && b.2 >= a.2);
+    }
+
+    #[test]
+    fn weight_ladder_maps_all_levels() {
+        use super::super::psi::PressureLevel;
+        assert_eq!(super::weight_for_level(PressureLevel::Normal), 9);
+        assert_eq!(super::weight_for_level(PressureLevel::Warning), 5);
+        assert_eq!(super::weight_for_level(PressureLevel::Critical), 1);
+    }
+
+    #[test]
+    fn memory_cap_round_trips_and_rejects_zero() {
+        let job = JobObject::create().expect("create job");
+        assert!(job.set_memory_cap(0).is_err());
+        job.set_memory_cap(512 * 1024 * 1024).expect("set cap");
+        let back = job.query_extended_limits().expect("query limits");
+        assert_eq!(back.JobMemoryLimit as u64, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cpu_weight_round_trips_and_rejects_out_of_range() {
+        let job = JobObject::create().expect("create job");
+        assert!(job.set_cpu_weight(0).is_err());
+        assert!(job.set_cpu_weight(10).is_err());
+        job.set_cpu_weight(5).expect("set weight");
+        assert_eq!(job.query_cpu_weight().expect("query weight"), 5);
+        job.set_cpu_weight(1).expect("set weight");
+        assert_eq!(job.query_cpu_weight().expect("query weight"), 1);
+    }
+
+    #[test]
+    fn system_default_is_singleton() {
+        let a = JobObject::system_default().expect("system job") as *const _;
+        let b = JobObject::system_default().expect("system job") as *const _;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn create_drop_cycle_does_not_exhaust_handles() {
+        // RAII-by-construction (single `OwnedHandle` owner, no manual
+        // close): 256 create/drop cycles must all succeed. An exact
+        // handle-count delta would be racy in a shared test process,
+        // so exhaustion is the signal instead.
+        for _ in 0..256 {
+            JobObject::create().expect("create job");
+        }
     }
 
     #[test]

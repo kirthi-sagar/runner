@@ -4,9 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use runner_telemetry::{LogEvent, LogLevel};
+use runner_telemetry::LogEvent;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub use runner_telemetry::LogLevel;
 
 /// One chained audit entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,16 +120,31 @@ impl AuditLog {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Best-effort open of the default trail: `None` when no path
+    /// resolves or the file cannot be opened (audit never blocks
+    /// boot; `doctor` surfaces a missing trail instead).
+    pub fn open_default() -> Option<Self> {
+        Self::open(&default_audit_path()?).ok()
+    }
 }
 
-/// Default audit trail (`~/.config/runner/audit.jsonl`).
+/// Default audit trail (`~/.config/runner/audit.jsonl` on unix,
+/// `%APPDATA%\runner\audit.jsonl` on Windows).
 pub fn default_audit_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("runner")
-            .join("audit.jsonl")
-    })
+    #[cfg(unix)]
+    {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join(".config")
+                .join("runner")
+                .join("audit.jsonl")
+        })
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("runner").join("audit.jsonl"))
+    }
 }
 
 /// Structured outcome of [`verify_file`].
@@ -279,5 +296,41 @@ mod tests {
         let reloaded = AuditLog::open(&path).unwrap();
         assert_eq!(reloaded.len(), 2);
         assert!(reloaded.verify());
+    }
+
+    // Default trail follows platform convention (mirrors
+    // `RunnerConfig::default_path`); an unset home resolves to None
+    // instead of panicking.
+    #[test]
+    fn default_audit_path_follows_platform_convention() {
+        #[cfg(unix)]
+        {
+            match std::env::var_os("HOME") {
+                Some(home) => assert_eq!(
+                    default_audit_path(),
+                    Some(
+                        std::path::PathBuf::from(home)
+                            .join(".config")
+                            .join("runner")
+                            .join("audit.jsonl")
+                    )
+                ),
+                None => assert_eq!(default_audit_path(), None),
+            }
+        }
+        #[cfg(windows)]
+        {
+            match std::env::var_os("APPDATA") {
+                Some(dir) => assert_eq!(
+                    default_audit_path(),
+                    Some(
+                        std::path::PathBuf::from(dir)
+                            .join("runner")
+                            .join("audit.jsonl")
+                    )
+                ),
+                None => assert_eq!(default_audit_path(), None),
+            }
+        }
     }
 }

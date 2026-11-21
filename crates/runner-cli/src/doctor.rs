@@ -354,7 +354,10 @@ fn check_audit() -> Check {
             ),
             VerifyOutcome::Tampered { reason, .. } => Check::fail("audit", reason),
         },
-        None => Check::warn("audit", "no HOME; cannot locate audit trail".to_string()),
+        None => Check::warn(
+            "audit",
+            "no home directory; cannot locate audit trail".to_string(),
+        ),
     }
 }
 

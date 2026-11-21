@@ -705,6 +705,13 @@ fn cmd_stop(force: bool) -> Result<()> {
     remove_pidfile(&pid_path);
     let _ = std::fs::remove_file(&sock_path);
     eprintln!("daemon stopped; socket and pid file cleaned");
+    if let Some(mut log) = runner_enterprise::audit::AuditLog::open_default() {
+        log.append(
+            runner_enterprise::audit::LogLevel::Info,
+            "daemon",
+            "daemon stopped",
+        );
+    }
     Ok(())
 }
 
@@ -1237,6 +1244,13 @@ async fn main() -> Result<()> {
                     "runner start failed: sandbox unavailable: \
                      --strict refuses to supervise unsandboxed workers"
                 );
+                if let Some(mut log) = runner_enterprise::audit::AuditLog::open_default() {
+                    log.append(
+                        runner_enterprise::audit::LogLevel::Warn,
+                        "sandbox",
+                        "strict mode refused boot: host unconfined",
+                    );
+                }
                 std::process::exit(1);
             }
             if daemon {
@@ -1329,6 +1343,13 @@ async fn main() -> Result<()> {
             let pid_path = resolve_pid_path();
             if let Err(e) = write_current_pid(&pid_path) {
                 eprintln!("runner: pid file unavailable ({e})");
+            }
+            if let Some(mut log) = runner_enterprise::audit::AuditLog::open_default() {
+                log.append(
+                    runner_enterprise::audit::LogLevel::Info,
+                    "daemon",
+                    &format!("daemon started (pid: {})", std::process::id()),
+                );
             }
             // WAN federation identity (persisted once when generated;
             // untouched otherwise so daemon boots never rewrite config).

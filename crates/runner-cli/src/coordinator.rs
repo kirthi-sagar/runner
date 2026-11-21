@@ -408,6 +408,13 @@ pub async fn spawn_coordinator(
     if !sandboxed {
         eprintln!("runner: Tier-2 sandbox unavailable; dispatches run unsandboxed");
     }
+    if let Some(mut log) = runner_enterprise::audit::AuditLog::open_default() {
+        log.append(
+            runner_enterprise::audit::LogLevel::Info,
+            "coordinator",
+            &format!("coordinator initialized (strict: {strict}, sandboxed: {sandboxed})"),
+        );
+    }
     // One kill ceiling for every forge (GitLab/Bitbucket configs carry
     // no per-forge timeout).
     let timeout = Duration::from_secs(config.coordinator.job_timeout_mins * 60);

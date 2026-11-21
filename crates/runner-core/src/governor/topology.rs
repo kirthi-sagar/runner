@@ -203,25 +203,89 @@ pub fn detect_slots(afk_boost: bool) -> io::Result<SlotReport> {
     }
 }
 
-/// Windows has no sysfs/NUMA topology wired; report a static
-/// single-core topology so slot math still resolves. (The governor
-/// loop sizes from `available_parallelism` instead.)
+/// Windows topology via Win32: logical CPUs from `GetSystemInfo`,
+/// physical cores by counting `RelationProcessorCore` entries, memory
+/// from the governor sensor. Assembled by the shared helper, so slot
+/// math matches every other platform.
 #[cfg(windows)]
 fn windows_slots(afk_boost: bool) -> io::Result<SlotReport> {
-    eprintln!("NUMA topology unavailable on Windows");
+    let topology = detect_windows_topology()?;
+    let (_, total, avail) = super::windows::read_memory()?;
     Ok(slots_from_counts(
-        CpuTopology {
-            logical: 1,
-            physical: 1,
-        },
-        4096,
-        4096,
+        topology,
+        total / 1024 / 1024,
+        avail / 1024 / 1024,
         afk_boost,
     ))
 }
 
+/// Logical + physical core counts: `SYSTEM_INFO.dwNumberOfProcessors`
+/// plus one `PROCESSOR_RELATIONSHIP` entry per core. The two-call
+/// buffer dance is the documented pattern; a zero/failed probe fails
+/// closed (callers already degrade on `Err`).
+#[cfg(windows)]
+fn detect_windows_topology() -> io::Result<CpuTopology> {
+    use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, GetSystemInfo, RelationProcessorCore, SYSTEM_INFO,
+    };
+    // SAFETY: plain out-struct; the call cannot fail.
+    let mut sysinfo: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+    unsafe { GetSystemInfo(&mut sysinfo) };
+    let logical = sysinfo.dwNumberOfProcessors;
+    // Size probe: success-with-null-buffer is impossible, anything but
+    // INSUFFICIENT_BUFFER (or an empty length) is a real failure.
+    let mut len = 0u32;
+    // SAFETY: null buffer + valid length out-word is the documented probe.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut len)
+    };
+    if ok != 0 || len == 0 {
+        return Err(super::windows::last_error(
+            "GetLogicalProcessorInformationEx(size)",
+        ));
+    }
+    // SAFETY: GetLastError has no arguments.
+    if unsafe { windows_sys::Win32::Foundation::GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+        return Err(super::windows::last_error(
+            "GetLogicalProcessorInformationEx(size)",
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: buffer sized by the probe above.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RelationProcessorCore, buf.as_mut_ptr() as _, &mut len)
+    };
+    if ok == 0 {
+        return Err(super::windows::last_error(
+            "GetLogicalProcessorInformationEx",
+        ));
+    }
+    // Walk variable-length entries by their Size fields.
+    let mut physical = 0u32;
+    let mut offset = 0usize;
+    while offset + 8 <= buf.len() {
+        let rel = i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap());
+        let size = u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        if size < 8 || offset + size > buf.len() {
+            break;
+        }
+        if rel == RelationProcessorCore {
+            physical += 1;
+        }
+        offset += size;
+    }
+    if physical == 0 || logical == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows topology probe returned no cores",
+        ));
+    }
+    Ok(CpuTopology { logical, physical })
+}
+
 /// Assemble a slot report from explicit counts (shared by the Linux
-/// sysfs path and the macOS sysconf path).
+/// sysfs, macOS sysconf, and Windows Win32 paths).
 fn slots_from_counts(
     topology: CpuTopology,
     mem_total_mb: u64,

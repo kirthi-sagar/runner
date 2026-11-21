@@ -236,7 +236,7 @@ impl JobObject {
 // No manual `Drop`: `OwnedHandle` closes the job handle exactly
 // once, so handles are never leaked and never double-closed.
 
-fn last_error(op: &str) -> io::Error {
+pub(crate) fn last_error(op: &str) -> io::Error {
     // SAFETY: no arguments; reads the calling thread's last error.
     let code = unsafe { GetLastError() };
     io::Error::other(format!("{op} failed with Win32 error {code}"))

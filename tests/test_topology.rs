@@ -33,6 +33,25 @@ fn spec_matrix_interactive_slots() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_detects_real_topology_and_memory() {
+    let report = runner::governor::topology::detect_slots(false).expect("detect slots");
+    assert!(
+        report.topology.logical >= report.topology.physical,
+        "logical {} < physical {}",
+        report.topology.logical,
+        report.topology.physical
+    );
+    assert!(report.topology.physical >= 1, "no cores detected");
+    assert!(report.mem_total_mb > 0, "no memory reported");
+    assert!(
+        report.mem_avail_mb <= report.mem_total_mb,
+        "avail exceeds total"
+    );
+    assert!(report.slots >= 1, "zero slots");
+}
+
 #[test]
 fn afk_boost_expands_slots() {
     let interactive = calculate_slots(SlotInputs {

@@ -349,10 +349,12 @@ pub async fn run_supervised(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use runner_core::governor::darwin::{DarwinQos, MockQos};
 
     /// Write a test script and force it to stable storage before launch,
     /// closing the ETXTBSY race on the writer side.
+    #[cfg(unix)]
     fn write_script(path: &Path, contents: &str) {
         use std::io::Write;
         let mut file = std::fs::File::create(path).unwrap();

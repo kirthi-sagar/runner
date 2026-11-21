@@ -108,7 +108,7 @@ impl FirecrackerClient {
 
     #[cfg(unix)]
     async fn put_inner(&self, path: &str, body: &serde_json::Value) -> Result<(), String> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let body = serde_json::to_vec(body).map_err(|e| format!("encode: {e}"))?;
         let request = format!(
             "PUT {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
@@ -126,21 +126,9 @@ impl FirecrackerClient {
             .write_all(&body)
             .await
             .map_err(|e| format!("write: {e}"))?;
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
+        let code = tokio::time::timeout(API_READ_TIMEOUT, read_response_code(&mut stream))
             .await
-            .map_err(|e| format!("read: {e}"))?;
-        let status_line = response
-            .split(|b| *b == b'\n')
-            .next()
-            .and_then(|line| std::str::from_utf8(line).ok())
-            .unwrap_or("");
-        let code: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or(0);
+            .map_err(|_| format!("firecracker {path}: response timed out"))??;
         if (200..300).contains(&code) {
             Ok(())
         } else {
@@ -169,6 +157,112 @@ impl FirecrackerClient {
         self.put("/actions", &action_payload("SendCtrlAltDel"))
             .await
     }
+}
+
+/// Bound for one API response read (local UDS; milliseconds normally).
+#[cfg(unix)]
+const API_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fail-closed caps: Firecracker answers tiny headers and small JSON
+/// error bodies; anything larger is a runaway or hostile peer.
+#[cfg(unix)]
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Read one framed HTTP/1.1 response and return its status code.
+/// Firecracker answers `Connection: keep-alive` and never closes, so
+/// EOF-framed reads hang forever — frame on headers + Content-Length
+/// instead, and never wait past the caller's timeout.
+#[cfg(unix)]
+async fn read_response_code(stream: &mut tokio::net::UnixStream) -> Result<u16, String> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("firecracker closed connection mid-response".to_string());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_HEADER_BYTES {
+            return Err("firecracker response headers too large".to_string());
+        }
+        if let Some(end) = find_headers_end(&buf) {
+            break end;
+        }
+    };
+    let code = parse_status_code(&buf[..head_end]);
+    let mut body = buf[head_end..].to_vec();
+    // A declared body is drained exactly; without Content-Length the
+    // response is whatever already arrived (204s carry nothing) and
+    // waiting longer would reintroduce the keep-alive hang.
+    if let Some(len) = parse_content_length(&buf[..head_end])? {
+        if len > MAX_BODY_BYTES {
+            return Err("firecracker response body too large".to_string());
+        }
+        while body.len() < len {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("firecracker truncated response body".to_string());
+            }
+            body.extend_from_slice(&chunk[..n]);
+            if body.len() > MAX_BODY_BYTES {
+                return Err("firecracker response body too large".to_string());
+            }
+        }
+        body.truncate(len);
+    }
+    let _ = body;
+    Ok(code)
+}
+
+/// Offset just past the `\r\n\r\n` headers delimiter, if present.
+#[cfg(unix)]
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+}
+
+/// Status code from a response head; 0 when unparseable (fails the
+/// caller's 2xx check loudly rather than panicking).
+#[cfg(unix)]
+fn parse_status_code(head: &[u8]) -> u16 {
+    let line = head.split(|b| *b == b'\n').next().unwrap_or(b"");
+    let line = std::str::from_utf8(line).unwrap_or("");
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Declared body length, if any. A malformed value fails closed:
+/// without a trustworthy length there is no safe way to frame.
+#[cfg(unix)]
+fn parse_content_length(head: &[u8]) -> Result<Option<usize>, String> {
+    for raw in head.split(|b| *b == b'\n') {
+        let line = std::str::from_utf8(raw).unwrap_or("").trim();
+        let Some(value) = line
+            .get(..15)
+            .filter(|name| name.eq_ignore_ascii_case("content-length:"))
+            .map(|_| &line[15..])
+        else {
+            continue;
+        };
+        let len: usize = value
+            .trim()
+            .parse()
+            .map_err(|_| "firecracker sent malformed Content-Length".to_string())?;
+        return Ok(Some(len));
+    }
+    Ok(None)
 }
 
 /// True when KVM is present and this process can open it read/write.
@@ -304,6 +398,37 @@ mod tests {
         assert_eq!(config.vcpu_count, 2);
         assert_eq!(config.mem_size_mib, 1024);
         assert_eq!(config.vsock_cid, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_framing_parses_firecracker_shapes() {
+        // Observed live: 204, keep-alive, no Content-Length, no body.
+        let keepalive =
+            b"HTTP/1.1 204 \r\nServer: Firecracker API\r\nConnection: keep-alive\r\n\r\n";
+        assert_eq!(find_headers_end(keepalive), Some(keepalive.len()));
+        assert_eq!(parse_status_code(keepalive), 204);
+        assert_eq!(parse_content_length(keepalive).unwrap(), None);
+
+        // Error shape: status + declared JSON body.
+        let err = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\nConnection: keep-alive\r\n\r\n{\"error\":\"bad drive config...\"}";
+        let end = find_headers_end(err).unwrap();
+        assert_eq!(parse_status_code(&err[..end]), 400);
+        assert_eq!(parse_content_length(&err[..end]).unwrap(), Some(31));
+        assert_eq!(&err[end..], b"{\"error\":\"bad drive config...\"}");
+
+        // Header names are case-insensitive; values tolerate padding.
+        let mixed = b"HTTP/1.1 200 OK\r\ncontent-length:   5  \r\n\r\nhello";
+        let end = find_headers_end(mixed).unwrap();
+        assert_eq!(parse_status_code(&mixed[..end]), 200);
+        assert_eq!(parse_content_length(&mixed[..end]).unwrap(), Some(5));
+
+        // Degenerate input fails closed, never panics.
+        assert_eq!(find_headers_end(b"HTTP/1.1 204"), None);
+        assert_eq!(parse_status_code(b""), 0);
+        assert_eq!(parse_status_code(b"garbage"), 0);
+        assert_eq!(parse_content_length(b"HTTP/1.1 204\r\n\r\n").unwrap(), None);
+        assert!(parse_content_length(b"Content-Length: many\r\n\r\n").is_err());
     }
 
     #[tokio::test]

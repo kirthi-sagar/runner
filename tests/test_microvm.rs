@@ -10,7 +10,23 @@ use runner::sandbox::microvm::{wait_for_socket, FirecrackerClient};
 use std::path::Path;
 use std::time::Duration;
 
-/// Minimal mock Firecracker API: accepts PUTs, records paths, answers 204.
+/// Keep-alive discipline: the real server never closes; a faithful
+/// mock exits only on client hangup. (A mock that closes would mask
+/// EOF-framing regressions — the exact live hang this guards.)
+#[cfg(unix)]
+async fn hold_open(mut stream: tokio::net::UnixStream) {
+    use tokio::io::AsyncReadExt;
+    let mut drain = [0u8; 1024];
+    loop {
+        match stream.read(&mut drain).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+}
+
+/// Minimal mock Firecracker API: accepts PUTs, records paths, answers
+/// 204 with the exact keep-alive bytes the live server sends.
 #[cfg(unix)]
 async fn serve_mock(
     path: std::path::PathBuf,
@@ -40,9 +56,10 @@ async fn serve_mock(
             }
             let _ = stream
                 .write_all(
-                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    b"HTTP/1.1 204 \r\nServer: Firecracker API\r\nConnection: keep-alive\r\n\r\n",
                 )
                 .await;
+            hold_open(stream).await;
         });
     }
 }
@@ -74,18 +91,54 @@ async fn client_handshake_and_instance_start_over_mock_uds() {
         .unwrap();
 
     let client = FirecrackerClient::new(sock.clone());
-    client
-        .set_boot_source(Path::new("/k"), "console=ttyS0")
-        .await
-        .unwrap();
-    client.set_rootfs(Path::new("/r")).await.unwrap();
-    client.set_vsock(3, Path::new("/v")).await.unwrap();
-    client.start_instance().await.unwrap();
+    // Bounded: an EOF-framing regression would hang forever against
+    // the keep-alive mock instead of failing.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        client
+            .set_boot_source(Path::new("/k"), "console=ttyS0")
+            .await
+            .unwrap();
+        client.set_rootfs(Path::new("/r")).await.unwrap();
+        client.set_vsock(3, Path::new("/v")).await.unwrap();
+        client.start_instance().await.unwrap();
+    })
+    .await
+    .expect("mock handshake must complete without EOF");
 
     let seen = seen.lock().await;
     for path in ["/boot-source", "/drives/rootfs", "/vsock", "/actions"] {
         assert!(seen.iter().any(|p| p == path), "missing {path}: {seen:?}");
     }
+    server.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn client_surfaces_error_status_with_framed_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = runner::test_support::TempDir::new("fc-mock-err").unwrap();
+    let sock = dir.path().join("fc.sock");
+    let _ = std::fs::remove_file(&sock);
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 8192];
+        let _ = stream.read(&mut buf).await;
+        let body = br#"{"fault_message":"bad drive"}"#;
+        let head = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        hold_open(stream).await;
+    });
+    let client = FirecrackerClient::new(sock);
+    let err = tokio::time::timeout(Duration::from_secs(30), client.set_rootfs(Path::new("/r")))
+        .await
+        .expect("error response must arrive without EOF")
+        .unwrap_err();
+    assert!(err.contains("400"), "{err}");
     server.abort();
 }
 

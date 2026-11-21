@@ -34,11 +34,14 @@ What it protects (filesystem isolation for job processes):
 
 - `~/.ssh`, `~/.gnupg`, `~/.config/runner`, `~/.runner`: neither
   readable nor writable from inside a job.
-- Writes anywhere outside the job workspace: denied.
+- Writes anywhere outside the job workspace and the temp roots
+  (`/private/tmp`, `/private/var/tmp`, canonicalized `$TMPDIR`):
+  denied.
 
 What it allows:
 
 - Full read/write to the job workspace (parameterized per job).
+- Writes to the temp roots (linker tempfiles, build caches).
 - Reads of system directories (`/usr`, `/System`, `/Library`,
   `/private/tmp`).
 - Unrestricted outbound network (CI jobs fetch dependencies;

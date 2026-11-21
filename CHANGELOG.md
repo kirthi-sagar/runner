@@ -6,6 +6,14 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.9.1 — 2026-11-21
+
+- Seatbelt profile allows writes to `/private/tmp`, `/private/var/tmp`,
+  and the canonicalized `$TMPDIR` (linker tempfiles and build caches
+  no longer fail under Tier-2).
+- `runner doctor` Tier-2 verdict reports `active (Seatbelt)` on macOS
+  when the facility probe passes, degraded warning otherwise.
+
 ## v1.9.0 — 2026-11-21
 
 - macOS Tier-2 sandbox via Apple Seatbelt: `sandbox_init` FFI in the

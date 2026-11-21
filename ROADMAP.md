@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v1.9.0 and prior)
+## Shipped (v1.9.1 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -27,8 +27,14 @@ services or heavyweight frameworks.
 - Native Windows Tier-3 MVP: cross-compiled exe, shims, install.ps1 (v1.8.0).
 - Native windows-latest CI: 6th green job, full suite on real Windows (v1.8.1).
 - macOS Seatbelt Tier-2: sandbox_init FFI, job profiles, pre_exec hook (v1.9.0).
+- Seatbelt TMPDIR carve-out + doctor Tier-2 verdict fix (v1.9.1).
 
-## Current: v1.9.0 (macOS Seatbelt Tier-2)
+## Current: v1.9.1 (Seatbelt TMPDIR + Doctor Verdict)
+
+- Profile allows writes to system temp dirs + `$TMPDIR`.
+- `doctor` reports `active (Seatbelt)` when the facility probes working.
+
+## Shipped in v1.9.0: macOS Seatbelt Tier-2
 
 - `seatbelt.rs`: sandbox_check nesting guard, in-memory profile builder.
 - Tier-2 on macOS: Seatbelt confinement with soft-fail (no entitlements).

@@ -18,7 +18,9 @@ use serde_json::Value;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 #[cfg(windows)]
@@ -82,7 +84,18 @@ pub fn pipe_name_for(path: &Path) -> String {
             }
         })
         .collect();
-    format!(r"\\.\pipe\runner-test-{stem}")
+    // Suffix with an FNV-1a hash of the FULL path: parallel tests
+    // routinely share the `runner.sock` stem from different TempDirs,
+    // and a stem-only name would put two servers on one pipe (one
+    // bind fails with access-denied, or clients land on the wrong
+    // server). FNV is deterministic across processes (unlike
+    // SipHash), so out-of-process daemon/CLI pairs keep agreeing.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!(r"\\.\pipe\runner-test-{stem}-{hash:016x}")
 }
 
 /// Handle one IPC request value.
@@ -469,9 +482,14 @@ pub struct IpcServer {
     #[cfg(unix)]
     listener: UnixListener,
     /// Named-pipe instances are created per accept (no persistent
-    /// listener object), so the server only retains the name.
+    /// listener object), so the server only retains the name — plus
+    /// the first instance, created synchronously at bind so the pipe
+    /// exists before any client can dial (mirrors the unix socket
+    /// file appearing at bind).
     #[cfg(windows)]
     pipe_name: String,
+    #[cfg(windows)]
+    first: std::sync::Mutex<Option<NamedPipeServer>>,
     state: SharedState,
 }
 
@@ -492,19 +510,21 @@ impl IpcServer {
         })
     }
 
-    /// Bind the named pipe for `path` (see [`pipe_name_for`]). A
-    /// probe instance validates the name up front with
-    /// first-pipe-instance exclusivity (pipes leave no stale files,
-    /// so a taken name always means a live daemon).
+    /// Bind the named pipe for `path` (see [`pipe_name_for`]). The
+    /// first instance is created (and held) here with first-pipe-
+    /// instance exclusivity: a taken name fails the bind (pipes
+    /// leave no stale files, so taken always means a live daemon),
+    /// and holding it closes the dial-before-serve race.
     #[cfg(windows)]
     pub async fn bind(path: &Path, state: SharedState) -> io::Result<Self> {
         let pipe_name = pipe_name_for(path);
-        let mut probe_opts = ServerOptions::new();
-        probe_opts.first_pipe_instance(true);
-        let _probe = probe_opts.create(&pipe_name)?;
+        let first = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)?;
         Ok(Self {
             path: path.to_path_buf(),
             pipe_name,
+            first: std::sync::Mutex::new(Some(first)),
             state,
         })
     }
@@ -527,13 +547,18 @@ impl IpcServer {
         }
     }
 
-    /// Accept loop; runs until instance creation fails fatally. Each
-    /// iteration creates one server instance, waits for a client,
-    /// then hands it to a task and loops for the next.
+    /// Accept loop; runs until instance creation fails fatally. The
+    /// first iteration serves the instance held since bind, later
+    /// ones create fresh instances — each waits for a client, then
+    /// hands it to a task and loops for the next.
     #[cfg(windows)]
     pub async fn serve(&self) -> io::Result<()> {
         loop {
-            let pipe = ServerOptions::new().create(&self.pipe_name)?;
+            let held = self.first.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let pipe = match held {
+                Some(pipe) => pipe,
+                None => ServerOptions::new().create(&self.pipe_name)?,
+            };
             pipe.connect().await?;
             let state = self.state.clone();
             tokio::spawn(async move {
@@ -643,6 +668,16 @@ mod tests {
         assert!(derived.starts_with(r"\\.\pipe\runner-test-"), "{derived}");
         assert!(derived.contains("runner.sock"), "{derived}");
         assert_ne!(derived, PIPE_NAME);
+        // Same stem from different dirs must not share a pipe
+        // (parallel tests bind simultaneously).
+        let other = pipe_name_for(Path::new(r"C:\Temp\runner-test-2\runner.sock"));
+        assert_ne!(derived, other);
+        // Same path re-derives the same name (server/client agree,
+        // rebinds land on the same pipe).
+        assert_eq!(
+            derived,
+            pipe_name_for(Path::new(r"C:\Temp\runner-test-1\runner.sock"))
+        );
     }
 
     #[cfg(unix)]

@@ -6,6 +6,18 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.0.0 — 2026-11-21
+
+- Native Windows governor via Job Objects: Win32 pressure sensing
+  (`GlobalMemoryStatusEx` + `GetSystemTimes`) feeding the shared
+  pressure ladder with Windows `%` bands.
+- RAII job manager: post-spawn worker assignment, memory ceilings,
+  weight-based CPU control (9/5/1, never-freeze), kill-on-close.
+- Supervisor loop runs on Windows (250ms cadence, `ctrl_c`
+  shutdown); `runner doctor` reports governor `active (Job Objects)`.
+- macOS Tier-1 microVM parked (no nested virt on hosted runners,
+  entitlement mandate); Windows track advanced first.
+
 ## v1.9.1 — 2026-11-21
 
 - Seatbelt profile allows writes to `/private/tmp`, `/private/var/tmp`,

@@ -3,7 +3,7 @@ resolver = "2"
 members = [".", "crates/*"]
 
 [workspace.package]
-version = "1.9.1"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 
@@ -32,13 +32,13 @@ bytes = "1"
 jsonwebtoken = "9"
 libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
-runner-core = { path = "crates/runner-core", version = "1.9.1" }
-runner-sandbox = { path = "crates/runner-sandbox", version = "1.9.1" }
-runner-providers = { path = "crates/runner-providers", version = "1.9.1" }
-runner-telemetry = { path = "crates/runner-telemetry", version = "1.9.1" }
-runner-enterprise = { path = "crates/runner-enterprise", version = "1.9.1" }
-runner-cli = { path = "crates/runner-cli", version = "1.9.1" }
-runner-guest-agent = { path = "crates/runner-guest-agent", version = "1.9.1" }
+runner-core = { path = "crates/runner-core", version = "2.0.0" }
+runner-sandbox = { path = "crates/runner-sandbox", version = "2.0.0" }
+runner-providers = { path = "crates/runner-providers", version = "2.0.0" }
+runner-telemetry = { path = "crates/runner-telemetry", version = "2.0.0" }
+runner-enterprise = { path = "crates/runner-enterprise", version = "2.0.0" }
+runner-cli = { path = "crates/runner-cli", version = "2.0.0" }
+runner-guest-agent = { path = "crates/runner-guest-agent", version = "2.0.0" }
 
 [package]
 name = "runner"

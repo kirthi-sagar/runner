@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "runner-cli"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "runner-enterprise"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "runner-guest-agent"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "base64 0.23.1",
  "libc",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "runner-providers"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1461,7 +1461,7 @@ dependencies = [
 
 [[package]]
 name = "runner-sandbox"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "runner-telemetry"
-version = "1.9.1"
+version = "2.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2401,9 +2401,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 dependencies = [
  "zeroize_derive",
 ]

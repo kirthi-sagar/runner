@@ -163,8 +163,29 @@ impl SupervisorState {
             last_snapshot: PsiSnapshot::default(),
             last_weight: None,
             last_slots: 1,
-            psi_warn: super::psi::CPU_WARN,
-            psi_crit: super::psi::CPU_CRIT,
+            // Threshold defaults follow the snapshot units (PSI stall
+            // % on Linux, busy % on Windows); operator config still
+            // overrides both via `seed_from_config`.
+            psi_warn: {
+                #[cfg(windows)]
+                {
+                    super::psi::WIN_CPU_WARN
+                }
+                #[cfg(not(windows))]
+                {
+                    super::psi::CPU_WARN
+                }
+            },
+            psi_crit: {
+                #[cfg(windows)]
+                {
+                    super::psi::WIN_CPU_CRIT
+                }
+                #[cfg(not(windows))]
+                {
+                    super::psi::CPU_CRIT
+                }
+            },
             temp_c: None,
             thermal_throttled: false,
             discharging: false,
@@ -707,7 +728,11 @@ mod tests {
 
     #[test]
     fn tick_follows_pressure_ladder() {
-        let state = SupervisorState::new();
+        // Explicit bands: the ladder logic must hold regardless of
+        // platform defaults (Windows bands differ).
+        let mut state = SupervisorState::new();
+        state.psi_warn = 20.0;
+        state.psi_crit = 40.0;
         let now = Instant::now();
         assert_eq!(
             tick_weight(&state, &snapshot_with(10.0, 1.0, 1.0), now),
@@ -860,7 +885,7 @@ mod tests {
         let mut state = SupervisorState::new();
         state.seed_from_config(&config);
         let now = Instant::now();
-        // 50% pressure is critical by default but normal under custom bands.
+        // 50% pressure sits below the custom 70/90 bands.
         assert_eq!(
             tick_weight(&state, &snapshot_with(50.0, 1.0, 1.0), now),
             100
@@ -887,14 +912,22 @@ mod tests {
 
     #[test]
     fn degenerate_config_keeps_safe_defaults() {
-        // Degenerate config keeps safe defaults.
+        // Degenerate config keeps safe defaults (platform bands).
         let mut bad = RunnerConfig::default();
         bad.governor.warn_cpu_psi = 90.0;
         bad.governor.crit_cpu_psi = 10.0;
         let mut state = SupervisorState::new();
         state.seed_from_config(&bad);
-        assert_eq!(state.psi_warn, crate::governor::psi::CPU_WARN);
-        assert_eq!(state.psi_crit, crate::governor::psi::CPU_CRIT);
+        #[cfg(windows)]
+        {
+            assert_eq!(state.psi_warn, crate::governor::psi::WIN_CPU_WARN);
+            assert_eq!(state.psi_crit, crate::governor::psi::WIN_CPU_CRIT);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(state.psi_warn, crate::governor::psi::CPU_WARN);
+            assert_eq!(state.psi_crit, crate::governor::psi::CPU_CRIT);
+        }
     }
 
     #[test]
@@ -905,15 +938,28 @@ mod tests {
         // Override forces 25 even when pressure is normal ...
         assert_eq!(tick_weight(&state, &snapshot_with(5.0, 1.0, 1.0), now), 25);
         // ... but critical pressure still wins over a warning override.
-        assert_eq!(tick_weight(&state, &snapshot_with(90.0, 1.0, 1.0), now), 1);
+        // (95 exceeds the critical band on every platform.)
+        assert_eq!(tick_weight(&state, &snapshot_with(95.0, 1.0, 1.0), now), 1);
     }
 
     #[test]
     fn pressure_shrinks_effective_slots() {
-        assert_eq!(effective_slots(4, &snapshot_with(5.0, 1.0, 1.0)), 4);
-        assert_eq!(effective_slots(4, &snapshot_with(30.0, 1.0, 1.0)), 2);
-        assert_eq!(effective_slots(4, &snapshot_with(50.0, 1.0, 1.0)), 1);
-        assert_eq!(effective_slots(4, &snapshot_with(5.0, 20.0, 1.0)), 1);
+        // Same slot policy both platforms; snapshots speak each
+        // platform's units (PSI stall % vs Win32 busy/load %).
+        #[cfg(not(windows))]
+        {
+            assert_eq!(effective_slots(4, &snapshot_with(5.0, 1.0, 1.0)), 4);
+            assert_eq!(effective_slots(4, &snapshot_with(30.0, 1.0, 1.0)), 2);
+            assert_eq!(effective_slots(4, &snapshot_with(50.0, 1.0, 1.0)), 1);
+            assert_eq!(effective_slots(4, &snapshot_with(5.0, 20.0, 1.0)), 1);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(effective_slots(4, &snapshot_with(5.0, 1.0, 1.0)), 4);
+            assert_eq!(effective_slots(4, &snapshot_with(80.0, 1.0, 1.0)), 2);
+            assert_eq!(effective_slots(4, &snapshot_with(95.0, 1.0, 1.0)), 1);
+            assert_eq!(effective_slots(4, &snapshot_with(5.0, 96.0, 1.0)), 1);
+        }
     }
 
     #[test]

@@ -28,6 +28,14 @@ pub const MEM_CRIT: f64 = 15.0;
 /// I/O `full avg10` thresholds.
 pub const IO_WARN: f64 = 3.0;
 pub const IO_CRIT: f64 = 10.0;
+/// Windows `%`-scale thresholds (CPU busy %, memory load %): PSI
+/// stall bands would misread percentages (a typical load % sits
+/// permanently "critical" on stall bands), so Windows classifies
+/// against its own defaults. Operator config overrides both.
+pub const WIN_CPU_WARN: f64 = 75.0;
+pub const WIN_CPU_CRIT: f64 = 90.0;
+pub const WIN_MEM_WARN: f64 = 80.0;
+pub const WIN_MEM_CRIT: f64 = 95.0;
 
 /// Pressure severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -52,6 +60,29 @@ pub fn cpu_level_with(some_avg10: f64, warn: f64, crit: f64) -> PressureLevel {
 /// Classify memory pressure from `some avg10`.
 pub fn mem_level(some_avg10: f64) -> PressureLevel {
     level(some_avg10, MEM_WARN, MEM_CRIT)
+}
+
+/// Classify memory pressure against explicit bands (Windows load %
+/// via [`WIN_MEM_WARN`]/[`WIN_MEM_CRIT`]).
+pub fn mem_level_with(value: f64, warn: f64, crit: f64) -> PressureLevel {
+    level(value, warn, crit)
+}
+
+/// CPU busy % between two `GetSystemTimes` samples (`(idle, kernel,
+/// user)` 100ns ticks). Kernel time includes idle per the API docs,
+/// so busy ticks = (kernel − idle) + user over total ticks. Yields
+/// 0.0 when nothing elapsed; saturating throughout (counter
+/// wrap/race safety).
+pub fn busy_percent_from_ticks(prev: (u64, u64, u64), next: (u64, u64, u64)) -> f64 {
+    let idle = next.0.saturating_sub(prev.0);
+    let kernel = next.1.saturating_sub(prev.1);
+    let user = next.2.saturating_sub(prev.2);
+    let total = kernel.saturating_add(user);
+    if total == 0 {
+        return 0.0;
+    }
+    let busy = kernel.saturating_sub(idle).saturating_add(user);
+    busy as f64 / total as f64 * 100.0
 }
 
 /// Classify I/O pressure from `full avg10`.
@@ -129,6 +160,10 @@ pub fn parse_psi_file(text: &str) -> Result<PsiFile, String> {
 }
 
 /// Point-in-time pressure snapshot across all three resources.
+/// Units are platform-defined: PSI stall % on Linux, Win32 load/busy
+/// % on Windows (I/O stays zero there — no unprivileged disk-pressure
+/// sensor). Classification bands follow the platform; raw values
+/// stay honest per platform.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PsiSnapshot {
     pub cpu: PsiFile,
@@ -142,12 +177,32 @@ impl PsiSnapshot {
         self.cpu.some.avg10
     }
 
+    /// Classify the CPU reading. Snapshot units are platform-defined
+    /// (PSI stall % on Linux, busy % on Windows), so the bands follow
+    /// the platform; every consumer stays correct with no call-site
+    /// changes.
     pub fn cpu_pressure(&self) -> PressureLevel {
-        cpu_level(self.cpu_some_avg10())
+        #[cfg(windows)]
+        {
+            cpu_level_with(self.cpu_some_avg10(), WIN_CPU_WARN, WIN_CPU_CRIT)
+        }
+        #[cfg(not(windows))]
+        {
+            cpu_level(self.cpu_some_avg10())
+        }
     }
 
+    /// Classify the memory reading (PSI stall % on Linux, load % on
+    /// Windows — see [`Self::cpu_pressure`]).
     pub fn mem_pressure(&self) -> PressureLevel {
-        mem_level(self.memory.some.avg10)
+        #[cfg(windows)]
+        {
+            mem_level_with(self.memory.some.avg10, WIN_MEM_WARN, WIN_MEM_CRIT)
+        }
+        #[cfg(not(windows))]
+        {
+            mem_level(self.memory.some.avg10)
+        }
     }
 
     pub fn io_pressure(&self) -> PressureLevel {
@@ -265,6 +320,35 @@ mod tests {
         assert_eq!(io_level(2.99), PressureLevel::Normal);
         assert_eq!(io_level(3.0), PressureLevel::Warning);
         assert_eq!(io_level(10.01), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn mem_level_with_honors_explicit_bands() {
+        assert_eq!(
+            mem_level_with(79.9, WIN_MEM_WARN, WIN_MEM_CRIT),
+            PressureLevel::Normal
+        );
+        assert_eq!(
+            mem_level_with(80.0, WIN_MEM_WARN, WIN_MEM_CRIT),
+            PressureLevel::Warning
+        );
+        assert_eq!(
+            mem_level_with(95.01, WIN_MEM_WARN, WIN_MEM_CRIT),
+            PressureLevel::Critical
+        );
+    }
+
+    #[test]
+    fn busy_percent_from_ticks_matches_documented_math() {
+        // Half the non-idle ticks busy: (200 + 200) / 800 = 50%.
+        // (idle, kernel incl. idle, user) deltas.
+        assert_eq!(busy_percent_from_ticks((0, 0, 0), (400, 600, 200)), 50.0);
+        // All idle: 0%.
+        assert_eq!(busy_percent_from_ticks((0, 0, 0), (800, 800, 0)), 0.0);
+        // Nothing elapsed: 0%, never NaN.
+        assert_eq!(busy_percent_from_ticks((7, 9, 3), (7, 9, 3)), 0.0);
+        // Fully busy: 100%.
+        assert_eq!(busy_percent_from_ticks((0, 0, 0), (0, 500, 500)), 100.0);
     }
 
     #[test]

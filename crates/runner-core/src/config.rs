@@ -609,10 +609,12 @@ pub fn resolve_cache_dir(config: &CacheConfig) -> std::path::PathBuf {
 /// cgroups v2 weight ladder (warning = 25, critical = trickle 1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GovernorConfig {
-    /// Pressure at/above which throttling begins (default 20.0).
+    /// Pressure at/above which throttling begins (default 20.0;
+    /// on Windows this is CPU busy %, default 75.0).
     #[serde(default = "default_warn_cpu_psi")]
     pub warn_cpu_psi: f64,
-    /// Pressure above which the trickle throttle applies (default 40.0).
+    /// Pressure above which the trickle throttle applies (default 40.0;
+    /// on Windows this is CPU busy %, default 90.0).
     #[serde(default = "default_crit_cpu_psi")]
     pub crit_cpu_psi: f64,
     /// AFK boost mode: `auto`, `always`, or `never` (default `auto`).

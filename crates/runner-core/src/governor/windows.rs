@@ -27,11 +27,13 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{GetLastError, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
 };
+use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+use windows_sys::Win32::System::Threading::GetSystemTimes;
 
 /// One Windows Job Object, closed on drop. Handles are never leaked:
 /// every constructor funnels through [`JobObject::create`], and
@@ -116,6 +118,83 @@ fn last_error(op: &str) -> io::Error {
     io::Error::other(format!("{op} failed with Win32 error {code}"))
 }
 
+/// Read memory load % (0-100) plus raw byte figures for telemetry:
+/// `(load_pct, total_phys, avail_phys)`.
+pub fn read_memory() -> io::Result<(u32, u64, u64)> {
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    // Mandatory per API contract: the call fails without it.
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `dwLength` initialized; valid out-struct.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 {
+        return Err(last_error("GlobalMemoryStatusEx"));
+    }
+    Ok((
+        status.dwMemoryLoad,
+        status.ullTotalPhys,
+        status.ullAvailPhys,
+    ))
+}
+
+fn filetime_to_u64(ft: &FILETIME) -> u64 {
+    ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+}
+
+/// One `GetSystemTimes` sample: `(idle, kernel, user)` 100ns ticks
+/// summed across all processors.
+pub fn read_system_times() -> io::Result<(u64, u64, u64)> {
+    let mut idle: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    // SAFETY: all three are valid out-structs.
+    let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+    if ok == 0 {
+        return Err(last_error("GetSystemTimes"));
+    }
+    Ok((
+        filetime_to_u64(&idle),
+        filetime_to_u64(&kernel),
+        filetime_to_u64(&user),
+    ))
+}
+
+/// Rolling Windows sensor: the first sample seeds the CPU baseline
+/// (returns `None`, skipping one tick); later samples yield full
+/// snapshots with `%`-unit readings (see [`super::psi::PsiSnapshot`]
+/// for the unit contract).
+#[derive(Default)]
+pub struct WindowsSensor {
+    prev_times: Option<(u64, u64, u64)>,
+}
+
+impl WindowsSensor {
+    pub fn sample(&mut self) -> io::Result<Option<super::psi::PsiSnapshot>> {
+        let (load, _, _) = read_memory()?;
+        let now = read_system_times()?;
+        let Some(prev) = self.prev_times.replace(now) else {
+            return Ok(None);
+        };
+        let cpu = super::psi::busy_percent_from_ticks(prev, now);
+        Ok(Some(super::psi::PsiSnapshot {
+            cpu: super::psi::PsiFile {
+                some: super::psi::PsiLine {
+                    avg10: cpu,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            memory: super::psi::PsiFile {
+                some: super::psi::PsiLine {
+                    avg10: load as f64,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            io: Default::default(),
+        }))
+    }
+}
+
 /// Probe the Job Objects facility end to end: create a job, apply
 /// empty extended limits, and read them back. True when a governed
 /// worker tree would work on this host (mirrors `probe_userns`).
@@ -156,5 +235,32 @@ mod tests {
     #[test]
     fn job_probe_succeeds_on_windows_runner() {
         assert!(probe_jobs());
+    }
+
+    #[test]
+    fn memory_sensor_returns_sane_figures() {
+        let (load, total, avail) = read_memory().expect("memory read");
+        assert!(load <= 100, "load {load}");
+        assert!(total > 0, "no physical memory reported");
+        assert!(avail <= total, "avail {avail} > total {total}");
+    }
+
+    #[test]
+    fn system_times_are_monotonic() {
+        let a = read_system_times().expect("times read");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let b = read_system_times().expect("times re-read");
+        assert!(b.0 >= a.0 && b.1 >= a.1 && b.2 >= a.2);
+    }
+
+    #[test]
+    fn sensor_seeds_then_samples_sane_snapshot() {
+        let mut sensor = WindowsSensor::default();
+        assert!(sensor.sample().expect("seed").is_none());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let snap = sensor.sample().expect("sample").expect("snapshot");
+        let cpu = snap.cpu_some_avg10();
+        assert!((0.0..=100.0).contains(&cpu), "cpu {cpu}");
+        assert!((0.0..=100.0).contains(&snap.memory.some.avg10));
     }
 }

@@ -242,16 +242,34 @@ mod tests {
         assert_eq!(SandboxDriver::MicroVm.name(), "microvm");
     }
 
+    /// Exit-0 / exit-nonzero argv per platform (`true`/`false` don't
+    /// exist on Windows; `cmd /c exit N` propagates N).
+    fn exit_zero_argv() -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".to_string(), "/c".to_string(), "exit 0".to_string()]
+        } else {
+            vec!["true".to_string()]
+        }
+    }
+
+    fn exit_nonzero_argv() -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".to_string(), "/c".to_string(), "exit 3".to_string()]
+        } else {
+            vec!["false".to_string()]
+        }
+    }
+
     #[tokio::test]
     async fn process_tier_runs_and_propagates_exit_codes() {
         let engine = SandboxEngine::new(SandboxDriver::Process);
         let ok = engine
-            .execute(&["true".to_string()], Duration::from_secs(30))
+            .execute(&exit_zero_argv(), Duration::from_secs(30))
             .await
             .unwrap();
         assert_eq!(ok, 0);
         let fail = engine
-            .execute(&["false".to_string()], Duration::from_secs(30))
+            .execute(&exit_nonzero_argv(), Duration::from_secs(30))
             .await
             .unwrap();
         assert_ne!(fail, 0);
@@ -318,7 +336,7 @@ mod tests {
         let dir = runner_core::test_support::TempDir::new("driver-qos").unwrap();
         let log = dir.path().join("qos.log");
         let mock = Arc::new(MockQos::with_log(log.clone()));
-        let code = execute_process(&["true".to_string()], Duration::from_secs(30), mock)
+        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), mock)
             .await
             .unwrap();
         assert_eq!(code, 0);
@@ -326,7 +344,7 @@ mod tests {
         // A failing backend never fails the spawn.
         let failing = Arc::new(MockQos::new());
         failing.set_failing();
-        let code = execute_process(&["true".to_string()], Duration::from_secs(30), failing)
+        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), failing)
             .await
             .unwrap();
         assert_eq!(code, 0);

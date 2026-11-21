@@ -189,21 +189,41 @@ mod tests {
     fn slice_roundtrip_in_tempdir() {
         let dir = crate::test_support::TempDir::new("cgroup").unwrap();
         let slice = CgroupSlice::new(dir.path().join(SLICE_NAME));
-        // Simulate a cgroupfs weight file.
-        slice.ensure().unwrap();
-        fs::write(slice.path().join("cpu.weight"), "100").unwrap();
-        assert_eq!(slice.weight().unwrap(), 100);
-        assert_eq!(slice.apply_pressure(50.0).unwrap(), 1);
-        assert_eq!(slice.weight().unwrap(), 1);
-        assert_eq!(slice.apply_pressure(10.0).unwrap(), 100);
+        if cfg!(windows) {
+            // No cgroups on Windows: every stub refuses loudly.
+            for err in [
+                slice.ensure().unwrap_err(),
+                slice.apply_pressure(50.0).unwrap_err(),
+                slice.weight().unwrap_err(),
+            ] {
+                assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+            }
+        } else {
+            // Simulate a cgroupfs weight file.
+            slice.ensure().unwrap();
+            fs::write(slice.path().join("cpu.weight"), "100").unwrap();
+            assert_eq!(slice.weight().unwrap(), 100);
+            assert_eq!(slice.apply_pressure(50.0).unwrap(), 1);
+            assert_eq!(slice.weight().unwrap(), 1);
+            assert_eq!(slice.apply_pressure(10.0).unwrap(), 100);
+        }
     }
 
     #[test]
     fn rejects_out_of_range_weights() {
         let dir = crate::test_support::TempDir::new("cgroup-range").unwrap();
         let slice = CgroupSlice::new(dir.path().join(SLICE_NAME));
-        slice.ensure().unwrap();
-        assert!(slice.set_weight(0).is_err());
-        assert!(slice.set_weight(10_001).is_err());
+        if cfg!(windows) {
+            // The range check is unreachable: the stub refuses first.
+            assert_eq!(
+                slice.ensure().unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
+            assert!(slice.set_weight(100).is_err());
+        } else {
+            slice.ensure().unwrap();
+            assert!(slice.set_weight(0).is_err());
+            assert!(slice.set_weight(10_001).is_err());
+        }
     }
 }

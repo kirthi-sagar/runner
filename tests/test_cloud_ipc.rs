@@ -38,6 +38,21 @@ async fn cloud_ipc_and_mcp_reach_live_daemon_state() {
         guard.add_cloud_node(node("i-7"));
         guard.set_cloud_pool(runner::mesh::cloud::CloudPool::default(), 25.0);
     }
+    // Windows has no Unix domain sockets: `bind` must fail loudly with
+    // `Unsupported`, never silently succeed.
+    if cfg!(windows) {
+        // (`match`, not `unwrap_err`: `IpcServer` is not `Debug`.)
+        let err = match IpcServer::bind(&sock, state).await {
+            Ok(_) => panic!("IpcServer::bind must fail on Windows"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(
+            err.to_string(),
+            "unsupported on Windows: IPC (Unix domain socket)"
+        );
+        return;
+    }
     let server = Arc::new(IpcServer::bind(&sock, state).await.unwrap());
     tokio::spawn(async move { server.serve().await });
     for _ in 0..50 {

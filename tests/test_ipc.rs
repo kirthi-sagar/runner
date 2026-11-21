@@ -4,10 +4,29 @@ use runner::governor::supervisor::new_shared_state;
 use runner::ipc::{ipc_call, IpcServer};
 use std::sync::Arc;
 
+/// Windows has no Unix domain sockets: `bind` must fail loudly with
+/// `Unsupported`, never silently succeed.
+async fn assert_ipc_bind_unsupported(path: &std::path::Path) {
+    // (`match`, not `unwrap_err`: `IpcServer` is not `Debug`.)
+    let err = match IpcServer::bind(path, new_shared_state()).await {
+        Ok(_) => panic!("IpcServer::bind must fail on Windows"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(
+        err.to_string(),
+        "unsupported on Windows: IPC (Unix domain socket)"
+    );
+}
+
 #[tokio::test]
 async fn ipc_ping_roundtrip() {
     let dir = runner::test_support::TempDir::new("ipc-it").unwrap();
     let path = dir.path().join("runner.sock");
+    if cfg!(windows) {
+        assert_ipc_bind_unsupported(&path).await;
+        return;
+    }
     let server = Arc::new(IpcServer::bind(&path, new_shared_state()).await.unwrap());
     let task = tokio::spawn(async move { server.serve().await });
 
@@ -28,6 +47,10 @@ async fn ipc_ping_roundtrip() {
 async fn ipc_snapshot_and_poll_now() {
     let dir = runner::test_support::TempDir::new("ipc-snap").unwrap();
     let path = dir.path().join("runner.sock");
+    if cfg!(windows) {
+        assert_ipc_bind_unsupported(&path).await;
+        return;
+    }
     let state = new_shared_state();
     {
         let mut guard = state.write().await;

@@ -312,6 +312,12 @@ mod tests {
         let err = wait_for_socket(&missing, std::time::Duration::from_millis(120))
             .await
             .unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
+        // No Unix domain sockets on Windows: the loud stub fires
+        // instead of the timeout.
+        if cfg!(windows) {
+            assert!(err.contains("unsupported on Windows"), "{err}");
+        } else {
+            assert!(err.contains("timed out"), "{err}");
+        }
     }
 }

@@ -543,6 +543,15 @@ mod tests {
     async fn ping_roundtrip_over_socket() {
         let dir = crate::test_support::TempDir::new("ipc").unwrap();
         let path = dir.path().join("runner.sock");
+        // No Unix domain sockets on Windows: `bind` must fail loudly.
+        if cfg!(windows) {
+            let err = match IpcServer::bind(&path, new_shared_state()).await {
+                Ok(_) => panic!("IpcServer::bind must fail on Windows"),
+                Err(e) => e,
+            };
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+            return;
+        }
         let server = std::sync::Arc::new(IpcServer::bind(&path, new_shared_state()).await.unwrap());
         let task = tokio::spawn(async move { server.serve().await });
         let res = ipc_call(&path, "ping").await.unwrap();

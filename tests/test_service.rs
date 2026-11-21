@@ -68,8 +68,15 @@ fn unit_file_matches_installer_contract() {
 
 #[test]
 fn unit_path_and_binary_resolve() {
-    let unit = user_unit_path().expect("HOME set under cargo test");
-    assert!(unit.ends_with(".config/systemd/user/runner.service"));
+    // HOME is set under Unix cargo test; Windows CI leaves it
+    // unset, and the path must be absent exactly then.
+    match user_unit_path() {
+        Some(unit) => assert!(unit.ends_with(".config/systemd/user/runner.service")),
+        None => assert!(
+            std::env::var_os("HOME").is_none(),
+            "unit path missing while HOME is set"
+        ),
+    }
 
     // The integration test binary itself must resolve to a real file.
     let exe = current_binary_path().unwrap();

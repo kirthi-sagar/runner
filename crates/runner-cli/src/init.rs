@@ -169,7 +169,10 @@ mod tests {
             next_steps: vec!["runner doctor".to_string()],
         };
         let rendered = render_report(&report);
-        assert!(rendered.contains("/tmp/x/config.toml"), "{rendered}");
+        // `Path::display` renders native separators (backslashes on
+        // Windows), so expect exactly what the platform prints.
+        let expect_path = report.config_path.display().to_string();
+        assert!(rendered.contains(&expect_path), "{rendered}");
         assert!(rendered.contains("set org = acme"), "{rendered}");
         assert!(rendered.contains("runner doctor"), "{rendered}");
 

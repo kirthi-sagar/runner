@@ -113,7 +113,13 @@ mod tests {
         write_current_pid(&path).unwrap();
         let pid = read_pid(&path).unwrap();
         assert_eq!(pid, std::process::id());
-        assert!(process_alive(pid));
-        assert!(!process_alive(u32::MAX - 100));
+        if cfg!(windows) {
+            // No signal-0 probe on Windows: the stub always
+            // reports not-alive (callers fail earlier, loudly).
+            assert!(!process_alive(pid));
+        } else {
+            assert!(process_alive(pid));
+            assert!(!process_alive(u32::MAX - 100));
+        }
     }
 }

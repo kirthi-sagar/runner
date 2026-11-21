@@ -156,8 +156,15 @@ mod tests {
 
     #[test]
     fn unit_path_lands_in_user_systemd_dir() {
-        let path = user_unit_path().expect("HOME is set under cargo test");
-        assert!(path.ends_with(".config/systemd/user/runner.service"));
+        // HOME is set under Unix cargo test; Windows CI leaves it
+        // unset, and the path must be absent exactly then.
+        match user_unit_path() {
+            Some(path) => assert!(path.ends_with(".config/systemd/user/runner.service")),
+            None => assert!(
+                std::env::var_os("HOME").is_none(),
+                "unit path missing while HOME is set"
+            ),
+        }
     }
 
     #[test]

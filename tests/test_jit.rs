@@ -47,7 +47,11 @@ fn jit_request_serializes_and_targets_org_and_repo() {
 fn worker_launches_with_jitconfig_argv() {
     let launch = WorkerLaunch::new("/cache/worker-2.338.2".into(), "BLOB123");
     let argv = launch.argv();
-    assert_eq!(argv[0], "./run.sh");
+    if cfg!(windows) {
+        assert_eq!(argv[0], "run.cmd");
+    } else {
+        assert_eq!(argv[0], "./run.sh");
+    }
     assert_eq!(argv[1], "--jitconfig");
     assert_eq!(argv[2], "BLOB123");
     assert_eq!(argv.len(), 3);

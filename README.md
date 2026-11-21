@@ -20,7 +20,7 @@
 | Feature | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | Tier-3 dispatch | ✅ | ✅ | ✅ |
-| Governor (PSI + cgroups) | ✅ | ✅ | ❌ logged |
+| Governor | ✅ | ✅ Darwin QoS | ✅ Job Objects |
 | Tier-2 sandbox | ✅ namespaces | ✅ Seatbelt | ❌ logged |
 | Tier-1 microVM (Firecracker) | ✅ | ❌ | ❌ logged |
 | WireGuard transport | ✅ | ✅ | ✅ |

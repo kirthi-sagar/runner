@@ -355,8 +355,9 @@ pub fn weight_for_level(level: super::psi::PressureLevel) -> u32 {
 }
 
 /// Probe the Job Objects facility end to end: create a job, apply
-/// empty extended limits, and read them back. True when a governed
-/// worker tree would work on this host (mirrors `probe_userns`).
+/// empty extended limits, read them back, and round-trip a CPU
+/// weight. True when a governed worker tree would work on this host
+/// (mirrors `probe_userns`).
 pub fn probe_jobs() -> bool {
     let job = match JobObject::create() {
         Ok(job) => job,
@@ -370,10 +371,23 @@ pub fn probe_jobs() -> bool {
         eprintln!("[runner] job probe: set limits failed: {e}");
         return false;
     }
-    match job.query_extended_limits() {
-        Ok(_) => true,
+    if job.query_extended_limits().is_err() {
+        eprintln!("[runner] job probe: query limits failed");
+        return false;
+    }
+    // Rate-control capability: a weight round-trip on the temp job.
+    if let Err(e) = job.set_cpu_weight(5) {
+        eprintln!("[runner] job probe: set weight failed: {e}");
+        return false;
+    }
+    match job.query_cpu_weight() {
+        Ok(5) => true,
+        Ok(other) => {
+            eprintln!("[runner] job probe: weight mismatch (want 5, got {other})");
+            false
+        }
         Err(e) => {
-            eprintln!("[runner] job probe: query limits failed: {e}");
+            eprintln!("[runner] job probe: query weight failed: {e}");
             false
         }
     }

@@ -113,13 +113,35 @@ fn check_kernel() -> Check {
     }
 }
 
-/// Windows has no cgroups; the check names the gap explicitly.
+/// Windows governor probe result (pure input for the verdict).
+#[cfg(any(test, target_os = "windows"))]
+struct JobFacts {
+    available: bool,
+}
+
+/// Pure governor verdict for Windows. The check keeps the
+/// `"cgroupsv2"` name for JSON stability; only the verdict text is
+/// platform-aware.
+#[cfg(any(test, target_os = "windows"))]
+fn job_verdict(facts: &JobFacts) -> Check {
+    if facts.available {
+        Check::pass(
+            "cgroupsv2",
+            "active (Job Objects): worker trees governed".to_string(),
+        )
+    } else {
+        Check::fail(
+            "cgroupsv2",
+            "Job Objects unavailable: jobs run governed-direct (governor degraded)".to_string(),
+        )
+    }
+}
+
 #[cfg(windows)]
 fn check_cgroup() -> Check {
-    Check::fail(
-        "cgroupsv2",
-        "feature unavailable on Windows: cgroup pressure control".to_string(),
-    )
+    job_verdict(&JobFacts {
+        available: runner_core::governor::windows::probe_jobs(),
+    })
 }
 
 #[cfg(unix)]
@@ -1136,6 +1158,27 @@ mod tests {
         let degraded = seatbelt_verdict(&SeatbeltFacts { available: false });
         assert_eq!(degraded.name, "userns");
         assert!(matches!(degraded.status, Status::Warn));
+        assert!(
+            degraded.detail.contains("governed-direct"),
+            "{}",
+            degraded.detail
+        );
+    }
+
+    #[test]
+    fn job_verdict_covers_available_and_unavailable() {
+        let active = job_verdict(&JobFacts { available: true });
+        assert_eq!(active.name, "cgroupsv2");
+        assert!(matches!(active.status, Status::Pass));
+        assert!(
+            active.detail.contains("active (Job Objects)"),
+            "{}",
+            active.detail
+        );
+
+        let degraded = job_verdict(&JobFacts { available: false });
+        assert_eq!(degraded.name, "cgroupsv2");
+        assert!(matches!(degraded.status, Status::Fail));
         assert!(
             degraded.detail.contains("governed-direct"),
             "{}",

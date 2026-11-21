@@ -14,11 +14,24 @@ fn weight_ladder() {
 fn pressure_drives_weight_file() {
     let dir = runner::test_support::TempDir::new("cgroup-it").unwrap();
     let slice = CgroupSlice::new(dir.path().join("runner.slice"));
-    slice.ensure().unwrap();
-    fs::write(slice.path().join("cpu.weight"), "100").unwrap();
+    // Windows has no cgroups: every stub method must fail loudly with
+    // `Unsupported`, never silently succeed.
+    if cfg!(windows) {
+        for err in [
+            slice.ensure().unwrap_err(),
+            slice.apply_pressure(45.0).unwrap_err(),
+            slice.weight().unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+            assert_eq!(err.to_string(), "cgroups unavailable on Windows");
+        }
+    } else {
+        slice.ensure().unwrap();
+        fs::write(slice.path().join("cpu.weight"), "100").unwrap();
 
-    assert_eq!(slice.apply_pressure(45.0).unwrap(), 1);
-    assert_eq!(slice.weight().unwrap(), 1);
-    assert_eq!(slice.apply_pressure(30.0).unwrap(), 25);
-    assert_eq!(slice.apply_pressure(5.0).unwrap(), 100);
+        assert_eq!(slice.apply_pressure(45.0).unwrap(), 1);
+        assert_eq!(slice.weight().unwrap(), 1);
+        assert_eq!(slice.apply_pressure(30.0).unwrap(), 25);
+        assert_eq!(slice.apply_pressure(5.0).unwrap(), 100);
+    }
 }

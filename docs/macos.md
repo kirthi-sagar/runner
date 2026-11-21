@@ -74,8 +74,11 @@ Behavioral notes:
   macOS power management owns both.
 - **`runner doctor` stays red** on Linux-only checks (kernel,
   cgroups, userns) by design; mac-aware checks are a follow-up.
-- **No Linux guests**: spec §3.5's Virtualization.framework guests are
-  future work; macOS runners execute mac-native steps only.
+- **No Linux guests (parked, was v1.10.0)**: Virtualization.framework
+  guests cannot boot on hosted runners (no nested virt, closed
+  not-planned upstream) and mandate an entitlement. macOS runners
+  execute mac-native steps only; see ROADMAP "Parked" for the
+  re-entry conditions.
 
 ## Test posture
 

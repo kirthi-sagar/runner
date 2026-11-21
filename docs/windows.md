@@ -2,20 +2,52 @@
 
 Two supported paths, pick one:
 
-- **Native Windows (Tier-3)**: `runner.exe`, direct unprivileged
-  subprocess dispatch, no governor/sandbox. See below.
+- **Native Windows (Tier-3 + governor)**: `runner.exe`, direct
+  unprivileged subprocess dispatch governed by Job Objects (v2.0.0).
+  See below.
 - **Windows via WSL2**: full Linux guest with governor + sandbox.
   See "Windows via WSL2" further down.
 
-## Native Windows (Tier-3 degraded mode)
+## Native Windows (Tier-3 + governor)
 
-Supported: Tier-3 dispatch (direct unprivileged subprocess) and the
-WireGuard mesh transport (UDP + STUN work unchanged on Windows).
+Supported: Tier-3 dispatch (direct unprivileged subprocess), the
+WireGuard mesh transport (UDP + STUN work unchanged on Windows),
+and the Job Objects governor (v2.0.0 — see "Windows governor").
 
 Unsupported — every item logs loudly at the point of use, never
-silently: the governor (no PSI, no cgroups), Tier-2 sandboxing (no
-Linux namespaces), Tier-1 microVMs (no Firecracker/KVM), daemon IPC
-(no Unix domain sockets), and `runner top` (no `/proc` telemetry).
+silently: Tier-2 sandboxing (no Linux namespaces), Tier-1 microVMs
+(no Firecracker/KVM), daemon IPC (no Unix domain sockets), and
+`runner top` (no `/proc` telemetry).
+
+## Windows governor (Job Objects, v2.0.0)
+
+Unprivileged Win32 throughout: no entitlements, no drivers, no
+hypervisor. Three layers, mirroring the Linux governor:
+
+- **Sensor.** Memory pressure from `GlobalMemoryStatusEx` (load
+  percentage plus commit-limit headroom); CPU utilization from
+  `GetSystemTimes` deltas across two samples. Readings map onto the
+  existing `Normal`/`Warning`/`Critical` ladder and feed the shared
+  `tick_weight` policy unchanged — only the numbers are Windows'.
+- **Actuator.** One Job Object per worker tree: processes are
+  assigned post-spawn (grandchildren inherit membership), memory
+  ceilings ride `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, and CPU
+  share rides weight-based rate control. Throttling model:
+  Normal → weight 9, Warning → weight 5, Critical → weight 1
+  (trickle, never zero — the never-freeze invariant holds: weights
+  only matter under contention and can never starve a job the way
+  a hard cap could). `KILL_ON_JOB_CLOSE` guarantees no orphaned
+  workers when the runner exits.
+- **Supervisor loop.** Same 250ms cadence as Linux: sample,
+  classify, apply, publish. Shutdown via `ctrl_c`.
+
+Two invariants worth knowing. First, nesting: if the runner itself
+runs inside a job (CI agents, services), worker assignment nests by
+default on Windows 8+ — no breakaway flags needed — provided we
+never set UI restrictions (we don't, ever). Second, failure posture:
+a failed assignment or limit logs loudly and the job continues
+governed-direct, exactly like the Linux userns soft-fail; nothing
+in the governor path can fail a healthy job.
 
 Install (no admin rights required):
 
@@ -24,22 +56,21 @@ irm https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.ps1 | iex
 ```
 
 Then restart the terminal and run `runner doctor`. Expected output
-marks the unsupported subsystems explicitly — `kernel` and
-`cgroupsv2` report `feature unavailable on Windows`, and daemon IPC
-shows absent. Those entries are normal on this tier, not defects.
+marks the unsupported subsystems explicitly — `kernel` reports
+`feature unavailable on Windows`, `cgroupsv2` reports the governor
+`active (Job Objects)`, and daemon IPC shows absent. Those entries
+are normal on this tier, not defects.
 
 Known limitations:
 
-- `runner init` accepts governor config, but it is ignored on
-  Windows (the governor never starts).
 - `runner top` exits with an `unsupported on Windows` message.
-- `runner start` (daemon) refuses to start: without IPC sockets and
-  a governor there is nothing useful to supervise. `runner exec` is
-  the supported entry point.
+- `runner start` (daemon) refuses to start: without IPC sockets
+  there is nothing useful to supervise. `runner exec` is the
+  supported entry point.
 
-Future (v2.0): Job Object governor, WFP egress filtering, and a
-native sandbox backend. Every current stub logs its feature name so
-the v2.0 work can be harvested by grep.
+Future (v2.1+): WFP egress filtering and a native sandbox backend.
+Every remaining stub logs its feature name so the work can be
+harvested by grep.
 
 ## Windows via WSL2
 

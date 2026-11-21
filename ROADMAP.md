@@ -34,6 +34,21 @@ services or heavyweight frameworks.
 - Profile allows writes to system temp dirs + `$TMPDIR`.
 - `doctor` reports `active (Seatbelt)` when the facility probes working.
 
+## Parked: macOS Tier-1 microVM (was v1.10.0)
+
+Live Virtualization.framework guests are parked, not cancelled. Two
+independent blockers, both verified against primary sources: GitHub
+closed nested virtualization for Apple Silicon hosted runners as
+not-planned (`actions/runner-images#13505`), so `kern.hv_support` is
+0 on `macos-latest` and a VZ guest cannot boot in CI — shipping it
+would violate "CI proves what ships"; and the framework mandates the
+`com.apple.security.virtualization` entitlement, against the
+zero-entitlements invariant. Re-entry when either GitHub enables
+nested virt or the project accepts a self-hosted Mac for Tier-1
+verification. The macOS track resumes at Tier-2 Seatbelt (✅) as the
+isolation story; the Windows governor (v2.0.0) goes next because it
+is fully provable on hosted runners.
+
 ## Shipped in v1.9.0: macOS Seatbelt Tier-2
 
 - `seatbelt.rs`: sandbox_check nesting guard, in-memory profile builder.

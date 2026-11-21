@@ -149,6 +149,16 @@ pub fn apply_profile(profile: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Seatbelt escaping, mirrored for expectations: `Path::join`
+    /// uses native separators, so Windows joins contain backslashes
+    /// that the builder must double. (The builder only ever runs on
+    /// macOS in production; this keeps the logic test cross-platform.)
+    fn esc(path: &std::path::Path) -> String {
+        path.to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    }
+
     #[test]
     fn profile_builder_embeds_workspace_and_home_rules() {
         let ws = std::path::Path::new("/private/tmp/ws-1");
@@ -157,27 +167,28 @@ mod tests {
         assert!(!profile.is_empty());
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(allow default)"));
-        assert!(profile.contains("/private/tmp/ws-1"));
+        assert!(profile.contains(&esc(ws)), "missing workspace:\n{profile}");
         for leaf in [".ssh", ".gnupg", ".config/runner", ".runner"] {
+            let expect = esc(&home.join(leaf));
             assert!(
-                profile.contains(&format!("/Users/test/{leaf}")),
+                profile.contains(&expect),
                 "missing home rule for {leaf}:\n{profile}"
             );
         }
         // Paths with quotes stay syntactically intact.
-        let quoted = build_profile(
-            std::path::Path::new("/tmp/we\"ird"),
-            Some(std::path::Path::new("/Users/q\"x")),
-        );
-        assert!(quoted.contains("/tmp/we\\\"ird"));
-        assert!(quoted.contains("/Users/q\\\"x/.ssh"));
+        let qws = std::path::Path::new("/tmp/we\"ird");
+        let qhome = std::path::Path::new("/Users/q\"x");
+        let quoted = build_profile(qws, Some(qhome));
+        assert!(quoted.contains(&esc(qws)));
+        assert!(quoted.contains(&esc(&qhome.join(".ssh"))));
     }
 
     #[test]
     fn profile_builder_omits_home_rules_without_home() {
-        let profile = build_profile(std::path::Path::new("/private/tmp/ws-2"), None);
+        let ws = std::path::Path::new("/private/tmp/ws-2");
+        let profile = build_profile(ws, None);
         assert!(!profile.is_empty());
-        assert!(profile.contains("/private/tmp/ws-2"));
+        assert!(profile.contains(&esc(ws)));
         assert!(!profile.contains(".ssh"));
     }
 

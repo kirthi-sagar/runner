@@ -19,7 +19,9 @@ use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 
 use crate::microvm::{probe_kvm, MicroVmConfig, MicroVmSupervisor};
-use crate::mounts::{probe_userns, sanitize_job_id, Workspace};
+#[cfg(not(target_os = "macos"))]
+use crate::mounts::probe_userns;
+use crate::mounts::{sanitize_job_id, Workspace};
 use runner_core::governor::darwin::QosBackend;
 
 /// Isolation tier selector.

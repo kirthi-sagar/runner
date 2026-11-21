@@ -154,7 +154,7 @@ impl AgentTools for CliAgentTools {
                 )))
             }
         };
-        let sock = resolve_sock_path();
+        let sock = self.sock();
         let res = ipc_call_with(&sock, method, params).await.map_err(|_| {
             ToolError::internal(format!("daemon not reachable at {}", sock.display()))
         })?;
@@ -188,7 +188,7 @@ impl AgentTools for CliAgentTools {
     async fn cache_stats(&self) -> Result<serde_json::Value, ToolError> {
         // Same split as manage_cloud: the daemon owns the store, so this
         // goes over daemon IPC — the same method `runner cache` uses.
-        let sock = resolve_sock_path();
+        let sock = self.sock();
         let res = ipc_call_with(&sock, "cache_stats", None)
             .await
             .map_err(|_| {

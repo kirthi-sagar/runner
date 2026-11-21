@@ -6,6 +6,15 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.9.0 — 2026-11-21
+
+- macOS Tier-2 sandbox via Apple Seatbelt: `sandbox_init` FFI in the
+  `pre_exec` child hook, no entitlements required.
+- In-memory job profiles: credentials/config unreadable, writes
+  confined to the job workspace, network outbound open.
+- Nesting guard (`sandbox_check`) and soft-fail on apply errors;
+  `sandbox_init` deprecation documented as future-removal risk.
+
 ## v1.8.1 — 2026-11-21
 
 - Native `windows-latest` CI (6th green job): the full hermetic suite now

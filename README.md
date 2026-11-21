@@ -3,7 +3,7 @@
 [![CI](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/kirthi-sagar/runner?color=blue&label=release)](https://github.com/kirthi-sagar/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/kirthi-sagar/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-452%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-453%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)

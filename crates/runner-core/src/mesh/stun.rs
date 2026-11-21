@@ -205,6 +205,16 @@ fn decode_xor_mapped(value: &[u8], txid: &[u8; STUN_TXID_LEN]) -> Result<SocketA
     Ok(SocketAddr::new(ip, port))
 }
 
+/// True when a recv error means "nobody is listening" (ICMP
+/// port-unreachable surfaced as refused/reset) rather than a broken
+/// socket: the server counts as silent, not fatal.
+fn is_silence(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 /// Discover this socket's reflexive address against one STUN server:
 /// send a Binding Request, await the matching response, resend up to
 /// [`STUN_ATTEMPTS`] times. The socket must be dedicated to this call
@@ -236,6 +246,17 @@ pub async fn discover_reflexive_addr(
                     }
                 }
             },
+            Ok(Err(e)) if is_silence(&e) => {
+                // ICMP port-unreachable (nothing listening): Windows
+                // surfaces it as a recv error where Unix times out.
+                // Same meaning — the server is silent — so pay a
+                // retry like a timeout instead of failing fast.
+                if attempt + 1 == STUN_ATTEMPTS {
+                    return Err(format!(
+                        "STUN server {server} silent after {STUN_ATTEMPTS} attempts"
+                    ));
+                }
+            }
             Ok(Err(e)) => return Err(format!("STUN receive failed: {e}")),
             Err(_) => {
                 if attempt + 1 == STUN_ATTEMPTS {
@@ -484,5 +505,16 @@ mod tests {
         assert!(same_subnet(v6a, v6b));
         assert!(!same_subnet(v6a, v6c));
         assert!(!same_subnet(a, v6a));
+    }
+
+    #[test]
+    fn silence_covers_refused_and_reset_only() {
+        use std::io::{Error, ErrorKind::*};
+        for kind in [ConnectionRefused, ConnectionReset] {
+            assert!(is_silence(&Error::new(kind, "x")), "{kind:?} is silence");
+        }
+        for kind in [TimedOut, Interrupted, UnexpectedEof, BrokenPipe] {
+            assert!(!is_silence(&Error::new(kind, "x")), "{kind:?} is fatal");
+        }
     }
 }

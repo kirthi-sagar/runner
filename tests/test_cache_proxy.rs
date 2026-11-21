@@ -425,9 +425,31 @@ async fn oversize_chunk_is_rejected_without_buffering() {
     .header("content-range", "bytes 0-34603007/*")
     .body(big)
     .send()
-    .await
-    .unwrap();
-    assert_eq!(res.status().as_u16(), 413);
+    .await;
+    match res {
+        Ok(res) => assert_eq!(res.status().as_u16(), 413),
+        // The server 413s without reading the 33 MiB body and closes;
+        // Windows delivers that close as a RST, so the client surfaces
+        // a connection error instead of ever reading the status line.
+        // Prove the rejection another way: the server is still alive
+        // and staged nothing.
+        Err(e) => {
+            let probe = http
+                .get(format!(
+                    "{base}/_apis/artifactcache/cache?keys=warm&version=v"
+                ))
+                .header("authorization", format!("Bearer {}", state.token))
+                .send()
+                .await
+                .expect("proxy must stay alive after rejecting oversize chunk");
+            assert_eq!(probe.status().as_u16(), 204, "upload error: {e}");
+        }
+    }
+    assert_eq!(
+        state.store.staged_len(id).unwrap_or(0),
+        0,
+        "oversize chunk must leave nothing buffered"
+    );
 }
 
 /// Reserve → single chunk → commit under `prefix` ("" for the legacy

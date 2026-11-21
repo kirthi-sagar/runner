@@ -1,8 +1,9 @@
-//! Local Unix domain socket API.
+//! Local daemon API: Unix domain sockets on unix, named pipes on Windows.
 //!
 //! Listens on [`SOCK_PATH`] (`/run/runner.sock`), falling back to
-//! `~/.runner/runner.sock` when unprivileged. Sockets are created with
-//! `0600` owner-only permissions. Requests are newline-delimited JSON-RPC:
+//! `~/.runner/runner.sock` when unprivileged; on Windows it listens on
+//! [`PIPE_NAME`]. Unix sockets are created with `0600` owner-only
+//! permissions. Requests are newline-delimited JSON-RPC either way:
 //! `ping` (liveness), `status` (host telemetry), `peers`, `join`,
 //! `snapshot` (daemon state for `runner top`), and `poll_now` (wake the
 //! coordinator for instant dispatch).
@@ -13,10 +14,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, ServerOptions};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
 use crate::governor::supervisor::SharedState;
 
@@ -29,6 +35,7 @@ pub fn fallback_sock_path() -> Option<PathBuf> {
 }
 
 /// Pick the privileged path when its parent is writable, else the fallback.
+#[cfg(not(windows))]
 pub fn resolve_sock_path() -> PathBuf {
     let primary = PathBuf::from(SOCK_PATH);
     if let Some(parent) = primary.parent() {
@@ -40,6 +47,42 @@ pub fn resolve_sock_path() -> PathBuf {
         }
     }
     fallback_sock_path().unwrap_or(primary)
+}
+
+/// Well-known production pipe. Callers pass paths through
+/// [`pipe_name_for`], so TempDir-based tests derive unique names.
+#[cfg(windows)]
+pub const PIPE_NAME: &str = r"\\.\pipe\runner-ipc";
+
+/// Windows pipe endpoint: literal `\\.\pipe\` paths pass through;
+/// anything else (test TempDirs) derives a unique name, so parallel
+/// tests never collide on one pipe.
+#[cfg(windows)]
+pub fn resolve_sock_path() -> PathBuf {
+    PathBuf::from(PIPE_NAME)
+}
+
+/// Map a socket path to its Windows pipe name (see [`resolve_sock_path`]).
+#[cfg(windows)]
+pub fn pipe_name_for(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text.starts_with(r"\\.\pipe\") {
+        return text.into_owned();
+    }
+    let stem: String = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!(r"\\.\pipe\runner-test-{stem}")
 }
 
 /// Handle one IPC request value.
@@ -393,9 +436,14 @@ pub fn throttle_weight_for_level(level: &str) -> Option<u32> {
     }
 }
 
-#[cfg(unix)]
-async fn serve_conn(stream: UnixStream, state: SharedState) -> io::Result<()> {
-    let (reader, mut writer) = stream.into_split();
+/// One accepted connection: newline-delimited JSON-RPC in, single
+/// JSON line per request out. Generic over the byte stream so Unix
+/// sockets and Windows named pipes share framing.
+async fn serve_conn<S>(stream: S, state: SharedState) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -420,9 +468,10 @@ pub struct IpcServer {
     path: PathBuf,
     #[cfg(unix)]
     listener: UnixListener,
-    // Unread on Windows (`bind` fails before serving); kept so the
-    // public shape stays identical across platforms.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// Named-pipe instances are created per accept (no persistent
+    /// listener object), so the server only retains the name.
+    #[cfg(windows)]
+    pipe_name: String,
     state: SharedState,
 }
 
@@ -443,15 +492,21 @@ impl IpcServer {
         })
     }
 
-    /// Windows has no Unix domain sockets; the daemon IPC server
-    /// cannot bind. Loud by design: every stub names its placeholder.
+    /// Bind the named pipe for `path` (see [`pipe_name_for`]). A
+    /// probe instance validates the name up front with
+    /// first-pipe-instance exclusivity (pipes leave no stale files,
+    /// so a taken name always means a live daemon).
     #[cfg(windows)]
-    pub async fn bind(_path: &Path, _state: SharedState) -> io::Result<Self> {
-        eprintln!("[runner] unsupported on Windows: IPC (Unix domain socket)");
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "unsupported on Windows: IPC (Unix domain socket)",
-        ))
+    pub async fn bind(path: &Path, state: SharedState) -> io::Result<Self> {
+        let pipe_name = pipe_name_for(path);
+        let mut probe_opts = ServerOptions::new();
+        probe_opts.first_pipe_instance(true);
+        let _probe = probe_opts.create(&pipe_name)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            pipe_name,
+            state,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -472,15 +527,21 @@ impl IpcServer {
         }
     }
 
-    /// Unreachable: `bind` already fails on Windows, but the signature
-    /// must exist for unconditional callers.
+    /// Accept loop; runs until instance creation fails fatally. Each
+    /// iteration creates one server instance, waits for a client,
+    /// then hands it to a task and loops for the next.
     #[cfg(windows)]
     pub async fn serve(&self) -> io::Result<()> {
-        eprintln!("[runner] unsupported on Windows: IPC (Unix domain socket)");
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "unsupported on Windows: IPC (Unix domain socket)",
-        ))
+        loop {
+            let pipe = ServerOptions::new().create(&self.pipe_name)?;
+            pipe.connect().await?;
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_conn(pipe, state).await {
+                    eprintln!("runner: ipc connection error: {e}");
+                }
+            });
+        }
     }
 }
 
@@ -495,18 +556,27 @@ pub async fn ipc_call_with(path: &Path, method: &str, params: Option<Value>) -> 
     ipc_call_with_inner(path, method, params).await
 }
 
-/// Windows has no Unix domain sockets; IPC calls fail loudly.
+/// Windows client: open the pipe for `path` (same name rule as
+/// the server, so TempDir tests dial their own instance). A missing
+/// pipe fails fast (no daemon); a busy pipe retries briefly while
+/// the server recreates its accept instance.
 #[cfg(windows)]
-pub async fn ipc_call_with(
-    _path: &Path,
-    _method: &str,
-    _params: Option<Value>,
-) -> io::Result<Value> {
-    eprintln!("[runner] unsupported on Windows: IPC (Unix domain socket)");
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "unsupported on Windows: IPC (Unix domain socket)",
-    ))
+pub async fn ipc_call_with(path: &Path, method: &str, params: Option<Value>) -> io::Result<Value> {
+    let name = pipe_name_for(path);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let stream: NamedPipeClient = loop {
+        match ClientOptions::new().open(&name) {
+            Ok(client) => break client,
+            Err(e)
+                if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    ipc_roundtrip(stream, method, params).await
 }
 
 #[cfg(unix)]
@@ -516,7 +586,16 @@ async fn ipc_call_with_inner(
     params: Option<Value>,
 ) -> io::Result<Value> {
     let stream = UnixStream::connect(path).await?;
-    let (reader, mut writer) = stream.into_split();
+    ipc_roundtrip(stream, method, params).await
+}
+
+/// One JSON-RPC exchange over any byte stream; shared by the Unix
+/// and Windows clients so framing can never drift apart.
+async fn ipc_roundtrip<S>(stream: S, method: &str, params: Option<Value>) -> io::Result<Value>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut req = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method });
     if let Some(params) = params {
         req["params"] = params;
@@ -543,20 +622,27 @@ mod tests {
     async fn ping_roundtrip_over_socket() {
         let dir = crate::test_support::TempDir::new("ipc").unwrap();
         let path = dir.path().join("runner.sock");
-        // No Unix domain sockets on Windows: `bind` must fail loudly.
-        if cfg!(windows) {
-            let err = match IpcServer::bind(&path, new_shared_state()).await {
-                Ok(_) => panic!("IpcServer::bind must fail on Windows"),
-                Err(e) => e,
-            };
-            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-            return;
-        }
         let server = std::sync::Arc::new(IpcServer::bind(&path, new_shared_state()).await.unwrap());
         let task = tokio::spawn(async move { server.serve().await });
         let res = ipc_call(&path, "ping").await.unwrap();
         assert_eq!(res["result"], "pong");
         task.abort();
+    }
+
+    // Pipe names: production marker passes through literally, test
+    // paths derive unique names that never collide with it.
+    #[cfg(windows)]
+    #[test]
+    fn pipe_name_for_routes_production_and_tests() {
+        use std::path::Path;
+        assert_eq!(
+            pipe_name_for(Path::new(r"\\.\pipe\runner-ipc")),
+            r"\\.\pipe\runner-ipc"
+        );
+        let derived = pipe_name_for(Path::new(r"C:\Temp\runner-test-1\runner.sock"));
+        assert!(derived.starts_with(r"\\.\pipe\runner-test-"), "{derived}");
+        assert!(derived.contains("runner.sock"), "{derived}");
+        assert_ne!(derived, PIPE_NAME);
     }
 
     #[cfg(unix)]

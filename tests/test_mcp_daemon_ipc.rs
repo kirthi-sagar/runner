@@ -21,23 +21,6 @@ fn call(id: u64, name: &str, args: serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// Windows has no Unix domain sockets: daemon IPC tests assert the
-/// loud `bind` refusal instead of socket behavior.
-async fn assert_daemon_ipc_unsupported(tag: &str) {
-    let dir = TempDir::new(tag).unwrap();
-    let sock = dir.path().join("daemon.sock");
-    // (`match`, not `unwrap_err`: `IpcServer` is not `Debug`.)
-    let err = match IpcServer::bind(&sock, new_shared_state()).await {
-        Ok(_) => panic!("IpcServer::bind must fail on Windows"),
-        Err(e) => e,
-    };
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    assert_eq!(
-        err.to_string(),
-        "unsupported on Windows: IPC (Unix domain socket)"
-    );
-}
-
 /// Unwrap the text content block MCP renders tool results into.
 fn content_text(res: &serde_json::Value) -> serde_json::Value {
     let text = res["result"]["content"][0]["text"]
@@ -91,10 +74,6 @@ impl DaemonHarness {
 
 #[tokio::test]
 async fn reserve_mutates_live_daemon_state() {
-    if cfg!(windows) {
-        assert_daemon_ipc_unsupported("mcp-ipc-reserve").await;
-        return;
-    }
     let h = DaemonHarness::new("mcp-ipc-reserve").await;
     let out = h
         .tool(
@@ -142,10 +121,6 @@ async fn reserve_mutates_live_daemon_state() {
 
 #[tokio::test]
 async fn throttle_and_drain_hit_live_daemon_state() {
-    if cfg!(windows) {
-        assert_daemon_ipc_unsupported("mcp-ipc-throttle").await;
-        return;
-    }
     let h = DaemonHarness::new("mcp-ipc-throttle").await;
     let out = h
         .tool(
@@ -178,10 +153,6 @@ async fn throttle_and_drain_hit_live_daemon_state() {
 
 #[tokio::test]
 async fn status_tools_read_live_daemon_state() {
-    if cfg!(windows) {
-        assert_daemon_ipc_unsupported("mcp-ipc-status").await;
-        return;
-    }
     let h = DaemonHarness::new("mcp-ipc-status").await;
     // Seed daemon-side state directly, then observe it via MCP.
     h.tool(
@@ -236,10 +207,6 @@ async fn cloud_capacity_denial_matches_local_shape() {
     // Zero spend cap: denial without provisioning on either path.
     // The daemon pool is unset here, so the arm denies before touching
     // any provider API.
-    if cfg!(windows) {
-        assert_daemon_ipc_unsupported("mcp-ipc-cloud").await;
-        return;
-    }
     let h = DaemonHarness::new("mcp-ipc-cloud").await;
     let out = h
         .tool(

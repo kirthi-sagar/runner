@@ -6,6 +6,13 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.0.1 — 2026-11-21
+
+- Fix Firecracker API client hang: frame HTTP responses by headers
+  + Content-Length instead of waiting for EOF (the server answers
+  keep-alive and never closes). Bounded 30s reads, fail-closed caps.
+- Live KVM harness proven green on real hardware for the first time.
+
 ## v2.0.0 — 2026-11-21
 
 - Native Windows governor via Job Objects: Win32 pressure sensing

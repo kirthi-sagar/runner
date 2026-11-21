@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.0.0 and prior)
+## Shipped (v2.0.1 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -29,8 +29,14 @@ services or heavyweight frameworks.
 - macOS Seatbelt Tier-2: sandbox_init FFI, job profiles, pre_exec hook (v1.9.0).
 - Seatbelt TMPDIR carve-out + doctor Tier-2 verdict fix (v1.9.1).
 - Native Windows Job Objects governor: Win32 sensing, weight ladder (v2.0.0).
+- Firecracker HTTP framing fix: header/Content-Length reads (v2.0.1).
 
-## Current: v2.0.0 (Windows Job Objects Governor)
+## Current: v2.0.1 (Firecracker Framing Fix)
+
+- `put_inner` frames responses; keep-alive no longer hangs Tier-1.
+- Live KVM harness verified green on real hardware.
+
+## Shipped in v2.0.0: Windows Job Objects Governor
 
 - `governor::windows`: sensor, RAII job manager, 9/5/1 weights.
 - Worker trees auto-contained; `doctor` reports governor active.
@@ -52,8 +58,8 @@ would violate "CI proves what ships"; and the framework mandates the
 zero-entitlements invariant. Re-entry when either GitHub enables
 nested virt or the project accepts a self-hosted Mac for Tier-1
 verification. The macOS track resumes at Tier-2 Seatbelt (✅) as the
-isolation story; the Windows governor (v2.0.0) goes next because it
-is fully provable on hosted runners.
+isolation story; the Windows governor (v2.0.0) shipped first because
+it is fully provable on hosted runners.
 
 ## Shipped in v1.9.0: macOS Seatbelt Tier-2
 

@@ -27,10 +27,17 @@ fn governor_table_boundaries() {
 
 #[test]
 fn snapshot_reads_from_directory() {
+    // Warning on every platform's bands (PSI stall % vs Win32 %).
+    #[cfg(not(windows))]
+    let cpu_avg = "30.00";
+    #[cfg(windows)]
+    let cpu_avg = "80.00";
     let dir = runner::test_support::TempDir::new("psi").unwrap();
     std::fs::write(
         dir.path().join("cpu"),
-        "some avg10=30.00 avg60=0 avg300=0 total=1\nfull avg10=0.00 avg60=0 avg300=0 total=0\n",
+        format!(
+            "some avg10={cpu_avg} avg60=0 avg300=0 total=1\nfull avg10=0.00 avg60=0 avg300=0 total=0\n"
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -44,6 +51,6 @@ fn snapshot_reads_from_directory() {
     )
     .unwrap();
     let snapshot = read_snapshot_from(dir.path()).unwrap();
-    assert_eq!(snapshot.cpu_some_avg10(), 30.0);
+    assert_eq!(snapshot.cpu_some_avg10(), cpu_avg.parse::<f64>().unwrap());
     assert_eq!(snapshot.cpu_pressure(), PressureLevel::Warning);
 }

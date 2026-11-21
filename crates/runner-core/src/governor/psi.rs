@@ -353,10 +353,15 @@ mod tests {
 
     #[test]
     fn snapshot_keys_cpu_off_some_only() {
+        // Critical on every platform's bands (PSI stall % vs Win32 %).
+        #[cfg(not(windows))]
+        let avg = 50.0;
+        #[cfg(windows)]
+        let avg = 95.0;
         let snapshot = PsiSnapshot {
             cpu: PsiFile {
                 some: PsiLine {
-                    avg10: 50.0,
+                    avg10: avg,
                     ..Default::default()
                 },
                 full: PsiLine {
@@ -366,7 +371,7 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(snapshot.cpu_some_avg10(), 50.0);
+        assert_eq!(snapshot.cpu_some_avg10(), avg);
         assert_eq!(snapshot.cpu_pressure(), PressureLevel::Critical);
     }
 

@@ -1,0 +1,104 @@
+//! macOS Seatbelt FFI: Tier-2 filesystem isolation via `sandbox_init`.
+//!
+//! The child-side half of Tier-2 on macOS. The parent never enters a
+//! sandbox; the `pre_exec` hook ([`crate::driver`] through
+//! `install_child_hook`) applies a profile to each job child after
+//! fork and before exec, so every job process is confined while the
+//! coordinator stays free.
+//!
+//! Two libc-level facts shape this module (both verified against
+//! current production users, not just the man pages):
+//!
+//! * `sandbox_init` takes a full profile *string* with flags `0`
+//!   (Chromium passes `0` with profile strings; the header's
+//!   SANDBOX_NAMED-only note covers the canned `kSBXProfile*`
+//!   constants instead). If the process is already sandboxed the new
+//!   profile is ignored and `sandbox_init` returns an error —
+//!   hence the [`is_sandboxed`] guard before every apply.
+//! * `sandbox_check` itself is *not* deprecated. The canonical
+//!   nesting probe is `sandbox_check(getpid(), NULL,
+//!   SANDBOX_FILTER_NONE)` which returns 1 when sandboxed
+//!   (Chromium's documented pattern, mirrored by Homebrew's
+//!   `nested_sandbox?`).
+//!
+//! No `<sandbox.h>` is included anywhere: the declarations below are
+//! hand-rolled Rust FFI, which also sidesteps the C compiler's
+//! deprecation warning on `sandbox_init`/`sandbox_free_error`.
+//! Deprecation is a documented future-removal risk (see
+//! `docs/macos.md`), not a blocker: Seatbelt remains the sandbox
+//! backend for Homebrew, Claude Code, Codex CLI, and Cursor.
+//!
+//! Gating split: every FFI item is `#[cfg(target_os = "macos")]` so
+//! no Apple symbol leaks onto other platforms, while the module
+//! itself (and the pure profile builder) stays ungated so the
+//! builder logic is unit-testable without a Mac.
+
+#[cfg(target_os = "macos")]
+use std::ffi::{c_char, c_int, CStr, CString};
+
+#[cfg(target_os = "macos")]
+#[link(name = "sandbox", kind = "dylib")]
+extern "C" {
+    fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
+    fn sandbox_free_error(errorbuf: *mut c_char);
+    fn sandbox_check(pid: i32, operation: *const c_char, type_: c_int, ...) -> c_int;
+}
+
+/// Flags for `sandbox_init` with a full profile string: 0.
+/// (The header reserves every value except SANDBOX_NAMED, but 0 with
+/// a profile string is the established production usage.)
+#[cfg(target_os = "macos")]
+const SANDBOX_PROFILE_STRING: u64 = 0;
+
+/// `SANDBOX_FILTER_NONE` for [`is_sandboxed`]: the filter argument is
+/// currently unused by the kernel for a NULL operation probe.
+#[cfg(target_os = "macos")]
+const SANDBOX_FILTER_NONE: c_int = 0;
+
+/// True when the current process is already inside a Seatbelt sandbox.
+/// Never fails; a NULL operation probe only inspects, never confines.
+#[cfg(target_os = "macos")]
+pub fn is_sandboxed() -> bool {
+    // SAFETY: canonical probe — NULL operation with FILTER_NONE
+    // performs no dereference; the pid is our own.
+    unsafe {
+        sandbox_check(
+            std::process::id() as i32,
+            std::ptr::null(),
+            SANDBOX_FILTER_NONE,
+        ) == 1
+    }
+}
+
+/// Apply a Seatbelt profile string to the current process.
+/// Irreversible: success confines this process (and its future
+/// children) until exit, so callers apply it only to job children in
+/// `pre_exec`, never to the coordinator. On failure returns the
+/// system's own diagnostic message.
+#[cfg(target_os = "macos")]
+pub fn apply_profile(profile: &str) -> Result<(), String> {
+    let c_profile =
+        CString::new(profile).map_err(|e| format!("seatbelt profile contains NUL: {e}"))?;
+    let mut errorbuf: *mut c_char = std::ptr::null_mut();
+    // SAFETY: NUL-terminated profile; `errorbuf` is a valid out-pointer.
+    let rc = unsafe { sandbox_init(c_profile.as_ptr(), SANDBOX_PROFILE_STRING, &mut errorbuf) };
+    if rc == 0 {
+        // The header promises NULL on success; free defensively if a
+        // future OS ever populates it, so success never leaks.
+        if !errorbuf.is_null() {
+            // SAFETY: non-null buffer came from `sandbox_init`.
+            unsafe { sandbox_free_error(errorbuf) };
+        }
+        return Ok(());
+    }
+    if errorbuf.is_null() {
+        return Err("sandbox_init failed without diagnostics".to_string());
+    }
+    // SAFETY: the header guarantees a NUL-terminated buffer on failure.
+    let message = unsafe { CStr::from_ptr(errorbuf) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: buffer came from `sandbox_init`; exactly one free.
+    unsafe { sandbox_free_error(errorbuf) };
+    Err(message)
+}

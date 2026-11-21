@@ -6,5 +6,6 @@ pub mod ebpf;
 pub mod microvm;
 pub mod mounts;
 pub mod network;
+pub mod seatbelt;
 pub mod vsock;
 pub mod worker;

@@ -37,7 +37,9 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetSystemTimes;
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+};
 
 /// One Windows Job Object, closed on drop. Handles are never leaked:
 /// every constructor funnels through [`JobObject::create`], and
@@ -325,12 +327,16 @@ fn create_system_job() -> io::Result<JobObject> {
     Ok(job)
 }
 
-/// Open a process with exactly the rights assignment needs
-/// (`PROCESS_SET_QUOTA | PROCESS_TERMINATE`, per the API docs).
+/// Open a process with the rights assignment and membership
+/// queries need: `PROCESS_SET_QUOTA | PROCESS_TERMINATE` for
+/// `AssignProcessToJobObject`, plus `PROCESS_QUERY_LIMITED_INFORMATION`
+/// for `IsProcessInJob` (without it the query fails with
+/// access-denied — observed live on windows-latest).
 fn open_process(pid: u32) -> io::Result<OwnedHandle> {
     // SAFETY: no handle to close on failure (null return); on
     // success ownership moves into `OwnedHandle` exactly once.
-    let raw = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+    let rights = PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let raw = unsafe { OpenProcess(rights, 0, pid) };
     if raw.is_null() {
         return Err(last_error("OpenProcess"));
     }

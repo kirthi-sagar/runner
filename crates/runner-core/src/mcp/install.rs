@@ -131,8 +131,15 @@ mod tests {
         assert_eq!(McpTarget::from_name("GENERIC").unwrap(), McpTarget::Generic);
         assert!(McpTarget::from_name("antigravity").is_err());
         assert!(default_target_path(McpTarget::Generic).is_none());
-        let cursor = default_target_path(McpTarget::Cursor).unwrap();
-        assert!(cursor.ends_with(".cursor/mcp.json"));
+        // HOME is set under Unix cargo test; Windows CI leaves it
+        // unset, and the path must be absent exactly then.
+        match default_target_path(McpTarget::Cursor) {
+            Some(cursor) => assert!(cursor.ends_with(".cursor/mcp.json")),
+            None => assert!(
+                std::env::var_os("HOME").is_none(),
+                "cursor path missing while HOME is set"
+            ),
+        }
     }
 
     #[test]

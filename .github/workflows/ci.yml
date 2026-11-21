@@ -19,7 +19,7 @@ jobs:
       matrix:
         # macos-latest is Apple Silicon (ARM); it gates portability
         # (fmt/clippy/build) plus the live Darwin syscall tests, while
-        # the full hermetic suite stays Linux-only.
+        # the full hermetic suite runs on Linux and native Windows.
         os: [ubuntu-22.04, ubuntu-latest, macos-latest]
     steps:
       - name: Checkout repository
@@ -141,3 +141,37 @@ jobs:
         with:
           name: runner-windows-x86_64
           path: target/x86_64-pc-windows-gnu/release/runner.exe
+
+  windows-native:
+    name: Native Windows (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format verification
+        # Also proves .gitattributes delivered LF checkouts: rustfmt fails on CRLF.
+        run: cargo fmt --all -- --check
+
+      - name: Linting & static analysis
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run automated test suite (native)
+        run: cargo test --workspace --all-features
+
+      - name: install.ps1 smoke (documented native install path)
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          ./install.ps1
+          $exe = Join-Path $env:LOCALAPPDATA 'runner\runner.exe'
+          if (-not (Test-Path $exe)) { throw "runner.exe missing after install.ps1" }
+          & $exe --version

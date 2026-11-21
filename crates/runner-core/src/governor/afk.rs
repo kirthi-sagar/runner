@@ -267,6 +267,8 @@ mod tests {
         assert!(!session_is_idle(&broken, 300, now));
     }
 
+    // Executes a POSIX shell stub; AFK probing is unsupported on Windows.
+    #[cfg(unix)]
     #[test]
     fn probe_uses_stub_binary_and_fails_safe() {
         // Stub loginctl: one idle graphical session.

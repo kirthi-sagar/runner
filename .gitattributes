@@ -1,0 +1,4 @@
+# Normalize line endings to LF on checkout on every platform. Without this,
+# a Windows checkout converts text files to CRLF, which breaks shell-fixture
+# tests and stdout assertions that expect `\n` (v1.8.1 native windows CI).
+* text=auto eol=lf

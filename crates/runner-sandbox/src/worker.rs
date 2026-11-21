@@ -374,19 +374,37 @@ mod tests {
     #[test]
     fn jit_launch_argv_has_no_config_step() {
         let launch = WorkerLaunch::new("/tmp/w".into(), "BLOB");
+        #[cfg(unix)]
         assert_eq!(launch.argv(), vec!["./run.sh", "--jitconfig", "BLOB"]);
+        #[cfg(windows)]
+        assert_eq!(launch.argv(), vec!["run.cmd", "--jitconfig", "BLOB"]);
     }
 
     #[test]
     fn release_asset_names_match_github() {
+        #[cfg(unix)]
         assert_eq!(
             tarball_name("2.338.2", "x64"),
             "actions-runner-linux-x64-2.338.2.tar.gz"
         );
+        #[cfg(unix)]
         assert_eq!(
             release_url("2.338.2", "x64"),
             "https://github.com/actions/runner/releases/download/\
              v2.338.2/actions-runner-linux-x64-2.338.2.tar.gz"
+        );
+        // Windows assets ship as zips (verified against the live
+        // `actions/runner` release listing).
+        #[cfg(windows)]
+        assert_eq!(
+            tarball_name("2.338.2", "x64"),
+            "actions-runner-win-x64-2.338.2.zip"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            release_url("2.338.2", "x64"),
+            "https://github.com/actions/runner/releases/download/\
+             v2.338.2/actions-runner-win-x64-2.338.2.zip"
         );
     }
 
@@ -399,6 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)] // executes a fixture `run.sh` via the Unix shell contract
     async fn supervises_fake_worker_exit_codes() {
         // Fake worker package: a run.sh honoring --jitconfig and exiting 0/3.
         let dir = runner_core::test_support::TempDir::new("worker").unwrap();
@@ -425,6 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)] // executes a fixture `run.sh` that sleeps
     async fn kills_worker_on_timeout() {
         let dir = runner_core::test_support::TempDir::new("worker-timeout").unwrap();
         let pkg = dir.path().join("pkg");
@@ -449,6 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)] // executes a fixture `run.sh` via the Unix shell contract
     async fn supervised_spawn_applies_qos_best_effort() {
         let dir = runner_core::test_support::TempDir::new("worker-qos").unwrap();
         let pkg = dir.path().join("pkg");

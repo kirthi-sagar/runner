@@ -6,6 +6,16 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v1.8.1 — 2026-11-21
+
+- Native `windows-latest` CI (6th green job): the full hermetic suite now
+  runs on real Windows alongside Linux, closing the CI parity gap.
+- POSIX-only tests triaged for Windows: per-platform argv pairs in the
+  local-exec suite, `#[cfg(unix)]` gates on shell-fixture unit tests,
+  platform-aware worker argv/asset assertions.
+- `.gitattributes` pins LF checkouts on every platform (CRLF class fix).
+- `install.ps1` smoke runs for the first time in CI (native install path).
+
 ## v1.8.0 — 2026-11-20
 
 - Native Windows Tier-3 MVP (degraded-but-honest): the workspace

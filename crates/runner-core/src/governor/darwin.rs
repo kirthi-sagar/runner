@@ -216,6 +216,8 @@ mod tests {
         assert!(DarwinQos.background_thread().is_ok());
     }
 
+    // Spawns `true` through the unix pre_exec hook (a no-op on Windows).
+    #[cfg(unix)]
     #[tokio::test]
     async fn child_hook_calls_backend_before_sandbox_setup() {
         // End-to-end hook placement through a real spawn: the mock log
@@ -230,6 +232,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "process\n");
     }
 
+    // Spawns `true` through the unix pre_exec hook (a no-op on Windows).
+    #[cfg(unix)]
     #[tokio::test]
     async fn child_hook_best_effort_never_fails_spawn() {
         let mock = std::sync::Arc::new(MockQos::new());

@@ -10,9 +10,22 @@ fn cmd(parts: &[&str]) -> Vec<String> {
     parts.iter().map(|s| s.to_string()).collect()
 }
 
+/// Shell line ending: `cmd.exe` emits CRLF where POSIX shells emit LF.
+fn sh_line(text: &str) -> Vec<u8> {
+    #[cfg(windows)]
+    return format!("{text}\r\n").into_bytes();
+    #[cfg(unix)]
+    return format!("{text}\n").into_bytes();
+}
+
 #[tokio::test]
 async fn echo_succeeds_with_zero() {
-    let code = execute_local_sandboxed(&cmd(&["echo", "hello"]), false, Duration::from_secs(30))
+    // Unix ships /bin/echo; on Windows `echo` is cmd-internal only.
+    #[cfg(unix)]
+    let argv = cmd(&["echo", "hello"]);
+    #[cfg(windows)]
+    let argv = cmd(&["cmd", "/c", "echo", "hello"]);
+    let code = execute_local_sandboxed(&argv, false, Duration::from_secs(30))
         .await
         .unwrap();
     assert_eq!(code, 0);
@@ -20,31 +33,44 @@ async fn echo_succeeds_with_zero() {
 
 #[tokio::test]
 async fn python_computation_succeeds() {
-    let code = execute_local_sandboxed(
-        &cmd(&["python3", "-c", "print(2+2)"]),
-        false,
-        Duration::from_secs(30),
-    )
-    .await
-    .unwrap();
+    // windows-latest ships CPython as `python` (no `python3` alias).
+    #[cfg(unix)]
+    let argv = cmd(&["python3", "-c", "print(2+2)"]);
+    #[cfg(windows)]
+    let argv = cmd(&["python", "-c", "print(2+2)"]);
+    let code = execute_local_sandboxed(&argv, false, Duration::from_secs(30))
+        .await
+        .unwrap();
     assert_eq!(code, 0);
 }
 
 #[tokio::test]
 async fn exit_code_propagates_on_failure() {
-    let code = execute_local_sandboxed(
-        &cmd(&["python3", "-c", "import sys; sys.exit(7)"]),
-        true,
-        Duration::from_secs(30),
-    )
-    .await
-    .unwrap();
+    #[cfg(unix)]
+    let argv = cmd(&["python3", "-c", "import sys; sys.exit(7)"]);
+    #[cfg(windows)]
+    let argv = cmd(&["python", "-c", "import sys; sys.exit(7)"]);
+    let code = execute_local_sandboxed(&argv, true, Duration::from_secs(30))
+        .await
+        .unwrap();
     assert_eq!(code, 7);
 }
 
 #[tokio::test]
 async fn timeout_kills_and_errors() {
-    let err = execute_local_sandboxed(&cmd(&["sleep", "30"]), true, Duration::from_millis(300))
+    // No `sleep(1)` on Windows; PowerShell Start-Sleep sleeps the
+    // full duration (unlike `timeout /t`, which errors without a
+    // console on stdin).
+    #[cfg(unix)]
+    let argv = cmd(&["sleep", "30"]);
+    #[cfg(windows)]
+    let argv = cmd(&[
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "Start-Sleep -Seconds 30",
+    ]);
+    let err = execute_local_sandboxed(&argv, true, Duration::from_millis(300))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("timed out"), "{err:#}");
@@ -68,13 +94,14 @@ async fn direct_mode_inherits_caller_cwd() {
         std::process::id(),
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     );
-    let code = execute_local_sandboxed(
-        &cmd(&["sh", "-c", &format!("pwd > {marker}")]),
-        true,
-        Duration::from_secs(30),
-    )
-    .await
-    .unwrap();
+    // `cmd /c cd` prints the working directory like `pwd`.
+    #[cfg(unix)]
+    let argv = cmd(&["sh", "-c", &format!("pwd > {marker}")]);
+    #[cfg(windows)]
+    let argv = cmd(&["cmd", "/c", &format!("cd > {marker}")]);
+    let code = execute_local_sandboxed(&argv, true, Duration::from_secs(30))
+        .await
+        .unwrap();
     assert_eq!(code, 0);
     let expected = std::env::current_dir().unwrap();
     let observed = std::fs::read_to_string(expected.join(&marker)).unwrap();
@@ -85,14 +112,19 @@ async fn direct_mode_inherits_caller_cwd() {
 #[tokio::test]
 async fn capture_caps_runaway_output_at_ten_mib() {
     // 12 MiB of output; only the trailing 10 MiB may be retained.
-    let out = execute_captured(
-        &cmd(&["head", "-c", "12582912", "/dev/zero"]),
-        &[],
-        true,
-        Duration::from_secs(60),
-    )
-    .await
-    .unwrap();
+    // No `head`/`/dev/zero` on Windows; PowerShell writes the bytes.
+    #[cfg(unix)]
+    let argv = cmd(&["head", "-c", "12582912", "/dev/zero"]);
+    #[cfg(windows)]
+    let argv = cmd(&[
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "$s=[Console]::OpenStandardOutput();$b=New-Object byte[] 12582912;$s.Write($b,0,$b.Length)",
+    ]);
+    let out = execute_captured(&argv, &[], true, Duration::from_secs(60))
+        .await
+        .unwrap();
     assert_eq!(out.code, 0);
     assert_eq!(out.stdout.len(), CAPTURE_CAP_BYTES);
     assert!(out.stdout.iter().all(|&b| b == 0));
@@ -101,15 +133,14 @@ async fn capture_caps_runaway_output_at_ten_mib() {
 
 #[tokio::test]
 async fn capture_keeps_small_output_intact() {
-    let out = execute_captured(
-        &cmd(&["sh", "-c", "echo out; echo err >&2"]),
-        &[],
-        true,
-        Duration::from_secs(30),
-    )
-    .await
-    .unwrap();
+    #[cfg(unix)]
+    let argv = cmd(&["sh", "-c", "echo out; echo err >&2"]);
+    #[cfg(windows)]
+    let argv = cmd(&["cmd", "/c", "echo out& echo err >&2"]);
+    let out = execute_captured(&argv, &[], true, Duration::from_secs(30))
+        .await
+        .unwrap();
     assert_eq!(out.code, 0);
-    assert_eq!(out.stdout, b"out\n");
-    assert_eq!(out.stderr, b"err\n");
+    assert_eq!(out.stdout, sh_line("out"));
+    assert_eq!(out.stderr, sh_line("err"));
 }

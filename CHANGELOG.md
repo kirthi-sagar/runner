@@ -6,6 +6,17 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.2.0 — 2026-11-21
+
+- Windows hardening: real multi-core topology via `GetSystemInfo` +
+  `GetLogicalProcessorInformationEx` (donor slots no longer clamp
+  to 1); daemon IPC over named pipes (`\\.\pipe\runner-*`) with a
+  pipe-aware doctor probe.
+- Native `runner stop` on Windows (`TerminateProcess` plus a
+  `%LOCALAPPDATA%` pidfile) and live `runner top` frames (system
+  CPU/memory via `GetSystemTimes` / `GlobalMemoryStatusEx`,
+  console `q` quit, Ctrl-C signals).
+
 ## v2.1.0 — 2026-11-21
 
 - Tier-1 dispatch verified end to end on live KVM: host listens on

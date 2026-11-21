@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.1.0 and prior)
+## Shipped (v2.2.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -31,8 +31,14 @@ services or heavyweight frameworks.
 - Native Windows Job Objects governor: Win32 sensing, weight ladder (v2.0.0).
 - Firecracker HTTP framing fix: header/Content-Length reads (v2.0.1).
 - Tier-1 in-guest dispatch: vsock suffix, musl agent, live success (v2.1.0).
+- Windows hardening: Win32 topology, named-pipe IPC, stop/top (v2.2.0).
 
-## Current: v2.1.0 (Tier-1 In-Guest Dispatch)
+## Current: v2.2.0 (Windows Hardening)
+
+- Win32 topology, named-pipe IPC + doctor probe, native stop.
+- Live `top` gauges with a console loop; zero doc warnings.
+
+## Shipped in v2.1.0: Tier-1 In-Guest Dispatch
 
 - Host listens on `<uds>_<port>`; agent runs as guest `/init`.
 - Live harness executes in-guest and asserts exit 0 on real KVM.
@@ -41,10 +47,6 @@ services or heavyweight frameworks.
 
 - `put_inner` frames responses; keep-alive no longer hangs Tier-1.
 - Live KVM harness verified green on real hardware.
-
-## Future: v2.2.0 (Windows Hardening)
-
-- Win32 multi-core topology, named-pipe IPC, top telemetry.
 
 ## Shipped in v2.0.0: Windows Job Objects Governor
 

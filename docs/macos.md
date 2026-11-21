@@ -21,12 +21,49 @@ interactive apps (spec §3.5).
   GitHub/GitLab/Bitbucket polling, MCP, and the control plane are
   platform-independent and work unchanged.
 
+## Tier-2 sandbox: Seatbelt (v1.9.0+)
+
+Job processes on macOS run under an Apple Seatbelt profile applied
+with `sandbox_init` in the `pre_exec` child hook — the same choke
+point as QoS, and the same mechanism Chrome, Homebrew, Claude Code,
+Codex CLI, and Cursor use for macOS sandboxing. No entitlements are
+required (ad-hoc Seatbelt profiles need none, unlike the App Sandbox
+container).
+
+What it protects (filesystem isolation for job processes):
+
+- `~/.ssh`, `~/.gnupg`, `~/.config/runner`, `~/.runner`: neither
+  readable nor writable from inside a job.
+- Writes anywhere outside the job workspace: denied.
+
+What it allows:
+
+- Full read/write to the job workspace (parameterized per job).
+- Reads of system directories (`/usr`, `/System`, `/Library`,
+  `/private/tmp`).
+- Unrestricted outbound network (CI jobs fetch dependencies;
+  egress filtering arrives in v1.10.0).
+
+Behavioral notes:
+
+- **Nesting**: if the job child is already sandboxed (detected via
+  the non-deprecated `sandbox_check` probe), the profile is skipped
+  with a log line — nested `sandbox_init` would fail, and the outer
+  sandbox stays in force.
+- **Soft-fail**: if `sandbox_init` itself fails, the error message is
+  logged and the job continues unsandboxed (same posture as the
+  Linux userns probe). `--strict` will convert this to a hard
+  failure in a future milestone.
+- **Deprecation risk**: `sandbox_init` is marked deprecated by Apple
+  (in favor of the entitled App Sandbox, which cannot confine
+  arbitrary CLI job processes). It remains functional on current
+  macOS with no announced removal; if Apple ever removes it, Tier-2
+  on macOS falls back to governed-direct spawning. The FFI is
+  hand-rolled Rust with no `<sandbox.h>`, so no C deprecation
+  warning is involved.
+
 ## Known macOS limitations (v1)
 
-- **No sandbox isolation**: no user namespaces, no tmpfs mounts, no
-  eBPF/socket-filter egress rules. Tier-2 degrades to governed direct
-  spawning plus QoS; the probes report unsupported and every layer
-  fails closed to that mode.
 - **No pressure feedback**: without PSI the governor holds static
   slots; QoS pinning (static E-core scheduling) is the whole thermal
   story on macOS v1.
@@ -44,6 +81,8 @@ interactive apps (spec §3.5).
   suite unchanged.
 - `cargo check --target {aarch64,x86_64}-apple-darwin --workspace
   --all-targets` must stay clean (the portability gate).
-- The macOS CI job runs fmt, clippy, a full native build (link check),
-  and `cargo test -p runner-core --lib governor::darwin` — whose
-  `cfg(macos)` cases invoke the real syscalls on a real Mac.
+- The macOS CI job runs fmt, clippy, a Seatbelt availability probe,
+  a full native build (link check),
+  `cargo test -p runner-core --lib governor::darwin`, and
+  `cargo test -p runner-sandbox --lib seatbelt` — whose `cfg(macos)`
+  cases invoke the real syscalls on a real Mac.

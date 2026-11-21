@@ -21,7 +21,7 @@
 | --- | --- | --- | --- |
 | Tier-3 dispatch | ✅ | ✅ | ✅ |
 | Governor (PSI + cgroups) | ✅ | ✅ | ❌ logged |
-| Tier-2 sandbox (namespaces) | ✅ | ⚠ degraded | ❌ logged |
+| Tier-2 sandbox | ✅ namespaces | ✅ Seatbelt | ❌ logged |
 | Tier-1 microVM (Firecracker) | ✅ | ❌ | ❌ logged |
 | WireGuard transport | ✅ | ✅ | ✅ |
 | STUN NAT traversal | ✅ | ✅ | ✅ |

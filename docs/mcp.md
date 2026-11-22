@@ -100,9 +100,13 @@ changes must update this doc and that test together.
 `drained_nodes`.
 
 `reserve_host_resources` — input: `cores` (number, required, finite
-\> 0), `ram_gb` (number, required, finite \> 0),
-`duration_minutes` (integer, required, \> 0), `reason` (string,
-optional). Output: `reservation_id`, `cores`, `ram_mb`, `reason`.
+\> 0), `reason` (string, optional), plus memory from `memory_mb`
+(integer, v2) or `ram_gb` (number, v1) and duration from
+`duration_secs` (integer, v2) or `duration_minutes` (integer, v1);
+v2 fields win when both are present. `priority` (v2, `low`|`normal`|
+`high`|`critical`, default `normal`) ranks preemption. Output:
+`reservation_id`, `cores`, `ram_mb`, `priority`, `duration_secs`,
+`reason`. A full table denies with `-32603` (retryable).
 
 `release_host_resources` — input: `reservation_id` (string,
 required). Output: `released`. Unknown id → `-32602`.

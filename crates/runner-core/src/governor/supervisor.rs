@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock};
 
 use super::afk::{poll_desktop_idle, AfkBoost, AfkMode, IdleState, PROBE_EVERY};
@@ -29,6 +29,23 @@ use crate::config::{PeerRecord, RunnerConfig};
 use crate::mesh::cloud::{CloudNode, CloudPool};
 use crate::mesh::peer::apply_donor_caps;
 
+/// Reservation preemption rank (v2.7.0 dynamic protocol). Ordering
+/// is the eviction order: strictly higher priority preempts lower;
+/// equal priority never preempts (first-come wins within a rank).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReservationPriority {
+    /// Background batch work: first to yield headroom.
+    Low,
+    /// Default interactive agent work.
+    #[default]
+    Normal,
+    /// Latency-sensitive work; preempts Low and Normal.
+    High,
+    /// Operator / break-glass work; preempts everything below it.
+    Critical,
+}
+
 /// Host headroom reservation for agent local work.
 #[derive(Debug, Clone)]
 pub struct Reservation {
@@ -37,11 +54,18 @@ pub struct Reservation {
     pub ram_mb: u64,
     pub reason: String,
     pub expires_at: Instant,
+    pub priority: ReservationPriority,
 }
 
 impl Reservation {
     pub fn expired(&self, now: Instant) -> bool {
         now >= self.expires_at
+    }
+
+    /// True when an incoming request at `priority` may evict this
+    /// reservation to reclaim headroom (strictly higher rank only).
+    pub fn preemptible_by(&self, priority: ReservationPriority) -> bool {
+        priority > self.priority
     }
 }
 
@@ -300,6 +324,7 @@ impl SupervisorState {
         ram_mb: u64,
         duration: Duration,
         reason: String,
+        priority: ReservationPriority,
         now: Instant,
     ) -> Reservation {
         let id = format!("res-{}", self.next_reservation);
@@ -310,6 +335,7 @@ impl SupervisorState {
             ram_mb,
             reason,
             expires_at: now + duration,
+            priority,
         };
         self.reservations.insert(id, reservation.clone());
         reservation
@@ -321,6 +347,11 @@ impl SupervisorState {
 
     pub fn reservations(&self) -> Vec<Reservation> {
         self.reservations.values().cloned().collect()
+    }
+
+    /// Live reservation count (callers prune first).
+    pub fn reservation_count(&self) -> usize {
+        self.reservations.len()
     }
 
     pub fn set_throttle(&mut self, weight: u32, duration: Duration, now: Instant) {
@@ -1372,10 +1403,24 @@ mod tests {
     fn reservations_expire_and_release() {
         let mut state = SupervisorState::new();
         let now = Instant::now();
-        let res = state.reserve(2.0, 4096, Duration::from_secs(1), "t".into(), now);
+        let res = state.reserve(
+            2.0,
+            4096,
+            Duration::from_secs(1),
+            "t".into(),
+            ReservationPriority::Normal,
+            now,
+        );
         assert!(state.release(&res.id));
         assert!(!state.release(&res.id));
-        state.reserve(1.0, 1024, Duration::from_secs(1), "t".into(), now);
+        state.reserve(
+            1.0,
+            1024,
+            Duration::from_secs(1),
+            "t".into(),
+            ReservationPriority::Low,
+            now,
+        );
         state.prune_expired(now + Duration::from_secs(2));
         assert!(state.reservations().is_empty());
     }

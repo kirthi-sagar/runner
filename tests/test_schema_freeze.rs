@@ -77,8 +77,12 @@ async fn mcp_tools_list_pins_twelve_names_and_schemas() {
                 "cores": { "type": "number" },
                 "ram_gb": { "type": "number" },
                 "duration_minutes": { "type": "integer" },
-                "reason": { "type": "string" }},
-            "required": ["cores", "ram_gb", "duration_minutes"]}),
+                "reason": { "type": "string" },
+                "memory_mb": { "type": "integer" },
+                "duration_secs": { "type": "integer" },
+                "priority": { "type": "string",
+                    "enum": ["low", "normal", "high", "critical"] }},
+            "required": ["cores"]}),
     );
     expected.insert(
         "release_host_resources",

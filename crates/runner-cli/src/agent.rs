@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use runner_core::config::RunnerConfig;
 use runner_core::ipc::{ipc_call_with, resolve_sock_path};
+use runner_core::mcp::reservation::ReservationRequest;
 use runner_core::mcp::tools::{AgentTools, ToolError};
 
 use crate::doctor::{render_json, run_all};
@@ -206,31 +207,36 @@ impl AgentTools for CliAgentTools {
         Ok(out)
     }
 
-    async fn reserve(
-        &self,
-        cores: f64,
-        ram_gb: f64,
-        duration_minutes: u64,
-        reason: String,
-    ) -> Result<serde_json::Value, ToolError> {
+    async fn reserve(&self, request: ReservationRequest) -> Result<serde_json::Value, ToolError> {
         let out = self
             .daemon(
                 "reserve",
                 Some(serde_json::json!({
-                    "cores": cores,
-                    "ram_gb": ram_gb,
-                    "duration_minutes": duration_minutes,
-                    "reason": reason.clone(),
+                    "cores": request.cores,
+                    // Legacy units for old daemons (exact ram round-trip;
+                    // minutes round up, over-holding conservatively).
+                    "ram_gb": request.memory_mb as f64 / 1024.0,
+                    "duration_minutes": request.duration_secs.div_ceil(60),
+                    "memory_mb": request.memory_mb,
+                    "duration_secs": request.duration_secs,
+                    "priority": request.priority,
+                    "reason": request.reason.clone(),
                 })),
             )
             .await?;
-        // Adapt the IPC shape to the frozen MCP shape (lossless: the
-        // daemon echoes our inputs; ram_mb re-derives identically).
+        // Adapt the IPC shape to the MCP shape, preferring canonical
+        // daemon echoes and falling back to request values (old
+        // daemons echo v1 inputs only).
         Ok(serde_json::json!({
             "reservation_id": out["reservation_id"],
             "cores": out["cores"],
-            "ram_mb": (ram_gb * 1024.0) as u64,
-            "reason": reason,
+            "ram_mb": out.get("ram_mb").cloned()
+                .unwrap_or(serde_json::json!(request.memory_mb)),
+            "priority": out.get("priority").cloned()
+                .unwrap_or(serde_json::json!("normal")),
+            "duration_secs": out.get("duration_secs").cloned()
+                .unwrap_or(serde_json::json!(request.duration_secs)),
+            "reason": request.reason,
         }))
     }
 

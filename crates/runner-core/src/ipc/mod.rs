@@ -322,31 +322,39 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
         }
         "reserve" => {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
-            let cores = params.get("cores").and_then(Value::as_f64).unwrap_or(0.0);
-            let ram_gb = params.get("ram_gb").and_then(Value::as_f64).unwrap_or(0.0);
-            let mins = params
-                .get("duration_minutes")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let reason = params
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            let (cores, ram_mb, mins) =
-                match crate::mcp::tools::validate_reserve(cores, ram_gb, mins) {
-                    Ok(v) => v,
+            let args: crate::mcp::tools::ReserveHostResourcesArgs =
+                match serde_json::from_value(params) {
+                    Ok(args) => args,
                     Err(e) => {
                         return serde_json::json!({ "jsonrpc": "2.0", "id": id,
-                        "error": { "code": -32602, "message": e } })
+                        "error": { "code": -32602, "message": e.to_string() } })
                     }
                 };
-            let r = crate::mcp::tools::reserve_on(state, cores, ram_mb, mins, reason).await;
+            let request = match crate::mcp::reservation::ReservationRequest::try_from(&args) {
+                Ok(request) => request,
+                Err(e) => {
+                    return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": e } })
+                }
+            };
+            let r = match crate::mcp::tools::reserve_on(state, &request).await {
+                Ok(r) => r,
+                Err(crate::mcp::reservation::ReserveError::Invalid(message)) => {
+                    return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": message } })
+                }
+                Err(full) => {
+                    return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": full.to_string() } })
+                }
+            };
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
                 "reservation_id": r.id,
                 "cores": r.cores,
-                "ram_gb": ram_gb,
-                "duration_minutes": mins,
+                "ram_mb": r.ram_mb,
+                "priority": r.priority,
+                "duration_secs": request.duration_secs,
+                "reason": r.reason,
             } })
         }
         "release" => {

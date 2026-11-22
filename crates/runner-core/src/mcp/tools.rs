@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use super::reservation::{ReservationLimits, ReservationRequest, ReserveError};
 use crate::config::RunnerConfig;
 use crate::governor::cgroup::{WEIGHT_TRICKLE, WEIGHT_WARNING};
 use crate::governor::supervisor::SharedState;
@@ -50,10 +51,24 @@ pub const ALL_TOOLS: [&str; 12] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReserveHostResourcesArgs {
     pub cores: f64,
+    /// Legacy memory unit (v1); `memory_mb` wins when present.
+    #[serde(default)]
     pub ram_gb: f64,
+    /// Legacy duration unit (v1); `duration_secs` wins when present.
+    #[serde(default)]
     pub duration_minutes: u64,
     #[serde(default)]
     pub reason: String,
+    /// Canonical memory unit, MiB (v2; precedence over `ram_gb`).
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
+    /// Canonical duration unit, seconds (v2; precedence over
+    /// `duration_minutes`).
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
+    /// Preemption rank (v2; default Normal).
+    #[serde(default)]
+    pub priority: Option<crate::governor::supervisor::ReservationPriority>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,16 +166,10 @@ pub trait AgentTools: Send + Sync + std::fmt::Debug {
     /// Report LAN cache counters. Goes through daemon IPC: the cache
     /// store lives in the daemon, not the MCP server process.
     async fn cache_stats(&self) -> Result<serde_json::Value, ToolError>;
-    /// Reserve headroom on the live daemon (reservation inputs are
-    /// pre-validated by shape; semantic checks run daemon-side).
+    /// Reserve headroom on the live daemon (the envelope arrives
+    /// normalized; semantic checks run daemon-side).
     /// Returns [`ToolError::offline`] when the daemon is unreachable.
-    async fn reserve(
-        &self,
-        cores: f64,
-        ram_gb: f64,
-        duration_minutes: u64,
-        reason: String,
-    ) -> Result<serde_json::Value, ToolError>;
+    async fn reserve(&self, request: ReservationRequest) -> Result<serde_json::Value, ToolError>;
     /// Release a daemon reservation by id.
     async fn release(&self, reservation_id: &str) -> Result<serde_json::Value, ToolError>;
     /// Engage a timed daemon throttle (`level` pre-validated to the
@@ -227,13 +236,7 @@ impl AgentTools for StubAgentTools {
 
     // Daemon-backed tools: the stub always reports offline so the
     // dispatcher deterministically uses local state (hermetic tests).
-    async fn reserve(
-        &self,
-        _cores: f64,
-        _ram_gb: f64,
-        _duration_minutes: u64,
-        _reason: String,
-    ) -> Result<serde_json::Value, ToolError> {
+    async fn reserve(&self, _request: ReservationRequest) -> Result<serde_json::Value, ToolError> {
         Err(ToolError::offline("agent tools not configured"))
     }
 
@@ -351,40 +354,29 @@ fn parse_args<T: for<'de> Deserialize<'de>>(
     serde_json::from_value(args).map_err(|e| ToolError::invalid_params(e.to_string()))
 }
 
-/// Shared validators + state operations used by BOTH the local MCP
-/// path and the daemon IPC arms (`reserve`, `release`, `drain`,
-/// `cloud_capacity`, `ci_status`, `fleet_topology`), so verdicts,
-/// messages, and shapes stay identical whichever path executes.
-/// `String` errors are caller-mapped (`invalid_params` locally,
-/// `-32602` over IPC); provision failures map to internal errors.
-pub(crate) fn validate_reserve(
-    cores: f64,
-    ram_gb: f64,
-    mins: u64,
-) -> Result<(f64, u64, u64), String> {
-    if !cores.is_finite() || cores <= 0.0 {
-        return Err("cores must be a finite value > 0".to_string());
-    }
-    if !ram_gb.is_finite() || ram_gb <= 0.0 {
-        return Err("ram_gb must be a finite value > 0".to_string());
-    }
-    if mins == 0 {
-        return Err("duration_minutes must be > 0".to_string());
-    }
-    Ok((cores, (ram_gb * 1024.0) as u64, mins))
-}
-
+/// Shared state operations used by BOTH the local MCP path and the
+/// daemon IPC arms (`reserve`, `release`, `drain`, `cloud_capacity`,
+/// `ci_status`, `fleet_topology`), so verdicts, messages, and shapes
+/// stay identical whichever path executes. Normalization and
+/// validation live in the reservation envelope; [`ReserveError`]
+/// variants are caller-mapped (`Invalid` → `invalid_params` locally /
+/// `-32602` over IPC, `Full` → internal / `-32603`).
 pub(crate) async fn reserve_on(
     state: &SharedState,
-    cores: f64,
-    ram_mb: u64,
-    mins: u64,
-    reason: String,
-) -> crate::governor::supervisor::Reservation {
+    request: &ReservationRequest,
+) -> Result<crate::governor::supervisor::Reservation, ReserveError> {
     let now = Instant::now();
     let mut guard = state.write().await;
     guard.prune_expired(now);
-    guard.reserve(cores, ram_mb, Duration::from_secs(mins * 60), reason, now)
+    request.validate(&ReservationLimits::default(), guard.reservation_count())?;
+    Ok(guard.reserve(
+        request.cores,
+        request.memory_mb,
+        request.duration(),
+        request.reason.clone(),
+        request.priority,
+        now,
+    ))
 }
 
 pub(crate) async fn release_on(state: &SharedState, id: &str) -> bool {
@@ -502,7 +494,8 @@ pub(crate) async fn ci_status_value(state: &SharedState) -> serde_json::Value {
             "afk_mode": guard.afk_mode.name(),
         },
         "reservations": guard.reservations().iter().map(|r| serde_json::json!({
-            "id": r.id, "cores": r.cores, "ram_mb": r.ram_mb, "reason": r.reason,
+            "id": r.id, "cores": r.cores, "ram_mb": r.ram_mb,
+            "priority": r.priority, "reason": r.reason,
         })).collect::<Vec<_>>(),
         "drained_nodes": guard.drained_nodes(),
         "forges": guard.forge_health(),
@@ -572,17 +565,11 @@ pub async fn execute_tool(
         }
         TOOL_RESERVE_HOST_RESOURCES => {
             let args: ReserveHostResourcesArgs = parse_args(args)?;
+            let request = ReservationRequest::try_from(&args).map_err(ToolError::invalid_params)?;
             with_daemon_fallback(
                 TOOL_RESERVE_HOST_RESOURCES,
-                ctx.agent
-                    .reserve(
-                        args.cores,
-                        args.ram_gb,
-                        args.duration_minutes,
-                        args.reason.clone(),
-                    )
-                    .await,
-                reserve_host_resources(&args, ctx),
+                ctx.agent.reserve(request.clone()).await,
+                reserve_host_resources(&request, ctx),
             )
             .await
         }
@@ -714,16 +701,19 @@ async fn get_fleet_topology(ctx: &ToolContext) -> Result<serde_json::Value, Tool
 }
 
 async fn reserve_host_resources(
-    args: &ReserveHostResourcesArgs,
+    request: &ReservationRequest,
     ctx: &ToolContext,
 ) -> Result<serde_json::Value, ToolError> {
-    let (cores, ram_mb, mins) = validate_reserve(args.cores, args.ram_gb, args.duration_minutes)
-        .map_err(ToolError::invalid_params)?;
-    let reservation = reserve_on(&ctx.state, cores, ram_mb, mins, args.reason.clone()).await;
+    let reservation = reserve_on(&ctx.state, request).await.map_err(|e| match e {
+        ReserveError::Invalid(message) => ToolError::invalid_params(message),
+        full @ ReserveError::Full { .. } => ToolError::internal(full.to_string()),
+    })?;
     Ok(serde_json::json!({
         "reservation_id": reservation.id,
         "cores": reservation.cores,
         "ram_mb": reservation.ram_mb,
+        "priority": reservation.priority,
+        "duration_secs": request.duration_secs,
         "reason": reservation.reason,
     }))
 }
@@ -816,8 +806,12 @@ pub fn tool_schema(name: &str) -> serde_json::Value {
                 "ram_gb": { "type": "number" },
                 "duration_minutes": { "type": "integer" },
                 "reason": { "type": "string" },
+                "memory_mb": { "type": "integer" },
+                "duration_secs": { "type": "integer" },
+                "priority": { "type": "string",
+                    "enum": ["low", "normal", "high", "critical"] },
             }),
-            vec!["cores", "ram_gb", "duration_minutes"],
+            vec!["cores"],
         ),
         TOOL_RELEASE_HOST_RESOURCES => (
             serde_json::json!({ "reservation_id": { "type": "string" } }),
@@ -887,7 +881,7 @@ pub fn tool_description(name: &str) -> &'static str {
     match name {
         TOOL_GET_CI_STATUS => "Host health, PSI pressure, slots, queue counts, reservations.",
         TOOL_GET_FLEET_TOPOLOGY => "Compute split across local, WAN peers, and cloud nodes.",
-        TOOL_RESERVE_HOST_RESOURCES => "Hold CPU/RAM headroom for local agent work.",
+        TOOL_RESERVE_HOST_RESOURCES => "Hold CPU/RAM headroom for local agent work. v2 fields (memory_mb, duration_secs, priority) take precedence over ram_gb/duration_minutes.",
         TOOL_RELEASE_HOST_RESOURCES => "Release a host resource reservation.",
         TOOL_THROTTLE_RUNNER => "Force runner weights down for a duration (never freezes).",
         TOOL_REQUEST_CLOUD_CAPACITY => "Request cloud burst within the pre-approved budget.",
@@ -999,6 +993,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserve_v2_envelope_roundtrip() {
+        let ctx = ctx();
+        let args = serde_json::json!({
+            "cores": 1.5, "memory_mb": 2048, "duration_secs": 90,
+            "priority": "high", "reason": "v2",
+        });
+        let out = execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&args), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["cores"], 1.5);
+        assert_eq!(out["ram_mb"], 2048);
+        assert_eq!(out["priority"], "high");
+        assert_eq!(out["duration_secs"], 90);
+        let id = out["reservation_id"].as_str().unwrap().to_string();
+        let rel = serde_json::json!({ "reservation_id": id });
+        let out = execute_tool(TOOL_RELEASE_HOST_RESOURCES, Some(&rel), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["released"], id);
+    }
+
+    #[tokio::test]
+    async fn reserve_daemon_arm_receives_normalized_envelope() {
+        let (ctx, agent) = agent_ctx();
+        // Mixed generations: v2 wins, legacy ignored.
+        let args = serde_json::json!({
+            "cores": 2.0, "ram_gb": 4.0, "duration_minutes": 10,
+            "memory_mb": 8192, "duration_secs": 30, "priority": "critical",
+        });
+        execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&args), &ctx)
+            .await
+            .unwrap();
+        let calls = agent.reserves.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].memory_mb, 8192);
+        assert_eq!(calls[0].duration_secs, 30);
+        assert_eq!(
+            calls[0].priority,
+            crate::governor::supervisor::ReservationPriority::Critical
+        );
+    }
+
+    #[tokio::test]
+    async fn reserve_invalid_shapes_reject_without_dispatch() {
+        let (ctx, agent) = agent_ctx();
+        for bad in [
+            serde_json::json!({ "cores": 0.0, "ram_gb": 4.0, "duration_minutes": 10 }),
+            serde_json::json!({ "cores": 2.0, "duration_minutes": 10 }),
+            serde_json::json!({ "cores": 2.0, "ram_gb": 4.0 }),
+            serde_json::json!({
+                "cores": 2.0, "memory_mb": 1024,
+                "duration_secs": 60, "priority": "urgent",
+            }),
+        ] {
+            let err = execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&bad), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, -32602, "{bad}");
+        }
+        // Rejected before delegation: the daemon arm never fires.
+        assert!(agent.reserves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserve_full_table_denies_retryable() {
+        let ctx = ctx();
+        let args = serde_json::json!({
+            "cores": 0.5, "memory_mb": 64, "duration_secs": 3600,
+        });
+        for _ in 0..crate::mcp::reservation::ReservationLimits::default().max_active {
+            execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&args), &ctx)
+                .await
+                .unwrap();
+        }
+        let err = execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&args), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32603);
+        assert!(err.message.contains("table full"), "{}", err.message);
+    }
+
+    #[test]
+    fn reserve_schema_advertises_v2_fields() {
+        let schema = tool_schema(TOOL_RESERVE_HOST_RESOURCES);
+        let props = schema["properties"].as_object().unwrap();
+        for field in [
+            "cores",
+            "ram_gb",
+            "duration_minutes",
+            "memory_mb",
+            "duration_secs",
+            "priority",
+        ] {
+            assert!(props.contains_key(field), "{field}");
+        }
+        assert_eq!(
+            schema["properties"]["priority"]["enum"],
+            serde_json::json!(["low", "normal", "high", "critical"])
+        );
+        assert_eq!(schema["required"], serde_json::json!(["cores"]));
+    }
+
+    #[tokio::test]
     async fn cloud_denied_without_budget() {
         let ctx = ctx();
         let args = serde_json::json!({
@@ -1055,6 +1152,7 @@ mod tests {
         providers: std::sync::Mutex<Vec<String>>,
         execs: std::sync::Mutex<Vec<ExecCall>>,
         clouds: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        reserves: std::sync::Mutex<Vec<ReservationRequest>>,
     }
 
     #[async_trait::async_trait]
@@ -1109,11 +1207,9 @@ mod tests {
         // the local fallback deterministically.
         async fn reserve(
             &self,
-            _cores: f64,
-            _ram_gb: f64,
-            _duration_minutes: u64,
-            _reason: String,
+            request: ReservationRequest,
         ) -> Result<serde_json::Value, ToolError> {
+            self.reserves.lock().unwrap().push(request);
             Err(ToolError::offline("scripted offline"))
         }
 

@@ -24,12 +24,16 @@
 //! real WFP constants live in the `#[cfg(windows)]`-gated `api`
 //! module.
 //!
-//! Phase 1 scope is the core contract plus the pure-logic rule
-//! engine. Opening the dynamic engine session (`FwpmEngineOpen0`),
-//! adding filters (`FwpmFilterAdd0`), and job-scoped
-//! install/remove land in Phase 2.
+//! Phase 1 delivered the core contract plus the pure-logic rule
+//! engine ([`types`]). Phase 2 adds the live engine half ([`engine`]):
+//! a dynamic session (`FwpmEngineOpen0`) with RAII close plus ALE
+//! filter installation (`FwpmFilterAdd0`). Job-scoped
+//! install/remove wiring lands in a later phase.
 
+pub mod engine;
 pub mod types;
+
+pub use engine::{plan_conditions, WfpConditionPlan, WfpEngineSession};
 
 pub use types::{
     arbitrate, parse_v4_cidr, parse_v6_cidr, sandbox_egress_rules, v4_prefix_mask, v6_prefix_mask,

@@ -176,6 +176,8 @@ jobs:
 
       - name: Run automated test suite (native)
         run: cargo test --workspace --all-features
+        env:
+          RUNNER_LIVE_WFP: '1'
 
       - name: install.ps1 smoke (documented native install path)
         shell: pwsh

@@ -132,6 +132,13 @@ mod imp {
         _description: Vec<u16>,
     }
 
+    // SAFETY: the engine HANDLE is an owned kernel object reference —
+    // opened here, closed exactly once in Drop, with no thread
+    // affinity — so moving ownership across threads is safe. `Sync`
+    // is deliberately not implemented: concurrent shared use is not
+    // needed and gets no safety claim.
+    unsafe impl Send for WfpEngineSession {}
+
     impl WfpEngineSession {
         /// Open a dynamic engine session on the local host with
         /// default authentication.
@@ -500,6 +507,16 @@ mod tests {
     fn stub_open_reports_unsupported() {
         let err = WfpEngineSession::open().unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    /// The session crosses `.await` points inside the supervised
+    /// worker future (`tokio::spawn` requires `Send`); this pins the
+    /// bound at compile time on every Windows CI job.
+    #[cfg(windows)]
+    #[test]
+    fn session_is_send_for_async_supervision() {
+        fn assert_send<T: Send>() {}
+        assert_send::<WfpEngineSession>();
     }
 
     /// Live engine lifecycle: open a dynamic session, install the 11

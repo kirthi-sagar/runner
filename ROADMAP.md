@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.3.0 and prior)
+## Shipped (v2.4.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -33,8 +33,14 @@ services or heavyweight frameworks.
 - Tier-1 in-guest dispatch: vsock suffix, musl agent, live success (v2.1.0).
 - Windows hardening: Win32 topology, named-pipe IPC, stop/top (v2.2.0).
 - Strict sandbox mode: fail-closed exec/start/doctor guardrails (v2.3.0).
+- Strict everywhere + audit trail: daemon strict, DACLs, spend gate (v2.4.0).
 
-## Current: v2.3.0 (Strict Sandbox Mode)
+## Current: v2.4.0 (Strict Everywhere, macOS Parity & Windows Security)
+
+- Full-chain strict, macOS coordinator Seatbelt, Windows DACLs.
+- Double-start prevention, ledger spend gate, live audit trail.
+
+## Shipped in v2.3.0: Strict Sandbox Mode
 
 - `--strict` flag, config, and env override across exec/doctor/start.
 - macOS Seatbelt detection fix for local execution.

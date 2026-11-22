@@ -6,6 +6,28 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## [2.4.0] - 2026-11-22
+
+- **Strict Everywhere & macOS Parity**: Full-chain `--strict`
+  threading, fail-closed pre-JIT worker refusal, Tier-2 Apple
+  Seatbelt confinement for macOS coordinator/captured jobs via
+  `can_sandbox()`, wired `cmd_exec_microvm.with_strict()`.
+- **Windows Access Security (0600 Parity)**: Owner-only DACLs for
+  secrets files (`env`, `config.toml`) and Named Pipe IPC
+  (`\\.\pipe\runner-*`) via `winacl.rs` using
+  `PROTECTED_DACL_SECURITY_INFORMATION`.
+- **Daemon Double-Start Prevention**: `check_double_start()`
+  liveness probe prevents socket/pidfile hijacking, auto-reaping
+  dead stale PID files.
+- **MCP Offline Spend Safety**: Shared choke point in
+  `request_cloud_with` enforces monthly cloud spend limits against
+  the local ledger even when daemon is offline.
+- **Tamper-Evident Audit Trail Activation**: Live `AuditLog::append`
+  across operational lifecycle events; cross-platform
+  `default_audit_path()` for native Windows
+  (`%APPDATA%\runner\audit.jsonl`); `runner doctor --enterprise`
+  passing with intact SHA-256 chain.
+
 ## v2.3.0 — 2026-11-21
 
 - Strict sandbox mode: `--strict` (or `sandbox.strict`, or

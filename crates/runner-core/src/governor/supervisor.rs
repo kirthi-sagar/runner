@@ -129,6 +129,7 @@ pub struct SupervisorState {
     /// Wall time of the last desktop-idle probe (5s throttle).
     pub afk_last_probe: Option<Instant>,
     reservations: HashMap<String, Reservation>,
+    reservation_hooks: Option<Arc<dyn crate::mcp::reservation::ReservationHooks>>,
     throttle: Option<ThrottleOverride>,
     drained: HashMap<String, String>,
     peers: HashMap<String, PeerRecord>,
@@ -178,6 +179,7 @@ impl SupervisorState {
             afk_idle_secs: 300,
             afk_last_probe: None,
             reservations: HashMap::new(),
+            reservation_hooks: None,
             throttle: None,
             drained: HashMap::new(),
             peers: HashMap::new(),
@@ -344,6 +346,25 @@ impl SupervisorState {
 
     pub fn release(&mut self, id: &str) -> bool {
         self.reservations.remove(id).is_some()
+    }
+
+    /// Remove and return a lease (lets release accounting observe it).
+    pub fn take_reservation(&mut self, id: &str) -> Option<Reservation> {
+        self.reservations.remove(id)
+    }
+
+    /// Install enterprise reservation accounting (daemon boot).
+    pub fn set_reservation_hooks(
+        &mut self,
+        hooks: Arc<dyn crate::mcp::reservation::ReservationHooks>,
+    ) {
+        self.reservation_hooks = Some(hooks);
+    }
+
+    /// Installed accounting hooks, if any (unwired servers enforce
+    /// limits only).
+    pub fn reservation_hooks(&self) -> Option<Arc<dyn crate::mcp::reservation::ReservationHooks>> {
+        self.reservation_hooks.clone()
     }
 
     /// Evict lower-priority leases whose combined headroom covers an

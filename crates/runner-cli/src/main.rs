@@ -1300,6 +1300,11 @@ async fn main() -> Result<()> {
             }
             let state = new_shared_state();
             state.write().await.seed_from_config(&config);
+            state.write().await.set_reservation_hooks(Arc::new(
+                runner_enterprise::spend::EnterpriseReservationHooks::from_default_paths(
+                    config.reservations.monthly_spend_cap_usd,
+                ),
+            ));
             let sock_path = resolve_sock_path();
             match IpcServer::bind(&sock_path, state.clone()).await {
                 Ok(server) => {

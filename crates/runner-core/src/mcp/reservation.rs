@@ -30,11 +30,99 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::tools::ReserveHostResourcesArgs;
-use crate::governor::supervisor::ReservationPriority;
+use crate::governor::supervisor::{Reservation, ReservationPriority};
 
 /// Re-exported victim policy (defined beside the governor state it
 /// acts on); the preemption groundwork tests below resolve through it.
 pub use crate::governor::supervisor::select_preemption_victims;
+
+/// Enterprise accounting hooks for the reservation lifecycle.
+///
+/// Core defines the trait and calls it; `runner-enterprise`
+/// implements it (core→enterprise calls would cycle the crates).
+/// Servers without installed hooks enforce limits only — budgeting
+/// and accounting are enterprise value-add, so unwired operation
+/// (unit tests, offline MCP fallback) stays functional.
+///
+/// Method contract: `check_budget` runs pre-grant (fail-closed deny
+/// on unreadable ledgers, mirroring the cloud spend gate);
+/// `on_grant` failures roll the grant back; `on_release` failures
+/// are logged by the caller while the release stands (cleanup must
+/// not strand capacity); `on_preempt` failures propagate (fail-closed
+/// and self-healing: victims are already gone, so a retry admits).
+pub trait ReservationHooks: Send + Sync + std::fmt::Debug {
+    /// Deny when the estimated cost exceeds remaining budget.
+    fn check_budget(&self, request: &ReservationRequest) -> Result<(), String>;
+    /// Record a completed grant (ledger + audit).
+    fn on_grant(
+        &self,
+        reservation: &Reservation,
+        request: &ReservationRequest,
+    ) -> Result<(), String>;
+    /// Record a release (ledger + audit; best-effort at the call site).
+    fn on_release(&self, reservation: &Reservation) -> Result<(), String>;
+    /// Record preemption victims evicted for an incoming request.
+    fn on_preempt(
+        &self,
+        victim_ids: &[String],
+        incoming: &ReservationRequest,
+    ) -> Result<(), String>;
+}
+
+/// Scripted hooks double: records calls, replays a scripted budget
+/// verdict. Shared by the MCP and IPC dispatch tests.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct ScriptHooks {
+    /// Recorded calls: "budget", "grant:{id}", "release:{id}",
+    /// "preempt:{n}".
+    pub calls: std::sync::Mutex<Vec<String>>,
+    /// When set, `check_budget` denies with this message (once).
+    pub deny_budget_with: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl ReservationHooks for ScriptHooks {
+    fn check_budget(&self, _request: &ReservationRequest) -> Result<(), String> {
+        self.calls.lock().unwrap().push("budget".to_string());
+        match self.deny_budget_with.lock().unwrap().take() {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
+    }
+
+    fn on_grant(
+        &self,
+        reservation: &Reservation,
+        _request: &ReservationRequest,
+    ) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("grant:{}", reservation.id));
+        Ok(())
+    }
+
+    fn on_release(&self, reservation: &Reservation) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("release:{}", reservation.id));
+        Ok(())
+    }
+
+    fn on_preempt(
+        &self,
+        victim_ids: &[String],
+        _incoming: &ReservationRequest,
+    ) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("preempt:{}", victim_ids.len()));
+        Ok(())
+    }
+}
 
 /// Sanity ceilings for one reservation request. These guard against
 /// absurd or typo'd requests (1e18 cores), not capacity planning —
@@ -134,9 +222,9 @@ impl ReservationRequest {
     }
 }
 
-/// Reservation failure: invalid requests (`-32602`) versus a full
-/// table (`-32603`, retryable — preemption converts these into
-/// evictions in a later phase).
+/// Reservation failure: invalid requests (`-32602`) versus
+/// retryable `-32603` denials (full table, exhausted budget —
+/// preemption converts capacity denials into evictions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReserveError {
     /// Malformed or over-limit request.
@@ -148,6 +236,8 @@ pub enum ReserveError {
         /// Configured ceiling.
         max: usize,
     },
+    /// Estimated cost exceeds remaining budget.
+    Budget(String),
 }
 
 impl ReserveError {
@@ -165,6 +255,7 @@ impl std::fmt::Display for ReserveError {
                 "reservation table full ({active} active, max {max}); \
                  retry after expiry or release"
             ),
+            Self::Budget(message) => write!(f, "{message}"),
         }
     }
 }
@@ -225,7 +316,6 @@ impl TryFrom<&ReserveHostResourcesArgs> for ReservationRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::governor::supervisor::Reservation;
     use crate::governor::supervisor::ReservationPriority::*;
 
     fn v1_args(cores: f64, ram_gb: f64, mins: u64) -> ReserveHostResourcesArgs {

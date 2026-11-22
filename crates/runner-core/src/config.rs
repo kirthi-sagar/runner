@@ -553,6 +553,20 @@ pub struct RunnerConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub power: PowerConfig,
+    #[serde(default)]
+    pub reservations: ReservationsConfig,
+}
+
+/// Host reservation budget policy.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ReservationsConfig {
+    /// Maximum monthly reservation spend in USD (nominal internal
+    /// transfer pricing, not cloud money). Unlike
+    /// `cloud.max_monthly_spend` (where 0 denies everything), 0 means
+    /// UNENFORCED: budgeting is opt-in restriction on a previously
+    /// free feature, so the default must not break existing users.
+    #[serde(default)]
+    pub monthly_spend_cap_usd: f64,
 }
 
 /// Power management: clamshell keep-alive while AC-powered jobs run.
@@ -960,6 +974,15 @@ mod tests {
         assert_eq!(config.governor.warn_cpu_psi, 70.0);
         assert_eq!(config.governor.crit_cpu_psi, 90.0);
         assert_eq!(config.sandbox.driver, "process");
+    }
+
+    #[test]
+    fn reservation_spend_cap_defaults_unenforced() {
+        let missing: RunnerConfig = toml::from_str("").unwrap();
+        assert_eq!(missing.reservations.monthly_spend_cap_usd, 0.0);
+        let set: RunnerConfig =
+            toml::from_str("[reservations]\nmonthly_spend_cap_usd = 25.0\n").unwrap();
+        assert_eq!(set.reservations.monthly_spend_cap_usd, 25.0);
     }
 
     #[test]

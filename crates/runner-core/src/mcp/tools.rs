@@ -391,19 +391,29 @@ pub(crate) async fn reserve_on(
                 }
                 // Recount after eviction (a zero cap still denies).
                 request.validate(&limits, guard.reservation_count())?;
-                let reservation = guard.reserve(
-                    request.cores,
-                    request.memory_mb,
-                    request.duration(),
-                    request.reason.clone(),
-                    request.priority,
-                    now,
-                );
-                return Ok(ReserveOutcome {
-                    reservation,
-                    preempted,
-                });
+                return grant_with_hooks(&mut guard, request, preempted, now);
             }
+            // validate() never emits Budget (budget gates below).
+            budget @ ReserveError::Budget(_) => return Err(budget),
+        }
+    }
+    grant_with_hooks(&mut guard, request, Vec::new(), now)
+}
+
+/// Budget-gate, grant, and account one validated request. Everything
+/// runs under the caller's write lock, so the budget check, the
+/// grant, and the ledger write are atomic: no TOCTOU overshoot
+/// between concurrent reserves. Hook failures roll the grant back.
+fn grant_with_hooks(
+    guard: &mut crate::governor::supervisor::SupervisorState,
+    request: &ReservationRequest,
+    preempted: Vec<String>,
+    now: Instant,
+) -> Result<ReserveOutcome, ReserveError> {
+    let hooks = guard.reservation_hooks();
+    if let Some(hooks) = &hooks {
+        if let Err(message) = hooks.check_budget(request) {
+            return Err(ReserveError::Budget(message));
         }
     }
     let reservation = guard.reserve(
@@ -414,14 +424,48 @@ pub(crate) async fn reserve_on(
         request.priority,
         now,
     );
+    if let Some(hooks) = &hooks {
+        if !preempted.is_empty() {
+            if let Err(e) = hooks.on_preempt(&preempted, request) {
+                guard.release(&reservation.id);
+                return Err(ReserveError::Budget(format!(
+                    "preemption accounting failed, grant rolled back: {e}"
+                )));
+            }
+        }
+        if let Err(e) = hooks.on_grant(&reservation, request) {
+            guard.release(&reservation.id);
+            eprintln!(
+                "runner: reservation grant rolled back for {}: {e}",
+                reservation.id
+            );
+            return Err(ReserveError::Budget(format!(
+                "grant accounting failed, rolled back: {e}"
+            )));
+        }
+    }
     Ok(ReserveOutcome {
         reservation,
-        preempted: Vec::new(),
+        preempted,
     })
 }
 
 pub(crate) async fn release_on(state: &SharedState, id: &str) -> bool {
-    state.write().await.release(id)
+    let mut guard = state.write().await;
+    let Some(reservation) = guard.take_reservation(id) else {
+        return false;
+    };
+    // Best-effort accounting: the release stands (capacity freed) —
+    // cleanup must not strand leases over a bookkeeping hiccup.
+    if let Some(hooks) = guard.reservation_hooks() {
+        if let Err(e) = hooks.on_release(&reservation) {
+            eprintln!(
+                "runner: reservation release accounting failed for {}: {e} (release stands)",
+                reservation.id
+            );
+        }
+    }
+    true
 }
 
 pub(crate) async fn drain_on(state: &SharedState, node_id: String, reason: String) {
@@ -747,7 +791,9 @@ async fn reserve_host_resources(
 ) -> Result<serde_json::Value, ToolError> {
     let outcome = reserve_on(&ctx.state, request).await.map_err(|e| match e {
         ReserveError::Invalid(message) => ToolError::invalid_params(message),
-        full @ ReserveError::Full { .. } => ToolError::internal(full.to_string()),
+        full @ (ReserveError::Full { .. } | ReserveError::Budget(_)) => {
+            ToolError::internal(full.to_string())
+        }
     })?;
     Ok(serde_json::json!({
         "reservation_id": outcome.reservation.id,
@@ -1153,6 +1199,40 @@ mod tests {
             ctx.state.read().await.reservation_count(),
             crate::mcp::reservation::ReservationLimits::default().max_active
         );
+    }
+
+    #[tokio::test]
+    async fn reserve_budget_hooks_fire_and_deny() {
+        use crate::mcp::reservation::ScriptHooks;
+        let ctx = ctx();
+        let hooks = Arc::new(ScriptHooks::default());
+        ctx.state.write().await.set_reservation_hooks(hooks.clone());
+        let args = serde_json::json!({
+            "cores": 2.0, "memory_mb": 2048, "duration_secs": 60,
+        });
+        // Scripted denial: -32603, nothing granted or recorded.
+        *hooks.deny_budget_with.lock().unwrap() = Some("over budget".to_string());
+        let err = execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&args), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32603);
+        assert!(err.message.contains("over budget"), "{}", err.message);
+        assert_eq!(*hooks.calls.lock().unwrap(), vec!["budget".to_string()]);
+        // Allowed: budget checked, then granted.
+        let out = execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&args), &ctx)
+            .await
+            .unwrap();
+        let id = out["reservation_id"].as_str().unwrap().to_string();
+        let calls = hooks.calls.lock().unwrap().clone();
+        assert_eq!(calls[1], "budget");
+        assert_eq!(calls[2], format!("grant:{id}"));
+        // Release records too.
+        let rel = serde_json::json!({ "reservation_id": id });
+        execute_tool(TOOL_RELEASE_HOST_RESOURCES, Some(&rel), &ctx)
+            .await
+            .unwrap();
+        let calls = hooks.calls.lock().unwrap().clone();
+        assert!(calls.last().unwrap().starts_with("release:"), "{calls:?}");
     }
 
     #[test]

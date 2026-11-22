@@ -343,7 +343,10 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                     return serde_json::json!({ "jsonrpc": "2.0", "id": id,
                     "error": { "code": -32602, "message": message } })
                 }
-                Err(full) => {
+                Err(
+                    full @ (crate::mcp::reservation::ReserveError::Full { .. }
+                    | crate::mcp::reservation::ReserveError::Budget(_)),
+                ) => {
                     return serde_json::json!({ "jsonrpc": "2.0", "id": id,
                     "error": { "code": -32603, "message": full.to_string() } })
                 }
@@ -895,5 +898,35 @@ mod tests {
         )
         .await;
         assert_eq!(res["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn reserve_arm_bills_and_denies_over_budget() {
+        use crate::mcp::reservation::ScriptHooks;
+        let state = new_shared_state();
+        let hooks = std::sync::Arc::new(ScriptHooks::default());
+        state.write().await.set_reservation_hooks(hooks.clone());
+        let params = serde_json::json!({
+            "cores": 2.0, "memory_mb": 1024, "duration_secs": 60,
+        });
+        let res = handle_ipc_request(cloud_req("reserve", params.clone()), &state).await;
+        let id = res["result"]["reservation_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            hooks.calls.lock().unwrap().clone(),
+            vec!["budget".to_string(), format!("grant:{id}")]
+        );
+        *hooks.deny_budget_with.lock().unwrap() = Some("cap hit".to_string());
+        let res = handle_ipc_request(cloud_req("reserve", params), &state).await;
+        assert_eq!(res["error"]["code"], -32603);
+        assert!(
+            res["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cap hit"),
+            "{res}"
+        );
     }
 }

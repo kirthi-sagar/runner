@@ -110,7 +110,11 @@ v2 fields win when both are present. `priority` (v2, `low`|`normal`|
 When the table is full, a strictly higher priority evicts the lowest
 leases whose headroom covers the request; otherwise a full table
 denies with `-32603` (retryable). Live reservations scale batch
-intake slots down until release or expiry.
+intake slots down until release or expiry. With
+`[reservations] monthly_spend_cap_usd` set, grants whose estimated
+cost exceeds the remaining budget deny fail-closed (`-32603`); every
+grant, release, and preemption lands in the spend ledger and the
+SHA-256 audit trail.
 
 `release_host_resources` — input: `reservation_id` (string,
 required). Output: `released`. Unknown id → `-32602`.

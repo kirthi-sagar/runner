@@ -24,7 +24,7 @@ pub use runner_cli::{init, service};
 pub use runner_core::{
     auth, cache, config, governor, ipc, mcp, mesh, pidfile, status, test_support,
 };
-pub use runner_enterprise::{audit, control_plane, policy, sso, webhook};
+pub use runner_enterprise::{audit, control_plane, policy, spend, sso, webhook};
 pub use runner_guest_agent as guest_agent;
 pub use runner_providers::{github, providers};
 pub use runner_sandbox as sandbox;

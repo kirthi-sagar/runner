@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.7.0 and prior)
+## Shipped (v2.8.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -39,21 +39,29 @@ services or heavyweight frameworks.
   session, parity suite, eBPF fixes, job-scoped guard (v2.6.0).
 - MCP dynamic resource reservations: v2 envelopes, preemption,
   spend ledger, expiry watchdog (v2.7.0).
+- Network boundary hardening follow-through: Seatbelt network
+  verbs, per-job WFP app scoping, nftables attach, configurable
+  reservation limits & pricing (v2.8.0).
 
-## Current: v2.7.0 (MCP Dynamic Resource Reservations)
+## Current: v2.8.0 (Network Boundary Hardening Follow-Through & Resource Governance)
+
+- Full cross-platform network egress boundary: Seatbelt verbs,
+  app-scoped WFP, privileged nftables attach.
+- Configurable reservation ceilings + transfer pricing.
+- Per-request `-32602` enforcement of configured limits.
+
+## Next: Candidate B — LAN Mesh Cache Federation & Peer Streaming
+
+- Cross-node cache federation across the LAN mesh.
+- Peer-to-peer artifact streaming between donors.
+- Remaining roadmap candidates: container runtime isolation
+  tier (D).
+
+## Shipped in v2.7.0: MCP Dynamic Resource Reservations
 
 - Versioned reservation envelopes with priority preemption.
 - Budget-gated spend ledger + SHA-256 audit trail.
 - Expiry watchdog with instant headroom reclamation.
-
-## Next: Network Boundary Hardening Follow-Through (candidate)
-
-- Privileged Linux `bpf()`/`nft` attach for live egress enforcement.
-- Per-job WFP app scoping on native Windows.
-- macOS Seatbelt network verbs for Tier-2 egress parity.
-- Configurable reservation transfer rate + limits plumbing.
-- Remaining roadmap candidates: LAN mesh cache tuning (B),
-  container runtime isolation tier (D).
 
 ## Shipped in v2.6.0: Windows WFP Egress Filtering & Universal Network Boundary
 

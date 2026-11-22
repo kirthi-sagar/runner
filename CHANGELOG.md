@@ -6,6 +6,22 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.8.0 — 2026-11-23
+
+- Phase 1: macOS Seatbelt network egress verbs (`(deny
+  network-outbound)` baseline, UDP 53, TCP 443, `localhost:*`,
+  mDNSResponder unix sockets) with pre-exec profile wiring.
+- Phase 2: Native Windows per-job WFP app scoping
+  (`FWPM_CONDITION_ALE_APP_ID`, RAII `AppIdBlob`,
+  `EgressGuard::acquire_scoped`, fail-secure fallback on resolve
+  failure).
+- Phase 3: Linux privileged nftables egress attachment (ephemeral
+  table probing, pre-flight `--check`, crash-recovery sweeper,
+  RAII drop, unprivileged canary degradation).
+- Phase 4: Configurable reservation limits & pricing
+  (`rate_host_core_hour_usd`, `ReservationLimitsConfig`, MCP
+  `-32602` ceilings enforcement).
+
 ## v2.7.0 — 2026-11-23
 
 - Phase 1: Canonical v2 `ReservationRequest` envelope with

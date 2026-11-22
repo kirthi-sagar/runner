@@ -134,6 +134,9 @@ pub struct SupervisorState {
     pub thermal_throttled: bool,
     /// On battery power: halt new job intake.
     pub discharging: bool,
+    /// Sleep-drain latch: set on pre-sleep, cleared on resume. While
+    /// set, published slots clamp to zero (no new intake).
+    pub sleep_halted: bool,
 }
 
 impl SupervisorState {
@@ -189,7 +192,21 @@ impl SupervisorState {
             temp_c: None,
             thermal_throttled: false,
             discharging: false,
+            sleep_halted: false,
         }
+    }
+
+    /// Engage the sleep-drain latch ahead of suspend: intake halts
+    /// immediately and stays clamped until [`Self::resume_from_sleep`].
+    pub fn halt_for_sleep(&mut self) {
+        self.sleep_halted = true;
+        self.last_slots = 0;
+    }
+
+    /// Clear the sleep-drain latch on resume; the next tick recomputes
+    /// slots normally.
+    pub fn resume_from_sleep(&mut self) {
+        self.sleep_halted = false;
     }
 
     /// Refresh workstation guards from live sensors, applying the
@@ -622,15 +639,86 @@ async fn shutdown_signal() {
 /// Best-effort under unprivileged execution: if the slice is not writable,
 /// pressure is still polled, logged, and published to state.
 #[cfg(unix)]
-pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
-    run_supervisor_inner(state).await
+pub async fn run_supervisor(
+    state: SharedState,
+    power_rx: Option<tokio::sync::broadcast::Receiver<crate::power::PowerEvent>>,
+) -> anyhow::Result<()> {
+    run_supervisor_inner(state, power_rx).await
 }
 
 /// Windows governor loop: Win32 sensor → shared ladder → Job Object
 /// limits. Mirrors the unix loop; shutdown via `ctrl_c`.
 #[cfg(windows)]
-pub async fn run_supervisor(state: SharedState) -> anyhow::Result<()> {
-    run_supervisor_inner_windows(state).await
+pub async fn run_supervisor(
+    state: SharedState,
+    power_rx: Option<tokio::sync::broadcast::Receiver<crate::power::PowerEvent>>,
+) -> anyhow::Result<()> {
+    run_supervisor_inner_windows(state, power_rx).await
+}
+
+/// Sleep latch: halted intake reports zero slots.
+fn sleep_clamped_slots(halted: bool, slots: u32) -> u32 {
+    if halted {
+        0
+    } else {
+        slots
+    }
+}
+
+/// Flush the cache index when a store is attached. Returns whether a
+/// flush ran (the sleep arm's observable; shutdown arms keep their
+/// own error-logging variant).
+async fn flush_cache_index(state: &SharedState) -> bool {
+    if let Some(store) = state.read().await.cache_store() {
+        let _ = store.flush();
+        true
+    } else {
+        false
+    }
+}
+
+/// Next power event, or pending forever when unsubscribed. Lagged
+/// receivers skip to live; a closed channel (watcher gone) parks.
+async fn power_event_or_pending(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<crate::power::PowerEvent>>,
+) -> crate::power::PowerEvent {
+    use tokio::sync::broadcast::error::RecvError;
+    let Some(rx) = rx else {
+        return std::future::pending().await;
+    };
+    loop {
+        match rx.recv().await {
+            Ok(event) => return event,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => return std::future::pending().await,
+        }
+    }
+}
+
+/// One power transition: latch/flush on sleep, restore on resume,
+/// log lid edges. Shared by both supervisor loops.
+async fn handle_power_event(state: &SharedState, event: crate::power::PowerEvent) {
+    use crate::power::PowerEvent;
+    match event {
+        PowerEvent::PreparingSleep { delay_ms } => {
+            eprintln!(
+                "runner: power event: host preparing sleep (delay: {delay_ms}ms); \
+                 flushing state and halting intake"
+            );
+            state.write().await.halt_for_sleep();
+            flush_cache_index(state).await;
+        }
+        PowerEvent::Resumed => {
+            eprintln!("runner: power event: host resumed from sleep; restoring intake");
+            state.write().await.resume_from_sleep();
+        }
+        PowerEvent::LidClosed => {
+            eprintln!("runner: power event: laptop lid closed");
+        }
+        PowerEvent::LidOpened => {
+            eprintln!("runner: power event: laptop lid opened");
+        }
+    }
 }
 
 /// Weight for one Windows tick: worst pressure level through the
@@ -671,7 +759,10 @@ pub fn tick_weight_windows(
 }
 
 #[cfg(windows)]
-async fn run_supervisor_inner_windows(state: SharedState) -> anyhow::Result<()> {
+async fn run_supervisor_inner_windows(
+    state: SharedState,
+    mut power_rx: Option<tokio::sync::broadcast::Receiver<crate::power::PowerEvent>>,
+) -> anyhow::Result<()> {
     let job = match super::windows::JobObject::system_default() {
         Ok(job) => Some(job),
         Err(e) => {
@@ -703,6 +794,9 @@ async fn run_supervisor_inner_windows(state: SharedState) -> anyhow::Result<()> 
                 }
                 break;
             }
+            event = power_event_or_pending(&mut power_rx) => {
+                handle_power_event(&state, event).await;
+            }
             _ = tick.tick() => {
                 let snapshot = match sensor.sample() {
                     Ok(Some(snapshot)) => snapshot,
@@ -724,8 +818,10 @@ async fn run_supervisor_inner_windows(state: SharedState) -> anyhow::Result<()> 
                     .map(|n| n.get() as u32)
                     .unwrap_or(1);
                 let slots = guard.clamp_slots(effective_slots(base, &snapshot));
-                guard.last_slots =
-                    apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging);
+                guard.last_slots = sleep_clamped_slots(
+                    guard.sleep_halted,
+                    apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging),
+                );
                 drop(guard);
                 if let Some(job) = job {
                     if let Err(e) = job.set_cpu_weight(weight) {
@@ -739,7 +835,10 @@ async fn run_supervisor_inner_windows(state: SharedState) -> anyhow::Result<()> 
 }
 
 #[cfg(unix)]
-async fn run_supervisor_inner(state: SharedState) -> anyhow::Result<()> {
+async fn run_supervisor_inner(
+    state: SharedState,
+    mut power_rx: Option<tokio::sync::broadcast::Receiver<crate::power::PowerEvent>>,
+) -> anyhow::Result<()> {
     let slice = CgroupSlice::system_default();
     let writable = match slice.ensure_baseline() {
         Ok(()) => true,
@@ -766,6 +865,9 @@ async fn run_supervisor_inner(state: SharedState) -> anyhow::Result<()> {
                 }
                 break;
             }
+            event = power_event_or_pending(&mut power_rx) => {
+                handle_power_event(&state, event).await;
+            }
             changed = rx.changed() => {
                 if changed.is_err() {
                     break;
@@ -781,8 +883,10 @@ async fn run_supervisor_inner(state: SharedState) -> anyhow::Result<()> {
                 guard.last_weight = Some(weight);
                 let base = detect_slots(guard.afk.boosted()).map(|r| r.slots).unwrap_or(1);
                 let slots = guard.clamp_slots(effective_slots(base, &snapshot));
-                guard.last_slots =
-                    apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging);
+                guard.last_slots = sleep_clamped_slots(
+                    guard.sleep_halted,
+                    apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging),
+                );
                 drop(guard);
                 if writable {
                     if let Err(e) = slice.set_weight(weight) {
@@ -801,6 +905,48 @@ async fn run_supervisor_inner(state: SharedState) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::governor::psi::{PsiFile, PsiLine};
+
+    // Sleep latch: halting zeroes intake immediately and clamps every
+    // tick while set; resume restores normal allocation.
+    #[test]
+    fn sleep_latch_clamps_and_restores_slots() {
+        let mut state = SupervisorState::new();
+        state.last_slots = 4;
+        state.halt_for_sleep();
+        assert!(state.sleep_halted);
+        assert_eq!(state.last_slots, 0);
+        assert_eq!(sleep_clamped_slots(true, 4), 0);
+        state.resume_from_sleep();
+        assert!(!state.sleep_halted);
+        assert_eq!(sleep_clamped_slots(false, 4), 4);
+    }
+
+    // The sleep arm flushes a real attached store (index file lands
+    // on disk) and reports false when no store is attached.
+    #[tokio::test]
+    async fn sleep_flushes_attached_cache_index() {
+        use crate::cache::server::{CacheServerState, MdnsPeerResolver};
+        use crate::cache::CacheStore;
+
+        let state = new_shared_state();
+        assert!(!flush_cache_index(&state).await);
+        let dir = crate::test_support::TempDir::new("sleep-flush").unwrap();
+        let store = CacheStore::open(dir.path(), 1024 * 1024).unwrap();
+        state.write().await.set_cache(CacheServerState {
+            store,
+            public_base: "http://127.0.0.1:1".to_string(),
+            token: "test".to_string(),
+            download_secret: [7u8; 32],
+            http: reqwest::Client::new(),
+            peers: std::sync::Arc::new(MdnsPeerResolver),
+        });
+        assert!(flush_cache_index(&state).await);
+        let index = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().contains("index.json"));
+        assert!(index, "flush must persist the cache index file");
+    }
 
     fn snapshot_with(cpu_some: f64, mem_some: f64, io_full: f64) -> PsiSnapshot {
         PsiSnapshot {

@@ -32,10 +32,9 @@ async fn worker_tree_assignment_and_limits_round_trip() {
 async fn supervisor_loop_ticks_and_applies_weight() {
     let state = runner_core::governor::supervisor::new_shared_state();
     let task_state = state.clone();
-    let task =
-        tokio::spawn(
-            async move { runner_core::governor::supervisor::run_supervisor(task_state).await },
-        );
+    let task = tokio::spawn(async move {
+        runner_core::governor::supervisor::run_supervisor(task_state, None).await
+    });
     // Several 250ms ticks (the first only seeds the sensor).
     tokio::time::sleep(Duration::from_millis(900)).await;
     task.abort();

@@ -673,6 +673,48 @@ fn check_double_start(pid_path: &std::path::Path) -> BootPidAction {
     }
 }
 
+/// Power-transition audit trail: the supervisor loop owns the
+/// latch and flush (runner-core cannot depend on runner-enterprise
+/// without a cycle), while this task records the same transitions.
+/// Best-effort throughout; a missing watcher simply spawns nothing.
+fn spawn_power_audit_task(
+    power_rx: Option<tokio::sync::broadcast::Receiver<runner_core::power::PowerEvent>>,
+) {
+    use runner_core::power::PowerEvent;
+    let Some(mut rx) = power_rx else {
+        return;
+    };
+    tokio::spawn(async move {
+        use runner_enterprise::audit::{AuditLog, LogLevel};
+        use tokio::sync::broadcast::error::RecvError;
+        loop {
+            match rx.recv().await {
+                Ok(PowerEvent::PreparingSleep { .. }) => {
+                    if let Some(mut log) = AuditLog::open_default() {
+                        log.append(
+                            LogLevel::Info,
+                            "power",
+                            "host preparing sleep: state flushed, intake halted",
+                        );
+                    }
+                }
+                Ok(PowerEvent::Resumed) => {
+                    if let Some(mut log) = AuditLog::open_default() {
+                        log.append(
+                            LogLevel::Info,
+                            "power",
+                            "host resumed from sleep: intake restored",
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 fn cmd_stop(force: bool) -> Result<()> {
     let pid_path = resolve_pid_path();
     let sock_path = resolve_sock_path();
@@ -1377,7 +1419,9 @@ async fn main() -> Result<()> {
                 .await;
             spawn_coordinator(&config, state.clone(), strict).await;
             spawn_embedded_listener(&config, state.clone()).await;
-            run_supervisor(state).await?;
+            let power_watcher = runner_core::power::start();
+            spawn_power_audit_task(power_watcher.as_ref().map(|w| w.subscribe()));
+            run_supervisor(state, power_watcher.as_ref().map(|w| w.subscribe())).await?;
             remove_pidfile(&pid_path);
         }
         Commands::Stop { force, .. } => {

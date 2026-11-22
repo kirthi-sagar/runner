@@ -6,6 +6,17 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## [2.6.1] - 2026-11-22
+
+- Fix Windows CI triage: `WfpEngineSession` is `Send` (owned engine
+  handle, no thread affinity) so the supervised worker future keeps
+  its `Send` bound; compile-time regression test included.
+- Fix supply-chain audit: bump `url` 2.5.8 → 2.5.9 for
+  RUSTSEC-2026-0592 (`Url::origin()` stack overflow on nested
+  `blob:` URLs).
+- Fix Windows target clippy: cfg-gate egress-guard test imports
+  (`EgressFilterProgram`, `Duration`) to their consuming platforms.
+
 ## v2.6.0 — 2026-11-22
 
 - Windows Filtering Platform egress: dynamic engine session

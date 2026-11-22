@@ -1303,6 +1303,7 @@ async fn main() -> Result<()> {
             state.write().await.set_reservation_hooks(Arc::new(
                 runner_enterprise::spend::EnterpriseReservationHooks::from_default_paths(
                     config.reservations.monthly_spend_cap_usd,
+                    config.reservations.effective_rate(),
                 ),
             ));
             let sock_path = resolve_sock_path();

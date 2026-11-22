@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::reservation::{ReservationLimits, ReservationRequest, ReserveError};
+use super::reservation::{ReservationRequest, ReserveError};
 use crate::config::RunnerConfig;
 use crate::governor::cgroup::{WEIGHT_TRICKLE, WEIGHT_WARNING};
 use crate::governor::supervisor::SharedState;
@@ -375,7 +375,9 @@ pub(crate) async fn reserve_on(
     let now = Instant::now();
     let mut guard = state.write().await;
     guard.prune_expired(now);
-    let limits = ReservationLimits::default();
+    // Configured ceilings (daemon-seeded; owned clone so the later
+    // mutable borrows below don't conflict).
+    let limits = guard.reservation_limits().clone();
     if let Err(e) = request.validate(&limits, guard.reservation_count()) {
         match e {
             // Malformed or over-limit requests never evict anyone.
@@ -1142,6 +1144,35 @@ mod tests {
         }
         // Rejected before delegation: the daemon arm never fires.
         assert!(agent.reserves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserve_configured_ceilings_reject_with_invalid() {
+        let state = new_shared_state();
+        let mut config = RunnerConfig::default();
+        config.reservations.limits = Some(crate::config::ReservationLimitsConfig {
+            max_cores: Some(1.0),
+            ..crate::config::ReservationLimitsConfig::default()
+        });
+        state.write().await.seed_from_config(&config);
+        let ctx = ToolContext::new(state, config);
+        // Over the configured 1-core ceiling (but far under the
+        // 1024-core default): rejected as an invalid request.
+        let over = serde_json::json!({
+            "cores": 2.0, "memory_mb": 64, "duration_secs": 60,
+        });
+        let err = execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&over), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("exceeds max"), "{}", err.message);
+        // Within the configured ceiling: granted.
+        let ok = serde_json::json!({
+            "cores": 1.0, "memory_mb": 64, "duration_secs": 60,
+        });
+        execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&ok), &ctx)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

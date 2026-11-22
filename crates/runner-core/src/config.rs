@@ -557,6 +557,50 @@ pub struct RunnerConfig {
     pub reservations: ReservationsConfig,
 }
 
+/// Nominal internal transfer rate, USD per core-hour, applied when
+/// no rate is configured. Prices agent headroom against the monthly
+/// cap; it is not cloud money.
+pub const DEFAULT_HOST_CORE_HOUR_USD: f64 = 0.05;
+
+/// Sanity ceilings for one reservation request. These guard against
+/// absurd or typo'd requests, not capacity planning — headroom
+/// contention is the preemption layer's job.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReservationLimits {
+    /// Maximum cores per reservation.
+    pub max_cores: f64,
+    /// Maximum memory per reservation, MiB.
+    pub max_memory_mb: u64,
+    /// Maximum duration per reservation, seconds.
+    pub max_duration_secs: u64,
+    /// Maximum simultaneously live reservations.
+    pub max_active: usize,
+}
+
+impl Default for ReservationLimits {
+    fn default() -> Self {
+        Self {
+            max_cores: 1024.0,
+            max_memory_mb: 4_194_304,
+            max_duration_secs: 604_800,
+            max_active: 256,
+        }
+    }
+}
+
+/// Per-field reservation limit overrides (each `None` keeps the default).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ReservationLimitsConfig {
+    #[serde(default)]
+    pub max_cores: Option<f64>,
+    #[serde(default)]
+    pub max_memory_mb: Option<u64>,
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
+    #[serde(default)]
+    pub max_active: Option<usize>,
+}
+
 /// Host reservation budget policy.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ReservationsConfig {
@@ -567,6 +611,38 @@ pub struct ReservationsConfig {
     /// free feature, so the default must not break existing users.
     #[serde(default)]
     pub monthly_spend_cap_usd: f64,
+    /// Transfer rate override, USD per core-hour (`None` keeps the
+    /// nominal [`DEFAULT_HOST_CORE_HOUR_USD`]).
+    #[serde(default)]
+    pub rate_host_core_hour_usd: Option<f64>,
+    /// Reservation sanity ceilings override (each `None` keeps the
+    /// [`ReservationLimits`] default).
+    #[serde(default)]
+    pub limits: Option<ReservationLimitsConfig>,
+}
+
+impl ReservationsConfig {
+    /// Effective transfer rate: configured override or nominal default.
+    pub fn effective_rate(&self) -> f64 {
+        self.rate_host_core_hour_usd
+            .unwrap_or(DEFAULT_HOST_CORE_HOUR_USD)
+    }
+
+    /// Effective limits: configured overrides merged over defaults.
+    pub fn effective_limits(&self) -> ReservationLimits {
+        let defaults = ReservationLimits::default();
+        match &self.limits {
+            None => defaults,
+            Some(limits) => ReservationLimits {
+                max_cores: limits.max_cores.unwrap_or(defaults.max_cores),
+                max_memory_mb: limits.max_memory_mb.unwrap_or(defaults.max_memory_mb),
+                max_duration_secs: limits
+                    .max_duration_secs
+                    .unwrap_or(defaults.max_duration_secs),
+                max_active: limits.max_active.unwrap_or(defaults.max_active),
+            },
+        }
+    }
 }
 
 /// Power management: clamshell keep-alive while AC-powered jobs run.
@@ -897,6 +973,48 @@ mod tests {
         assert_eq!(RunnerConfig::default().server.listen_port, None);
         let config: RunnerConfig = toml::from_str("[server]\nlisten_port = 9898\n").unwrap();
         assert_eq!(config.server.listen_port, Some(9898));
+    }
+
+    #[test]
+    fn reservations_effective_limits_merge_over_defaults() {
+        // Unset: pure defaults.
+        assert_eq!(
+            ReservationsConfig::default().effective_limits(),
+            ReservationLimits::default()
+        );
+        // Partial override: set fields win, the rest stay default.
+        let config = ReservationsConfig {
+            limits: Some(ReservationLimitsConfig {
+                max_cores: Some(8.0),
+                max_active: Some(4),
+                ..ReservationLimitsConfig::default()
+            }),
+            ..ReservationsConfig::default()
+        };
+        let limits = config.effective_limits();
+        assert_eq!(limits.max_cores, 8.0);
+        assert_eq!(limits.max_active, 4);
+        assert_eq!(
+            limits.max_memory_mb,
+            ReservationLimits::default().max_memory_mb
+        );
+        assert_eq!(
+            limits.max_duration_secs,
+            ReservationLimits::default().max_duration_secs
+        );
+    }
+
+    #[test]
+    fn reservations_effective_rate_defaults_nominal() {
+        assert_eq!(
+            ReservationsConfig::default().effective_rate(),
+            DEFAULT_HOST_CORE_HOUR_USD
+        );
+        let config = ReservationsConfig {
+            rate_host_core_hour_usd: Some(0.12),
+            ..ReservationsConfig::default()
+        };
+        assert_eq!(config.effective_rate(), 0.12);
     }
 
     #[test]

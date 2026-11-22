@@ -130,6 +130,7 @@ pub struct SupervisorState {
     pub afk_last_probe: Option<Instant>,
     reservations: HashMap<String, Reservation>,
     reservation_hooks: Option<Arc<dyn crate::mcp::reservation::ReservationHooks>>,
+    reservation_limits: crate::config::ReservationLimits,
     throttle: Option<ThrottleOverride>,
     drained: HashMap<String, String>,
     peers: HashMap<String, PeerRecord>,
@@ -180,6 +181,7 @@ impl SupervisorState {
             afk_last_probe: None,
             reservations: HashMap::new(),
             reservation_hooks: None,
+            reservation_limits: crate::config::ReservationLimits::default(),
             throttle: None,
             drained: HashMap::new(),
             peers: HashMap::new(),
@@ -287,6 +289,7 @@ impl SupervisorState {
         self.afk_mode = AfkMode::parse(&config.governor.afk_mode);
         self.afk_idle_secs = config.governor.afk_idle_seconds;
         self.prevent_sleep_on_ac = config.power.prevent_sleep_on_ac;
+        self.reservation_limits = config.reservations.effective_limits();
     }
 
     /// Evaluate AFK boost for this tick. Always/Never modes bypass the
@@ -384,6 +387,17 @@ impl SupervisorState {
     /// limits only).
     pub fn reservation_hooks(&self) -> Option<Arc<dyn crate::mcp::reservation::ReservationHooks>> {
         self.reservation_hooks.clone()
+    }
+
+    /// Override the reservation sanity ceilings (daemon seeds from
+    /// config; tests script tight budgets through this).
+    pub fn set_reservation_limits(&mut self, limits: crate::config::ReservationLimits) {
+        self.reservation_limits = limits;
+    }
+
+    /// Active reservation sanity ceilings.
+    pub fn reservation_limits(&self) -> &crate::config::ReservationLimits {
+        &self.reservation_limits
     }
 
     /// Evict lower-priority leases whose combined headroom covers an

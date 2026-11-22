@@ -18,11 +18,6 @@ use super::audit::{AuditLog, LogLevel};
 use runner_core::mcp::reservation::{ReservationHooks, ReservationRequest};
 use runner_core::mesh::cloud::ledger::year_month;
 
-/// Nominal internal transfer rate, USD per core-hour. This prices
-/// agent headroom against the monthly cap; it is not cloud money.
-/// Configurable rate is a follow-up.
-pub const RATE_HOST_CORE_HOUR_USD: f64 = 0.05;
-
 /// One reservation's billable lifecycle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReservationSpendEntry {
@@ -51,14 +46,14 @@ impl ReservationSpendEntry {
         self.cores * (self.elapsed_secs(now_secs) as f64 / 3600.0)
     }
 
-    /// Accrued USD through `now_secs`.
-    pub fn accrued_cost_usd(&self, now_secs: u64) -> f64 {
-        self.accrued_core_hours(now_secs) * RATE_HOST_CORE_HOUR_USD
+    /// Accrued USD through `now_secs` at an explicit rate.
+    pub fn accrued_cost_usd(&self, now_secs: u64, rate_usd_per_core_hour: f64) -> f64 {
+        self.accrued_core_hours(now_secs) * rate_usd_per_core_hour
     }
 
     /// Estimated total cost if held for the full duration.
-    pub fn estimated_total_cost_usd(&self) -> f64 {
-        self.cores * (self.duration_secs as f64 / 3600.0) * RATE_HOST_CORE_HOUR_USD
+    pub fn estimated_total_cost_usd(&self, rate_usd_per_core_hour: f64) -> f64 {
+        self.cores * (self.duration_secs as f64 / 3600.0) * rate_usd_per_core_hour
     }
 }
 
@@ -133,20 +128,31 @@ impl ReservationSpendLedger {
         Ok(())
     }
 
-    /// Total USD accrued by entries granted in (year, month).
-    pub fn month_spend(&self, year: i32, month: u32, now_secs: u64) -> Result<f64, String> {
+    /// Total USD accrued by entries granted in (year, month), priced
+    /// at an explicit rate.
+    pub fn month_spend(
+        &self,
+        year: i32,
+        month: u32,
+        now_secs: u64,
+        rate_usd_per_core_hour: f64,
+    ) -> Result<f64, String> {
         Ok(self
             .load()?
             .iter()
             .filter(|e| year_month(e.granted_at) == (year, month))
-            .map(|e| e.accrued_cost_usd(now_secs))
+            .map(|e| e.accrued_cost_usd(now_secs, rate_usd_per_core_hour))
             .sum())
     }
 
     /// Spend for the calendar month containing `now_secs`.
-    pub fn current_month_spend(&self, now_secs: u64) -> Result<f64, String> {
+    pub fn current_month_spend(
+        &self,
+        now_secs: u64,
+        rate_usd_per_core_hour: f64,
+    ) -> Result<f64, String> {
         let (year, month) = year_month(now_secs);
-        self.month_spend(year, month, now_secs)
+        self.month_spend(year, month, now_secs, rate_usd_per_core_hour)
     }
 }
 
@@ -166,6 +172,8 @@ pub struct EnterpriseReservationHooks {
     ledger: Option<ReservationSpendLedger>,
     audit_path: Option<PathBuf>,
     monthly_cap_usd: f64,
+    /// Configured transfer price, USD per core-hour.
+    rate_usd_per_core_hour: f64,
 }
 
 impl EnterpriseReservationHooks {
@@ -173,19 +181,22 @@ impl EnterpriseReservationHooks {
         ledger_path: Option<PathBuf>,
         audit_path: Option<PathBuf>,
         monthly_cap_usd: f64,
+        rate_usd_per_core_hour: f64,
     ) -> Self {
         Self {
             ledger: ledger_path.map(ReservationSpendLedger::new),
             audit_path,
             monthly_cap_usd,
+            rate_usd_per_core_hour,
         }
     }
 
-    pub fn from_default_paths(monthly_cap_usd: f64) -> Self {
+    pub fn from_default_paths(monthly_cap_usd: f64, rate_usd_per_core_hour: f64) -> Self {
         Self::new(
             default_ledger_path(),
             super::audit::default_audit_path(),
             monthly_cap_usd,
+            rate_usd_per_core_hour,
         )
     }
 
@@ -212,10 +223,12 @@ impl ReservationHooks for EnterpriseReservationHooks {
                 .to_string());
         };
         let now = now_secs();
-        let spent = ledger.current_month_spend(now).map_err(|e| {
+        let spent = ledger
+            .current_month_spend(now, self.rate_usd_per_core_hour)
+            .map_err(|e| {
             format!("cannot verify reservation spend against the ledger ({e}); refusing to provision blind")
         })?;
-        let estimate = request.estimated_cost_usd(RATE_HOST_CORE_HOUR_USD);
+        let estimate = request.estimated_cost_usd(self.rate_usd_per_core_hour);
         if spent + estimate > self.monthly_cap_usd {
             return Err(format!(
                 "reservation estimated ${estimate:.2} exceeds remaining monthly budget \
@@ -254,7 +267,7 @@ impl ReservationHooks for EnterpriseReservationHooks {
                 reservation.id,
                 reservation.cores,
                 reservation.ram_mb,
-                request.estimated_cost_usd(RATE_HOST_CORE_HOUR_USD),
+                request.estimated_cost_usd(self.rate_usd_per_core_hour),
             ),
         );
         Ok(())
@@ -304,6 +317,7 @@ impl ReservationHooks for EnterpriseReservationHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use runner_core::config::DEFAULT_HOST_CORE_HOUR_USD;
     use runner_core::governor::supervisor::ReservationPriority;
 
     /// 2026-11-16T00:00:00Z.
@@ -333,15 +347,18 @@ mod tests {
         // One hour in: 2 core-hours at the nominal rate.
         assert_eq!(e.accrued_core_hours(NOV_16 + 3600), 2.0);
         assert_eq!(
-            e.accrued_cost_usd(NOV_16 + 3600),
-            2.0 * RATE_HOST_CORE_HOUR_USD
+            e.accrued_cost_usd(NOV_16 + 3600, DEFAULT_HOST_CORE_HOUR_USD),
+            2.0 * DEFAULT_HOST_CORE_HOUR_USD
         );
-        assert_eq!(e.estimated_total_cost_usd(), 4.0 * RATE_HOST_CORE_HOUR_USD);
+        assert_eq!(
+            e.estimated_total_cost_usd(DEFAULT_HOST_CORE_HOUR_USD),
+            4.0 * DEFAULT_HOST_CORE_HOUR_USD
+        );
         // Release freezes accrual: far-future cost equals release cost.
         e.released_at = Some(NOV_16 + 3600);
         assert_eq!(
-            e.accrued_cost_usd(NOV_16 + 100_000),
-            e.accrued_cost_usd(NOV_16 + 3600)
+            e.accrued_cost_usd(NOV_16 + 100_000, DEFAULT_HOST_CORE_HOUR_USD),
+            e.accrued_cost_usd(NOV_16 + 3600, DEFAULT_HOST_CORE_HOUR_USD)
         );
     }
 
@@ -349,7 +366,12 @@ mod tests {
     fn ledger_roundtrip_attributes_by_grant_month() {
         let dir = temp_dir("spend-ledger");
         let ledger = ReservationSpendLedger::new(dir.path().join("spend.json"));
-        assert_eq!(ledger.current_month_spend(NOV_16 + 3600).unwrap(), 0.0);
+        assert_eq!(
+            ledger
+                .current_month_spend(NOV_16 + 3600, DEFAULT_HOST_CORE_HOUR_USD)
+                .unwrap(),
+            0.0
+        );
         ledger
             .record_grant(entry("nov", 2.0, NOV_16, 7200))
             .unwrap();
@@ -362,8 +384,10 @@ mod tests {
             .unwrap();
         assert_eq!(ledger.load().unwrap().len(), 2);
         // Only the November grant counts toward November spend.
-        let spend = ledger.current_month_spend(NOV_16 + 3600).unwrap();
-        assert_eq!(spend, 2.0 * RATE_HOST_CORE_HOUR_USD);
+        let spend = ledger
+            .current_month_spend(NOV_16 + 3600, DEFAULT_HOST_CORE_HOUR_USD)
+            .unwrap();
+        assert_eq!(spend, 2.0 * DEFAULT_HOST_CORE_HOUR_USD);
         // Unknown release is a no-op.
         ledger.record_release("ghost", NOV_16 + 10).unwrap();
         ledger.record_release("nov", NOV_16 + 3600).unwrap();
@@ -386,6 +410,7 @@ mod tests {
             Some(dir.path().join("spend.json")),
             Some(dir.path().join("audit.jsonl")),
             cap,
+            DEFAULT_HOST_CORE_HOUR_USD,
         )
     }
 
@@ -411,6 +436,23 @@ mod tests {
         // Zero cap means unenforced (deliberate cloud divergence).
         let hooks = hooks_with_cap(&dir, 0.0);
         assert!(hooks.check_budget(&request(1024.0, 604_800)).is_ok());
+    }
+
+    #[test]
+    fn budget_gate_prices_with_configured_rate() {
+        let dir = temp_dir("spend-rate");
+        // 2 cores x 1h = 2 core-hours: $0.10 at the nominal rate, $0.20
+        // at a doubled configured rate.
+        let nominal = hooks_with_cap(&dir, 0.15);
+        assert!(nominal.check_budget(&request(2.0, 3600)).is_ok());
+        let priced = EnterpriseReservationHooks::new(
+            Some(dir.path().join("spend.json")),
+            Some(dir.path().join("audit.jsonl")),
+            0.15,
+            2.0 * DEFAULT_HOST_CORE_HOUR_USD,
+        );
+        let err = priced.check_budget(&request(2.0, 3600)).unwrap_err();
+        assert!(err.contains("exceeds remaining monthly budget"), "{err}");
     }
 
     #[test]

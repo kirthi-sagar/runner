@@ -32,6 +32,9 @@ use serde::{Deserialize, Serialize};
 use super::tools::ReserveHostResourcesArgs;
 use crate::governor::supervisor::{Reservation, ReservationPriority};
 
+/// Re-exported sanity ceilings (defined beside the config that
+/// overrides them).
+pub use crate::config::ReservationLimits;
 /// Re-exported victim policy (defined beside the governor state it
 /// acts on); the preemption groundwork tests below resolve through it.
 pub use crate::governor::supervisor::select_preemption_victims;
@@ -136,33 +139,6 @@ impl ReservationHooks for ScriptHooks {
             .unwrap()
             .push(format!("preempt:{}", victim_ids.len()));
         Ok(())
-    }
-}
-
-/// Sanity ceilings for one reservation request. These guard against
-/// absurd or typo'd requests (1e18 cores), not capacity planning —
-/// headroom contention is the preemption layer's job (later phase).
-/// Config wiring for these bounds is a follow-up.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReservationLimits {
-    /// Maximum cores per reservation.
-    pub max_cores: f64,
-    /// Maximum memory per reservation, MiB.
-    pub max_memory_mb: u64,
-    /// Maximum duration per reservation, seconds.
-    pub max_duration_secs: u64,
-    /// Maximum simultaneously live reservations.
-    pub max_active: usize,
-}
-
-impl Default for ReservationLimits {
-    fn default() -> Self {
-        Self {
-            max_cores: 1024.0,
-            max_memory_mb: 4_194_304,
-            max_duration_secs: 604_800,
-            max_active: 256,
-        }
     }
 }
 

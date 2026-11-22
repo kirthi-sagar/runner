@@ -271,6 +271,17 @@ impl ReservationHooks for EnterpriseReservationHooks {
         Ok(())
     }
 
+    fn on_released(&self, reservation_id: &str) -> Result<(), String> {
+        if let Some(ledger) = &self.ledger {
+            ledger.record_release(reservation_id, now_secs())?;
+        }
+        self.audit(
+            LogLevel::Info,
+            format!("reservation {reservation_id} expired naturally; headroom reclaimed"),
+        );
+        Ok(())
+    }
+
     fn on_preempt(
         &self,
         victim_ids: &[String],
@@ -409,6 +420,46 @@ mod tests {
         let hooks = hooks_with_cap(&dir, 10.0);
         let err = hooks.check_budget(&request(1.0, 60)).unwrap_err();
         assert!(err.contains("refusing to provision blind"), "{err}");
+    }
+
+    #[test]
+    fn natural_expiry_stamps_ledger_and_audits_reclaim() {
+        use runner_core::governor::supervisor::{ReservationPriority, SupervisorState};
+        use runner_core::mcp::reservation::ReservationHooks;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let dir = temp_dir("spend-expiry");
+        let mut state = SupervisorState::new();
+        state.set_reservation_hooks(Arc::new(hooks_with_cap(&dir, 0.0)));
+        let now = Instant::now();
+        // Seed the ledger the way on_grant would, then expire.
+        let reservation = state.reserve(
+            2.0,
+            2048,
+            Duration::from_secs(1),
+            "t".into(),
+            ReservationPriority::Normal,
+            now,
+        );
+        let hooks = hooks_with_cap(&dir, 0.0);
+        hooks.on_grant(&reservation, &request(2.0, 3600)).unwrap();
+        state.prune_expired(now + Duration::from_secs(2));
+        // Ledger stamped released; audit carries the exact reclaim line.
+        let ledger = ReservationSpendLedger::new(dir.path().join("spend.json"));
+        let entries = ledger.load().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].released_at.is_some());
+        let trail = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        assert!(
+            trail.contains(&format!(
+                "reservation {} expired naturally; headroom reclaimed",
+                reservation.id
+            )),
+            "{trail}"
+        );
+        let log = super::super::audit::AuditLog::open(&dir.path().join("audit.jsonl")).unwrap();
+        assert!(log.verify());
     }
 
     #[test]

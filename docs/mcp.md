@@ -114,7 +114,9 @@ intake slots down until release or expiry. With
 `[reservations] monthly_spend_cap_usd` set, grants whose estimated
 cost exceeds the remaining budget deny fail-closed (`-32603`); every
 grant, release, and preemption lands in the spend ledger and the
-SHA-256 audit trail.
+SHA-256 audit trail. Natural expiry stamps the ledger, audits
+`reservation <id> expired naturally; headroom reclaimed`, and
+restores batch slots on the next tick.
 
 `release_host_resources` — input: `reservation_id` (string,
 required). Output: `released`. Unknown id → `-32602`.

@@ -49,7 +49,10 @@ pub use crate::governor::supervisor::select_preemption_victims;
 /// `on_grant` failures roll the grant back; `on_release` failures
 /// are logged by the caller while the release stands (cleanup must
 /// not strand capacity); `on_preempt` failures propagate (fail-closed
-/// and self-healing: victims are already gone, so a retry admits).
+/// and self-healing: victims are already gone, so a retry admits);
+/// `on_released` failures are logged per lease while pruning proceeds
+/// (expiry is a fact of time — capacity restoration must never wait
+/// on accounting IO).
 pub trait ReservationHooks: Send + Sync + std::fmt::Debug {
     /// Deny when the estimated cost exceeds remaining budget.
     fn check_budget(&self, request: &ReservationRequest) -> Result<(), String>;
@@ -59,8 +62,12 @@ pub trait ReservationHooks: Send + Sync + std::fmt::Debug {
         reservation: &Reservation,
         request: &ReservationRequest,
     ) -> Result<(), String>;
-    /// Record a release (ledger + audit; best-effort at the call site).
+    /// Record an explicit release (ledger + audit; best-effort at the
+    /// call site).
     fn on_release(&self, reservation: &Reservation) -> Result<(), String>;
+    /// Record a natural expiry (ledger stamp + distinct audit record;
+    /// best-effort at the prune call site).
+    fn on_released(&self, reservation_id: &str) -> Result<(), String>;
     /// Record preemption victims evicted for an incoming request.
     fn on_preempt(
         &self,
@@ -75,7 +82,7 @@ pub trait ReservationHooks: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct ScriptHooks {
     /// Recorded calls: "budget", "grant:{id}", "release:{id}",
-    /// "preempt:{n}".
+    /// "expired:{id}", "preempt:{n}".
     pub calls: std::sync::Mutex<Vec<String>>,
     /// When set, `check_budget` denies with this message (once).
     pub deny_budget_with: std::sync::Mutex<Option<String>>,
@@ -108,6 +115,14 @@ impl ReservationHooks for ScriptHooks {
             .lock()
             .unwrap()
             .push(format!("release:{}", reservation.id));
+        Ok(())
+    }
+
+    fn on_released(&self, reservation_id: &str) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("expired:{reservation_id}"));
         Ok(())
     }
 

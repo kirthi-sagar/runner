@@ -313,11 +313,30 @@ impl SupervisorState {
         }
     }
 
-    /// Drop expired reservations and throttle overrides.
+    /// Drop expired reservations and throttle overrides. Every
+    /// expired lease id goes to the accounting hooks; hook failures
+    /// log per lease while pruning proceeds — expiry is a fact of
+    /// time, so capacity restoration never waits on accounting IO.
     pub fn prune_expired(&mut self, now: Instant) {
-        self.reservations.retain(|_, r| !r.expired(now));
+        let hooks = self.reservation_hooks.clone();
+        let mut expired = Vec::new();
+        self.reservations.retain(|id, r| {
+            if r.expired(now) {
+                expired.push(id.clone());
+                false
+            } else {
+                true
+            }
+        });
         if self.throttle.as_ref().is_some_and(|t| t.expired(now)) {
             self.throttle = None;
+        }
+        if let Some(hooks) = hooks {
+            for id in &expired {
+                if let Err(e) = hooks.on_released(id) {
+                    eprintln!("runner: reservation expiry accounting failed for {id}: {e}");
+                }
+            }
         }
     }
 
@@ -1622,6 +1641,35 @@ mod tests {
         state.reserve(3.0, 8192, Duration::from_secs(1), "t".into(), Normal, now);
         assert_eq!(state.clamp_slots_for_reservations(8), 4);
         state.prune_expired(now + Duration::from_secs(2));
+        assert_eq!(state.clamp_slots_for_reservations(8), 8);
+    }
+
+    #[test]
+    fn prune_fires_expiry_hooks_and_restores_clamp() {
+        use crate::mcp::reservation::ScriptHooks;
+        use std::sync::Arc;
+        let mut state = SupervisorState::new();
+        let hooks = Arc::new(ScriptHooks::default());
+        state.set_reservation_hooks(hooks.clone());
+        let now = Instant::now();
+        let id = state
+            .reserve(
+                3.0,
+                8192,
+                Duration::from_secs(1),
+                "t".into(),
+                ReservationPriority::Normal,
+                now,
+            )
+            .id;
+        assert_eq!(state.clamp_slots_for_reservations(8), 4);
+        state.prune_expired(now + Duration::from_secs(2));
+        // Hook fired once per expired lease; clamp restored like the
+        // next supervisor tick recomputes it.
+        assert_eq!(
+            hooks.calls.lock().unwrap().clone(),
+            vec![format!("expired:{id}")]
+        );
         assert_eq!(state.clamp_slots_for_reservations(8), 8);
     }
 

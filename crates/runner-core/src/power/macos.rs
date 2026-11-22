@@ -45,25 +45,37 @@ pub struct WakeLockGuard {
 impl WakeLockGuard {
     /// Acquire the veto; `None` when power management refuses.
     pub fn acquire() -> Option<Self> {
-        // SAFETY: straight-line FFI; every pointer checked, the
-        // transient name string released on all paths.
+        // SAFETY: straight-line FFI; every pointer checked, both
+        // transient strings released on all paths. The assertion type
+        // is built at runtime: `kIOPMAssertionType...` names are
+        // CFSTR macros in the headers, not exported symbols, so no
+        // extern static can link them (this exact value is what
+        // `pmset -g assertions` prints for the type).
         unsafe {
             let name = ffi::CFStringCreateWithCString(
                 std::ptr::null(),
                 c"Runner active compilation".as_ptr(),
                 ffi::K_CF_STRING_ENCODING_UTF8,
             );
-            if name.is_null() {
+            let ty = ffi::CFStringCreateWithCString(
+                std::ptr::null(),
+                c"PreventUserIdleSystemSleep".as_ptr(),
+                ffi::K_CF_STRING_ENCODING_UTF8,
+            );
+            if name.is_null() || ty.is_null() {
+                if !name.is_null() {
+                    ffi::CFRelease(name);
+                }
+                if !ty.is_null() {
+                    ffi::CFRelease(ty);
+                }
                 return None;
             }
             let mut id = 0u32;
-            let status = ffi::IOPMAssertionCreateWithName(
-                ffi::kIOPMAssertionTypePreventUserIdleSystemSleep,
-                ffi::K_IOPM_ASSERTION_LEVEL_ON,
-                name,
-                &mut id,
-            );
+            let status =
+                ffi::IOPMAssertionCreateWithName(ty, ffi::K_IOPM_ASSERTION_LEVEL_ON, name, &mut id);
             ffi::CFRelease(name);
+            ffi::CFRelease(ty);
             if status != 0 {
                 return None;
             }
@@ -202,7 +214,6 @@ mod ffi {
             id: *mut u32,
         ) -> i32;
         pub fn IOPMAssertionRelease(id: u32) -> i32;
-        pub static kIOPMAssertionTypePreventUserIdleSystemSleep: *const c_void;
         pub fn IONotificationPortCreate(master: u32) -> *mut c_void;
         pub fn IONotificationPortGetRunLoopSource(port: *mut c_void) -> *mut c_void;
         pub fn IONotificationPortDestroy(port: *mut c_void);

@@ -58,12 +58,18 @@ pub fn validate_no_home_mount(sources: &[&Path]) -> Result<(), String> {
 pub struct SandboxSpec {
     /// Host workspace path (tmpfs-mounted over in the child).
     pub workspace: PathBuf,
+    /// Enforce network egress filtering in the child sandbox
+    /// (Seatbelt network verbs on macOS; inert elsewhere).
+    pub network_egress_filtering: bool,
 }
 
 impl SandboxSpec {
     pub fn new(workspace: PathBuf) -> Result<Self, String> {
         validate_no_home_mount(&[&workspace])?;
-        Ok(Self { workspace })
+        Ok(Self {
+            workspace,
+            network_egress_filtering: false,
+        })
     }
 }
 
@@ -133,10 +139,20 @@ pub fn sandbox_pre_exec(spec: &SandboxSpec, strict: bool) -> io::Result<()> {
             eprintln!("[runner] seatbelt: already sandboxed, skipping nested profile");
             return Ok(());
         }
-        let profile =
-            crate::seatbelt::build_profile(&workspace, home.as_deref(), tmpdir.as_deref());
+        let profile = crate::seatbelt::build_profile(
+            &workspace,
+            home.as_deref(),
+            tmpdir.as_deref(),
+            spec.network_egress_filtering,
+        );
         match crate::seatbelt::apply_profile(&profile) {
-            Ok(()) => eprintln!("[runner] seatbelt: Tier-2 sandbox active"),
+            Ok(()) => {
+                if spec.network_egress_filtering {
+                    eprintln!("[runner] seatbelt: Tier-2 sandbox active (network egress filtered)");
+                } else {
+                    eprintln!("[runner] seatbelt: Tier-2 sandbox active");
+                }
+            }
             Err(e) => {
                 if strict {
                     return Err(io::Error::new(

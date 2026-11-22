@@ -60,6 +60,13 @@ const SANDBOX_FILTER_NONE: c_int = 0;
 /// here; restricting them breaks real jobs).
 const SYSTEM_TMPDIRS: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
 
+/// mDNSResponder resolver sockets (`getaddrinfo` reaches the daemon
+/// over AF_UNIX, not UDP 53 — without these, filtered jobs cannot
+/// resolve names). `/var/run` symlinks to `/private/var/run`, so the
+/// kernel only ever matches the canonical path; both are emitted so
+/// the carve-out reads literally.
+const MDNS_SOCKETS: [&str; 2] = ["/private/var/run/mDNSResponder", "/var/run/mDNSResponder"];
+
 /// Build the Tier-2 job profile as an in-memory string (never
 /// written to disk). Permissive base with targeted denies:
 ///
@@ -71,8 +78,26 @@ const SYSTEM_TMPDIRS: [&str; 2] = ["/private/tmp", "/private/var/tmp"];
 /// * `/usr`, `/System`, `/Library`, `/private/tmp`,
 ///   `/private/var/tmp`: explicit read allows (documents the
 ///   allow-default base).
-/// * network: untouched by any rule, so outbound stays open (CI jobs
-///   fetch dependencies; egress filtering arrives in v1.10.0).
+/// * network: untouched by any rule when `network_egress_filtering`
+///   is false, so outbound stays open. When true, the shared egress
+///   contract is enforced as far as SBPL expresses it: allow UDP 53
+///   and TCP 443, carve out loopback and the mDNSResponder resolver
+///   sockets, deny everything else outbound.
+///
+/// Network rule semantics the emission order depends on (all verified
+/// against production SBPL users, since Apple publishes no grammar):
+///
+/// * Last match wins: a blanket `(deny network-outbound)` must be
+///   emitted BEFORE the carve-back allows, or it swallows them.
+/// * The IP filter knows only `*` and `localhost` — literal IPs are
+///   rejected by the parser — so the loopback carve-out is
+///   `(remote ip "localhost:*")`, never `127.0.0.1`. Range rules
+///   (RFC 1918 drops) are inexpressible; port scoping is the
+///   boundary Seatbelt can draw.
+/// * Unix-socket connects are `network-outbound` operations (not
+///   file operations): the resolver carve-outs use
+///   `(remote unix-socket (path-literal ...))` and need no file
+///   rules.
 ///
 /// `home`/`tmpdir` are parameters (not read here) so the builder
 /// stays pure and deterministic; pass `None` when unavailable and
@@ -83,6 +108,7 @@ pub fn build_profile(
     workspace: &std::path::Path,
     home: Option<&std::path::Path>,
     tmpdir: Option<&std::path::Path>,
+    network_egress_filtering: bool,
 ) -> String {
     fn esc(path: &std::path::Path) -> String {
         path.to_string_lossy()
@@ -119,6 +145,25 @@ pub fn build_profile(
         "/private/var/tmp",
     ] {
         profile.push_str(&format!("(allow file-read* (subpath \"{dir}\"))\n"));
+    }
+    if network_egress_filtering {
+        // Last match wins: the blanket deny goes FIRST, then the
+        // carve-backs. Ports come from the shared network contract.
+        profile.push_str("(deny network-outbound)\n");
+        profile.push_str(&format!(
+            "(allow network-outbound (remote udp \"*:{}\"))\n",
+            super::network::ALLOW_DNS_PORT
+        ));
+        profile.push_str(&format!(
+            "(allow network-outbound (remote tcp \"*:{}\"))\n",
+            super::network::ALLOW_HTTPS_PORT
+        ));
+        profile.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
+        for socket in MDNS_SOCKETS {
+            profile.push_str(&format!(
+                "(allow network-outbound (remote unix-socket (path-literal \"{socket}\")))\n"
+            ));
+        }
     }
     profile
 }
@@ -211,7 +256,7 @@ mod tests {
         let ws = std::path::Path::new("/private/tmp/ws-1");
         let home = std::path::Path::new("/Users/test");
         let tmp = std::path::Path::new("/var/folders/xx/T");
-        let profile = build_profile(ws, Some(home), Some(tmp));
+        let profile = build_profile(ws, Some(home), Some(tmp), false);
         assert!(!profile.is_empty());
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(allow default)"));
@@ -231,7 +276,7 @@ mod tests {
         // Paths with quotes stay syntactically intact.
         let qws = std::path::Path::new("/tmp/we\"ird");
         let qhome = std::path::Path::new("/Users/q\"x");
-        let quoted = build_profile(qws, Some(qhome), None);
+        let quoted = build_profile(qws, Some(qhome), None, false);
         assert!(quoted.contains(&esc(qws)));
         assert!(quoted.contains(&esc(&qhome.join(".ssh"))));
     }
@@ -239,7 +284,7 @@ mod tests {
     #[test]
     fn profile_builder_omits_home_rules_without_home() {
         let ws = std::path::Path::new("/private/tmp/ws-2");
-        let profile = build_profile(ws, None, None);
+        let profile = build_profile(ws, None, None, false);
         assert!(!profile.is_empty());
         assert!(profile.contains(&esc(ws)));
         assert!(!profile.contains(".ssh"));
@@ -249,10 +294,86 @@ mod tests {
     fn profile_builder_tmpdir_carve_out_is_optional() {
         let ws = std::path::Path::new("/private/tmp/ws-3");
         let tmp = std::path::Path::new("/var/folders/xx/T");
-        let with = build_profile(ws, None, Some(tmp));
+        let with = build_profile(ws, None, Some(tmp), false);
         assert!(with.contains(&esc(tmp)));
-        let without = build_profile(ws, None, None);
+        let without = build_profile(ws, None, None, false);
         assert!(!without.contains("folders"));
+    }
+
+    #[test]
+    fn profile_builder_network_filtering_emits_contract_rules() {
+        let ws = std::path::Path::new("/private/tmp/ws-net");
+        let profile = build_profile(ws, None, None, true);
+        // Shared contract ports (UDP DNS, TCP HTTPS).
+        assert!(
+            profile.contains("(allow network-outbound (remote udp \"*:53\"))"),
+            "missing UDP 53 allow:\n{profile}"
+        );
+        assert!(
+            profile.contains("(allow network-outbound (remote tcp \"*:443\"))"),
+            "missing TCP 443 allow:\n{profile}"
+        );
+        // Loopback carve-out via `localhost` (the parser rejects
+        // literal IPs, so 127.0.0.1 must never be emitted).
+        assert!(
+            profile.contains("(allow network-outbound (remote ip \"localhost:*\"))"),
+            "missing loopback carve-out:\n{profile}"
+        );
+        assert!(
+            !profile.contains("127.0.0.1"),
+            "literal loopback IP rejected by the parser:\n{profile}"
+        );
+        // Resolver sockets for getaddrinfo.
+        for socket in ["/private/var/run/mDNSResponder", "/var/run/mDNSResponder"] {
+            assert!(
+                profile.contains(&format!(
+                    "(allow network-outbound (remote unix-socket (path-literal \"{socket}\")))"
+                )),
+                "missing resolver carve-out for {socket}:\n{profile}"
+            );
+        }
+        // Blanket deny for everything else outbound.
+        assert!(
+            profile.contains("(deny network-outbound)\n"),
+            "missing outbound deny:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn profile_builder_network_deny_precedes_carve_backs() {
+        // Last match wins: the blanket deny must sort before every
+        // network allow, or it swallows them.
+        let ws = std::path::Path::new("/private/tmp/ws-order");
+        let profile = build_profile(ws, None, None, true);
+        let deny = profile
+            .find("(deny network-outbound)")
+            .expect("deny present");
+        for marker in [
+            "(remote udp",
+            "(remote tcp",
+            "(remote ip \"localhost",
+            "(remote unix-socket",
+        ] {
+            let allow = profile.find(marker).unwrap_or_else(|| {
+                panic!("missing {marker}:\n{profile}");
+            });
+            assert!(
+                deny < allow,
+                "deny must precede {marker} (last match wins):\n{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_builder_unfiltered_leaves_network_open() {
+        let ws = std::path::Path::new("/private/tmp/ws-open");
+        let profile = build_profile(ws, None, None, false);
+        assert!(!profile.contains("network-outbound"));
+        assert!(!profile.contains("remote udp"));
+        assert!(!profile.contains("remote tcp"));
+        assert!(!profile.contains("unix-socket"));
+        assert!(!profile.contains("localhost"));
+        assert!(!profile.contains("mDNSResponder"));
     }
 
     // The test runner itself is never sandboxed.
@@ -308,7 +429,7 @@ mod tests {
         std::fs::write(ssh_dir.join("sentinel"), "secret").unwrap();
         std::fs::write(outside.join("sentinel"), "public").unwrap();
 
-        let profile = build_profile(&ws, Some(&home), Some(&tmp));
+        let profile = build_profile(&ws, Some(&home), Some(&tmp), false);
         let run = |argv: &[&str]| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-p")
@@ -341,5 +462,103 @@ mod tests {
         let out = run(&["/bin/cat", outside.join("sentinel").to_str().unwrap()]);
         assert!(out.status.success(), "plain read denied: {out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "public");
+    }
+
+    // Live network enforcement on the real kernel: the filtered
+    // profile must compile, loopback and the DNS/HTTPS allowlist must
+    // pass, and off-allowlist destinations must fail. External checks
+    // need CI network (present on macos-latest); every denial pairs
+    // with an allow on the same endpoint family so outages read as
+    // loud failures, never vacuous passes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn filtered_profile_enforces_egress_via_sandbox_exec() {
+        let ws_dir = runner_core::test_support::TempDir::new("seatbelt-netws").unwrap();
+        let ws = std::fs::canonicalize(ws_dir.path()).unwrap();
+        let filtered = build_profile(&ws, None, None, true);
+        let open = build_profile(&ws, None, None, false);
+        let run = |profile: &str, argv: &[&str]| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(profile)
+                .args(argv)
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .output()
+                .expect("spawn sandbox-exec")
+        };
+
+        // Loopback TCP connect succeeds under the filtered profile
+        // (the kernel backlog completes the handshake; no accept needed).
+        let listener_v4 = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+        let port_v4 = listener_v4.local_addr().unwrap().port();
+        let probe_v4 = format!(
+            "import socket; socket.create_connection(('127.0.0.1',{port_v4}), timeout=10).close()"
+        );
+        let out = run(&filtered, &["python3", "-c", probe_v4.as_str()]);
+        assert!(out.status.success(), "loopback v4 denied: {out:?}");
+
+        // IPv6 loopback carve-out (spec compliance probe).
+        let listener_v6 = std::net::TcpListener::bind("[::1]:0").expect("bind ::1");
+        let port_v6 = listener_v6.local_addr().unwrap().port();
+        let probe_v6 = format!(
+            "import socket; socket.create_connection(('::1',{port_v6}), timeout=10).close()"
+        );
+        let out = run(&filtered, &["python3", "-c", probe_v6.as_str()]);
+        assert!(out.status.success(), "loopback v6 denied: {out:?}");
+
+        // UDP DNS to 8.8.8.8:53 succeeds (response bytes prove it).
+        let dns = "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); \
+            s.settimeout(10); \
+            s.sendto(bytes([18,52,1,0,0,1,0,0,0,0,0,0,7])+b'example'+bytes([3])+b'com'+bytes([0,0,1,0,1]), ('8.8.8.8',53)); \
+            assert len(s.recvfrom(512)[0]) > 12";
+        let out = run(&filtered, &["python3", "-c", dns]);
+        assert!(out.status.success(), "UDP 53 denied: {out:?}");
+
+        // System resolver reaches mDNSResponder through the carve-out.
+        let out = run(
+            &filtered,
+            &[
+                "python3",
+                "-c",
+                "import socket; assert socket.getaddrinfo('example.com', 443)",
+            ],
+        );
+        assert!(out.status.success(), "getaddrinfo denied: {out:?}");
+
+        // TCP HTTPS succeeds.
+        let out = run(
+            &filtered,
+            &[
+                "python3",
+                "-c",
+                "import socket; socket.create_connection(('1.1.1.1',443), timeout=10).close()",
+            ],
+        );
+        assert!(out.status.success(), "TCP 443 denied: {out:?}");
+
+        // TCP DNS is off-allowlist: denied under the filtered profile
+        // (8.8.8.8 serves TCP 53, so only our rule can refuse this —
+        // and the unfiltered control below proves the endpoint).
+        let out = run(
+            &filtered,
+            &[
+                "python3",
+                "-c",
+                "import socket; socket.create_connection(('8.8.8.8',53), timeout=10).close()",
+            ],
+        );
+        assert!(!out.status.success(), "TCP 53 allowed: {out:?}");
+        let out = run(
+            &open,
+            &[
+                "python3",
+                "-c",
+                "import socket; socket.create_connection(('8.8.8.8',53), timeout=10).close()",
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "TCP 53 control failed (no network?): {out:?}"
+        );
     }
 }

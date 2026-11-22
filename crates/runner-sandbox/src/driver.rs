@@ -238,12 +238,17 @@ async fn execute_process(
     // rides along when Tier-2 is available (userns on Linux, Seatbelt
     // on macOS). The job cwd is the workspace either way (child-side
     // chdir when sandboxed, parent-side otherwise).
-    let spec = if sandboxed {
+    let mut spec = if sandboxed {
         Some(workspace.sandbox_spec()?)
     } else {
         cmd.current_dir(workspace.path());
         None
     };
+    // Carry the egress flag into the child spec (Seatbelt network
+    // verbs on macOS; inert elsewhere).
+    if let Some(spec) = spec.as_mut() {
+        spec.network_egress_filtering = network_egress_filtering;
+    }
     runner_core::governor::darwin::install_child_hook(
         &mut cmd,
         qos,

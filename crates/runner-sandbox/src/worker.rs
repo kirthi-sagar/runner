@@ -329,13 +329,16 @@ pub async fn run_supervised(
     // along only when the launch carries a spec. A strict pre-exec
     // failure aborts the spawn (the error below), never soft-fails.
     let strict = launch.strict;
+    let network_egress_filtering = launch.network_egress_filtering;
     runner_core::governor::darwin::install_child_hook(
         &mut cmd,
         qos,
-        launch
-            .sandbox
-            .clone()
-            .map(|spec| move || crate::mounts::sandbox_pre_exec(&spec, strict)),
+        launch.sandbox.clone().map(|mut spec| {
+            // Carry the egress flag into the child spec (Seatbelt
+            // network verbs on macOS; inert elsewhere).
+            spec.network_egress_filtering = network_egress_filtering;
+            move || crate::mounts::sandbox_pre_exec(&spec, strict)
+        }),
     );
     // Egress boundary: acquire before spawn and hold across the
     // job; any failure aborts instead of running unfiltered.

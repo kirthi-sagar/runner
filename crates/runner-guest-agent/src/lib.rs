@@ -156,9 +156,39 @@ fn pump_pipe<R: Read, W: Write>(
     Ok(())
 }
 
+/// Orderly write-side shutdown for session streams: the vsock
+/// `File` via libc (UnixStream has it natively). Draining the final
+/// frame before close is what keeps Firecracker's host epoll loop
+/// from losing the result under load.
+pub trait ShutdownWrite {
+    fn shutdown_write(&self) -> std::io::Result<()>;
+}
+
+#[cfg(unix)]
+impl ShutdownWrite for std::fs::File {
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: live fd from our own stream; SHUT_WR only.
+        let rc = unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_WR) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl ShutdownWrite for std::os::unix::net::UnixStream {
+    fn shutdown_write(&self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+
 /// Serve one exec session on an established stream: read the request, run
 /// it, stream chunks, send the result. Blocking; call on a thread.
-pub fn run_agent<S: Read + Write + Send + 'static>(mut stream: S) -> Result<(), String> {
+pub fn run_agent<S: Read + Write + ShutdownWrite + Send + 'static>(
+    mut stream: S,
+) -> Result<(), String> {
     let request: ExecRequest = {
         let mut reader = BufReader::new(&mut stream);
         let mut line = String::new();
@@ -221,6 +251,14 @@ pub fn run_agent<S: Read + Write + Send + 'static>(mut stream: S) -> Result<(), 
         .write_all(line.as_bytes())
         .map_err(|e| format!("send result: {e}"))?;
     guard.flush().map_err(|e| format!("flush result: {e}"))?;
+    // Orderly shutdown plus a drain pause: the host epoll loop gets
+    // CPU cycles to pull the final frame before we exit. Without
+    // this, PID-1 exit can halt the virtio queues first and the
+    // result frame never arrives (observed live under host load).
+    guard
+        .shutdown_write()
+        .map_err(|e| format!("shutdown result stream: {e}"))?;
+    std::thread::sleep(Duration::from_millis(50));
     Ok(())
 }
 
@@ -269,5 +307,45 @@ mod tests {
         })
         .unwrap();
         assert!(decode_line::<ExecResult>(&chunk).is_err());
+    }
+
+    // Full session over a socket pair: the result frame arrives with
+    // the child's exit code, then an orderly EOF (no RST, no loss).
+    // Pins the serve-chunks-then-result-then-shutdown mechanism; the
+    // vsock race itself is proven by the live KVM harness.
+    #[cfg(unix)]
+    #[test]
+    fn session_result_precedes_orderly_shutdown() {
+        use std::os::unix::net::UnixStream;
+
+        let (host, guest) = UnixStream::pair().unwrap();
+        let agent = std::thread::spawn(move || run_agent(guest));
+        let request = ExecRequest {
+            argv: vec!["/bin/echo".to_string(), "hi".to_string()],
+            cwd: "/".to_string(),
+            env: Vec::new(),
+            timeout_secs: 10,
+        };
+        let mut host_write = host.try_clone().unwrap();
+        std::io::Write::write_all(&mut host_write, encode_line(&request).unwrap().as_bytes())
+            .unwrap();
+        let mut lines = std::io::BufReader::new(host).lines();
+        let mut saw_chunk = false;
+        let mut saw_result = false;
+        for line in lines.by_ref() {
+            let line = line.unwrap();
+            if let Ok(result) = decode_line::<ExecResult>(&line) {
+                assert_eq!(result.exit_code, 0);
+                saw_result = true;
+                break;
+            }
+            let chunk = decode_line::<ExecChunk>(&line).unwrap();
+            assert_eq!(chunk.stream, STREAM_STDOUT);
+            saw_chunk = true;
+        }
+        assert!(saw_chunk, "expected at least one stdout chunk");
+        assert!(saw_result, "expected a final result frame");
+        assert!(lines.next().is_none(), "expected EOF after result");
+        agent.join().unwrap().unwrap();
     }
 }

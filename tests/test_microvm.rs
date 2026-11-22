@@ -182,6 +182,19 @@ fn live_inputs_from(
     })
 }
 
+/// Last lines of the captured guest serial console (empty file and
+/// read errors degrade to a placeholder, never a second panic).
+fn console_tail(fc_log: &std::path::Path) -> String {
+    const KEEP_LINES: usize = 60;
+    let text = std::fs::read_to_string(fc_log).unwrap_or_default();
+    if text.trim().is_empty() {
+        return "<no console captured>".to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let skip = lines.len().saturating_sub(KEEP_LINES);
+    lines[skip..].join("\n")
+}
+
 fn live_inputs() -> Option<LiveInputs> {
     live_inputs_from(
         std::env::var("RUNNER_LIVE_KVM").is_ok(),
@@ -276,26 +289,40 @@ async fn live_kvm_boot_dispatch_and_shutdown() {
     use runner::sandbox::driver::{SandboxDriver, SandboxEngine};
     let dir = runner::test_support::TempDir::new("kvm-live").unwrap();
     let vsock_path = dir.path().join("v.sock");
+    let fc_log = dir.path().join("fc.log");
     let config = MicroVmConfig::new(
         dir.path().join("fc.sock"),
         inputs.kernel,
         inputs.rootfs,
         vsock_path.clone(),
-    );
+    )
+    .with_fc_log(fc_log.clone());
     let engine =
         SandboxEngine::new(SandboxDriver::MicroVm).with_microvm(config, inputs.firecracker);
     // End-to-end Tier-1 proof: the guest agent (injected as /init) dials
     // out over vsock, serves the exec session, and reports the exit
     // code. The mock suite covers stdio streaming shapes hermetically;
-    // this asserts the live round trip plus a clean teardown.
-    let code = engine
+    // this asserts the live round trip plus a clean teardown. Any
+    // failure dumps the guest serial console tail for instant triage.
+    let code = match engine
         .execute(
             &["/bin/echo".to_string(), "tier1-live-ok".to_string()],
             Duration::from_secs(15),
         )
         .await
-        .expect("live in-guest dispatch");
-    assert_eq!(code, 0);
+    {
+        Ok(code) => code,
+        Err(e) => panic!(
+            "live in-guest dispatch: {e}\n--- guest console tail ---\n{}",
+            console_tail(&fc_log)
+        ),
+    };
+    assert_eq!(
+        code,
+        0,
+        "--- guest console tail ---\n{}",
+        console_tail(&fc_log)
+    );
     // The host listener is the suffixed path (Firecracker owns bare `v.sock`).
     #[cfg(unix)]
     let leak_path = runner::sandbox::vsock::guest_listen_path(&vsock_path);

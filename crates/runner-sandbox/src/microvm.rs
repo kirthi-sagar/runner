@@ -24,6 +24,10 @@ pub struct MicroVmConfig {
     pub vsock_cid: u32,
     /// Host UDS path backing vsock.
     pub vsock_path: PathBuf,
+    /// Firecracker stdout/stderr sink (carries the guest serial
+    /// console). `None` discards (production default); the live
+    /// harness points at a TempDir file for failure triage.
+    pub fc_log_path: Option<PathBuf>,
 }
 
 impl MicroVmConfig {
@@ -41,7 +45,15 @@ impl MicroVmConfig {
             mem_size_mib: 1024,
             vsock_cid: 3,
             vsock_path,
+            fc_log_path: None,
         }
+    }
+
+    /// Capture Firecracker's stdout/stderr (guest serial console)
+    /// into `path` instead of discarding it.
+    pub fn with_fc_log(mut self, path: PathBuf) -> Self {
+        self.fc_log_path = Some(path);
+        self
     }
 }
 
@@ -302,6 +314,31 @@ pub async fn wait_for_socket(_path: &Path, _timeout: std::time::Duration) -> Res
     Err("unsupported on Windows: Tier-1 microVM (Firecracker)".to_string())
 }
 
+/// Firecracker stdio: both streams share one sink file when a log
+/// path is configured (it carries the guest serial console), else
+/// both discard. Logging must never fail a launch, so file errors
+/// fall back to discard with a loud note.
+fn fc_stdio(path: Option<&std::path::Path>) -> (std::process::Stdio, std::process::Stdio) {
+    use std::process::Stdio;
+    let Some(path) = path else {
+        return (Stdio::null(), Stdio::null());
+    };
+    let out = match std::fs::File::create(path) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("runner: fc log unavailable ({e}); discarding console");
+            return (Stdio::null(), Stdio::null());
+        }
+    };
+    match out.try_clone() {
+        Ok(err) => (Stdio::from(out), Stdio::from(err)),
+        Err(e) => {
+            eprintln!("runner: fc log clone failed ({e}); discarding console");
+            (Stdio::null(), Stdio::null())
+        }
+    }
+}
+
 /// MicroVM lifecycle supervisor: spawn, configure, start, stop, clean.
 pub struct MicroVmSupervisor {
     config: MicroVmConfig,
@@ -328,12 +365,13 @@ impl MicroVmSupervisor {
             return Err("/dev/kvm unavailable: Tier-1 microVMs need KVM".to_string());
         }
         let _ = std::fs::remove_file(&self.config.socket_path);
+        let (log_out, log_err) = fc_stdio(self.config.fc_log_path.as_deref());
         let mut child = tokio::process::Command::new(firecracker_bin)
             .arg("--api-sock")
             .arg(&self.config.socket_path)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(log_out)
+            .stderr(log_err)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("firecracker spawn: {e}"))?;

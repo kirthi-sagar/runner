@@ -6,7 +6,20 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match run() {
+    let result = run();
+    // PID 1 must never return after a served session: exiting init
+    // panics the guest kernel, halting virtio queues possibly before
+    // the host drains the final result frame. Power off cleanly
+    // instead. Errors keep the old behavior (exit, panic, reboot) so
+    // boot-time dial failures still retry.
+    #[cfg(target_os = "linux")]
+    if std::process::id() == 1 && result.is_ok() {
+        unsafe {
+            libc::sync();
+            libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+        }
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("runner-guest-agent: {e}");

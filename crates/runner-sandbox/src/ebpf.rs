@@ -19,10 +19,14 @@
 
 /// eBPF opcode classes and ALU/JMP operation codes (linux/bpf.h).
 pub mod op {
+    /// `BPF_ALU|BPF_AND|BPF_K`: 32-bit AND, upper bits zeroed.
+    pub const ALU_IMM_AND: u8 = 0x54;
     pub const ALU64_IMM_AND: u8 = 0x57;
     pub const ALU64_IMM_RSH: u8 = 0x77;
     pub const JMP_JA: u8 = 0x05;
     pub const JMP_IMM_JEQ: u8 = 0x15;
+    /// `BPF_JMP32|BPF_JEQ|BPF_K`: 32-bit equality compare.
+    pub const JMP32_IMM_JEQ: u8 = 0x16;
     pub const LD_ABS_W: u8 = 0x20;
     pub const LD_ABS_H: u8 = 0x28;
     pub const LD_ABS_B: u8 = 0x30;
@@ -71,10 +75,33 @@ pub fn alu64_imm(op: u8, dst: u8, imm: i32) -> BpfInstruction {
     }
 }
 
+/// `dst = (u32)dst <alu-op> (u32)imm`, upper 32 bits zeroed
+/// (32-bit immediate ALU).
+pub fn alu32_imm(op: u8, dst: u8, imm: i32) -> BpfInstruction {
+    BpfInstruction {
+        code: 0x04 | op,
+        dst_reg: dst,
+        src_reg: 0,
+        off: 0,
+        imm,
+    }
+}
+
 /// Conditional/unconditional jump with 32-bit immediate comparator.
 pub fn jmp_imm(op: u8, dst: u8, imm: i32, off: i16) -> BpfInstruction {
     BpfInstruction {
         code: 0x05 | op,
+        dst_reg: dst,
+        src_reg: 0,
+        off,
+        imm,
+    }
+}
+
+/// 32-bit conditional jump: compares `(u32)dst` against `(u32)imm`.
+pub fn jmp32_imm(op: u8, dst: u8, imm: i32, off: i16) -> BpfInstruction {
+    BpfInstruction {
+        code: 0x06 | op,
         dst_reg: dst,
         src_reg: 0,
         off,
@@ -206,6 +233,11 @@ impl Assembler {
         self.insns.push(jmp_imm(op, dst, imm, 0));
     }
 
+    fn jump32(&mut self, op: u8, dst: u8, imm: i32, target: &str) {
+        self.fixups.push((self.insns.len(), target.to_string()));
+        self.insns.push(jmp32_imm(op, dst, imm, 0));
+    }
+
     fn finish(mut self) -> Result<Vec<BpfInstruction>, String> {
         for (pos, target) in std::mem::take(&mut self.fixups) {
             let Some(dest) = self.labels.get(&target) else {
@@ -263,12 +295,19 @@ impl EgressFilterProgram {
         asm.jump(0x10, 0, 6, "ipv6");
         asm.jump(0x00, 0, 0, "drop"); // JA
 
-        // IPv4: masked range drops on dst word at offset 16.
+        // IPv4: masked range drops on dst word at offset 16. The
+        // 32-bit domain is load-bearing here, not a peephole: 64-bit
+        // JMP immediates are sign-extended, so a 64-bit JEQ against a
+        // high-bit net (172.16/12, 192.168/16, 169.254/16) compares
+        // the zero-extended load against 0xFFFF_FFFF_<net> and can
+        // never match — a fail-open. AND32 + JEQ32 keep the compare in
+        // the 32-bit domain, the same approach as the kernel's
+        // classic→eBPF converter for 32-bit packet data.
         asm.label("ipv4");
         for (net, mask) in &self.blocked_v4 {
             asm.emit(ld_abs(LD_ABS_W, 16));
-            asm.emit(alu64_imm(0x50, 0, *mask as i32)); // AND64_IMM
-            asm.jump(0x10, 0, *net as i32, "drop");
+            asm.emit(alu32_imm(0x50, 0, *mask as i32)); // AND_IMM
+            asm.jump32(0x10, 0, *net as i32, "drop"); // JEQ32_IMM
         }
         // Protocol dispatch.
         asm.emit(ld_abs(LD_ABS_B, 9));
@@ -320,15 +359,22 @@ impl EgressFilterProgram {
     /// [`MAX_V6_EXTENSIONS`] advancing stages plus one terminal
     /// dispatch (no backward jumps: socket-filter BPF is straight-line
     /// by design). R1 carries the current header offset (starts at
-    /// 40), R0 the next-header selector. Each stage dispatches TCP
-    /// (6)/UDP (17) to the port checks, advances over Hop-by-Hop (0),
-    /// Routing (43), and Destination Options (60) by `(Hdr Ext Len +
-    /// 1) * 8`, and over first-fragments (44, zero frag offset) by 8.
-    /// Anything else — ESP/AH/unknown headers, non-first fragments
-    /// (no transport header to check), truncated reads (OOB loads
-    /// yield 0, which never matches a port), or a fifth extension —
-    /// drops. Fail-closed: whatever the walker cannot parse never
-    /// reaches `allow`.
+    /// 40), R0 the current header's type, R2 walk scratch. Each stage
+    /// dispatches TCP (6)/UDP (17) to the port checks, advances over
+    /// Hop-by-Hop (0), Routing (43), and Destination Options (60) by
+    /// `(Hdr Ext Len + 1) * 8`, and over first-fragments (44, zero
+    /// frag offset) by 8. Anything else — ESP/AH/unknown headers,
+    /// non-first fragments (no transport header to check), truncated
+    /// reads (OOB loads yield 0, which never matches a port), or a
+    /// fifth extension — drops. Fail-closed: whatever the walker
+    /// cannot parse never reaches `allow`.
+    ///
+    /// The next-header read order is load-bearing: every extension
+    /// header's byte 0 is its Next field, so the following header's
+    /// type must be captured at the CURRENT R1 before advancing —
+    /// reading R1+0 after the advance would fetch the next header's
+    /// first payload byte (a source port for transport headers) and
+    /// dispatch on attacker-controlled data.
     fn emit_v6_walk(&self, asm: &mut Assembler) {
         asm.emit(mov64_imm(1, 40)); // R1 = base header length
         asm.emit(ld_abs(op::LD_ABS_B, 6)); // R0 = first next-header
@@ -348,26 +394,32 @@ impl EgressFilterProgram {
             asm.jump(0x10, 0, 60, &format!("extv{stage}")); // Dest Options
             asm.jump(0x10, 0, 44, &format!("extf{stage}")); // Fragment
             asm.jump(0x00, 0, 0, "drop"); // JA: ESP/AH/unknown
-                                          // Variable-length header: R1 += (Hdr Ext Len + 1) * 8, then
-                                          // re-read the following next-header byte.
+                                          // Variable-length header: capture the following
+                                          // header's type at R1+0 first (R2 scratch — the
+                                          // length math needs R0), then R1 += (Hdr Ext
+                                          // Len + 1) * 8 and restore R0 for dispatch.
             asm.label(&format!("extv{stage}"));
+            asm.emit(ld_ind(op::LD_IND_B, 1, 0));
+            asm.emit(mov64_reg(2, 0)); // R2 = following header type
             asm.emit(ld_ind(op::LD_IND_B, 1, 1));
             asm.emit(alu64_imm(0x00, 0, 1)); // ADD64_IMM
             asm.emit(alu64_imm(0x60, 0, 3)); // LSH64_IMM: * 8
             asm.emit(alu64_reg(0x00, 1, 0)); // ADD64_REG: R1 += R0
-            asm.emit(ld_ind(op::LD_IND_B, 1, 0));
+            asm.emit(mov64_reg(0, 2)); // R0 = following header type
             asm.jump(0x00, 0, 0, &next); // JA
                                          // Fragment: fixed 8 bytes, but only zero-offset first
                                          // fragments carry a transport header (bytes R1+2..R1+3 hold
                                          // the 13-bit offset in the top bits; mask 0xFFF8).
+                                         // The immediate R1 add preserves R0, so the
+                                         // pre-advance next-header read needs no scratch.
             asm.label(&format!("extf{stage}"));
             asm.emit(ld_ind(op::LD_IND_H, 1, 2));
             asm.emit(alu64_imm(0x50, 0, 0xfff8)); // AND64_IMM
             asm.jump(0x10, 0, 0, &format!("fragok{stage}"));
             asm.jump(0x00, 0, 0, "drop"); // JA: non-first fragment
             asm.label(&format!("fragok{stage}"));
+            asm.emit(ld_ind(op::LD_IND_B, 1, 0)); // R0 = following type
             asm.emit(alu64_imm(0x00, 1, 8)); // ADD64_IMM: R1 += 8
-            asm.emit(ld_ind(op::LD_IND_B, 1, 0));
             asm.jump(0x00, 0, 0, &next); // JA
         }
         // Terminal dispatch after the fourth advance: transport
@@ -403,6 +455,186 @@ impl EgressFilterProgram {
         }
         asm.jump(0x00, 0, 0, "drop");
     }
+}
+
+/// Verdict of in-memory bytecode evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BpfVerdict {
+    /// Packet dropped (program returned 0).
+    Drop,
+    /// Packet passed (program returned nonzero).
+    Pass,
+}
+
+/// Interpreter step cap. The generated program is straight-line
+/// (~100 instructions, no backward jumps), so exhaustion means a
+/// corrupt program — fail closed.
+const EVAL_MAX_STEPS: usize = 4096;
+
+/// eBPF general registers (R0-R9).
+const EVAL_NUM_REGS: usize = 10;
+
+/// Evaluate `program` against a raw packet buffer in memory by
+/// interpreting the generated bytecode with kernel socket-filter
+/// semantics: 64-bit ALU/JMP immediates are sign-extended (the
+/// kernel's classic→eBPF converter states this contract explicitly
+/// when routing 32-bit compares through zero-extended tmp
+/// registers), 32-bit ALU/JMP stay in the 32-bit domain with upper
+/// bits zeroed, and jumps are relative to the next instruction
+/// (RFC 9669 §4).
+///
+/// Fail-closed throughout: assembly errors, unknown opcodes,
+/// register/descriptor violations, step exhaustion, and falling off
+/// the program end all yield [`BpfVerdict::Drop`]. Out-of-bounds
+/// packet loads yield 0 and continue (the codebase's documented
+/// socket-filter model): a zero can never match a blocked net, a
+/// protocol, or an allowlisted port, so every truncated-read path
+/// still ends at `drop` — verdict-equivalent to terminating.
+pub fn evaluate_packet(program: &EgressFilterProgram, packet: &[u8]) -> BpfVerdict {
+    let insns = match program.to_instructions() {
+        Ok(insns) => insns,
+        Err(_) => return BpfVerdict::Drop,
+    };
+    let mut regs = [0u64; EVAL_NUM_REGS];
+    let mut pc = 0usize;
+    for _ in 0..EVAL_MAX_STEPS {
+        let Some(insn) = insns.get(pc) else {
+            return BpfVerdict::Drop;
+        };
+        let dst = insn.dst_reg as usize;
+        let src = insn.src_reg as usize;
+        if dst >= EVAL_NUM_REGS || src >= EVAL_NUM_REGS {
+            return BpfVerdict::Drop;
+        }
+        match insn.code {
+            op::EXIT => {
+                return if regs[0] as u32 == 0 {
+                    BpfVerdict::Drop
+                } else {
+                    BpfVerdict::Pass
+                };
+            }
+            op::MOV64_IMM => {
+                regs[dst] = insn.imm as i64 as u64;
+                pc += 1;
+            }
+            op::MOV64_REG => {
+                regs[dst] = regs[src];
+                pc += 1;
+            }
+            _ => match insn.code & 0x07 {
+                // BPF_LD: absolute/indirect packet loads into R0.
+                0x00 => {
+                    let size = match insn.code {
+                        op::LD_ABS_W | op::LD_IND_W => 4,
+                        op::LD_ABS_H | op::LD_IND_H => 2,
+                        op::LD_ABS_B | op::LD_IND_B => 1,
+                        _ => return BpfVerdict::Drop,
+                    };
+                    let indirect = matches!(insn.code, op::LD_IND_W | op::LD_IND_H | op::LD_IND_B);
+                    let base = if indirect { regs[src] } else { 0 };
+                    regs[0] = load_be(packet, base.wrapping_add(insn.imm as u64), size);
+                    pc += 1;
+                }
+                // BPF_ALU: 32-bit immediate ops, upper bits zeroed.
+                0x04 => {
+                    if insn.code & 0x08 != 0 {
+                        return BpfVerdict::Drop;
+                    }
+                    let imm32 = insn.imm as u32;
+                    let result = match insn.code & 0xf0 {
+                        0x00 => (regs[dst] as u32).wrapping_add(imm32),
+                        0x50 => (regs[dst] as u32) & imm32,
+                        0x60 => (regs[dst] as u32).wrapping_shl(imm32),
+                        0x70 => (regs[dst] as u32).wrapping_shr(imm32),
+                        _ => return BpfVerdict::Drop,
+                    };
+                    regs[dst] = result as u64;
+                    pc += 1;
+                }
+                // BPF_JMP: 64-bit jumps over a sign-extended immediate.
+                0x05 => {
+                    if insn.code & 0x08 != 0 {
+                        return BpfVerdict::Drop;
+                    }
+                    let imm = insn.imm as i64 as u64;
+                    let taken = match insn.code & 0xf0 {
+                        0x00 => true,             // JA
+                        0x10 => regs[dst] == imm, // JEQ
+                        0xa0 => regs[dst] < imm,  // JLT (unsigned)
+                        _ => return BpfVerdict::Drop,
+                    };
+                    let Some(next) = jump_target(pc, insn.off, taken) else {
+                        return BpfVerdict::Drop;
+                    };
+                    pc = next;
+                }
+                // BPF_JMP32: 32-bit compares (JA32's imm-target form is
+                // never emitted).
+                0x06 => {
+                    if insn.code & 0x08 != 0 {
+                        return BpfVerdict::Drop;
+                    }
+                    let taken = match insn.code & 0xf0 {
+                        0x10 => (regs[dst] as u32) == (insn.imm as u32), // JEQ32
+                        _ => return BpfVerdict::Drop,
+                    };
+                    let Some(next) = jump_target(pc, insn.off, taken) else {
+                        return BpfVerdict::Drop;
+                    };
+                    pc = next;
+                }
+                // BPF_ALU64: 64-bit ops over a sign-extended immediate,
+                // plus register ADD.
+                0x07 => {
+                    if insn.code & 0x08 == 0 {
+                        let imm = insn.imm as i64 as u64;
+                        match insn.code & 0xf0 {
+                            0x00 => regs[dst] = regs[dst].wrapping_add(imm),
+                            0x50 => regs[dst] &= imm,
+                            0x60 => regs[dst] = regs[dst].wrapping_shl(imm as u32),
+                            0x70 => regs[dst] = regs[dst].wrapping_shr(imm as u32),
+                            _ => return BpfVerdict::Drop,
+                        }
+                    } else {
+                        match insn.code & 0xf0 {
+                            0x00 => regs[dst] = regs[dst].wrapping_add(regs[src]),
+                            _ => return BpfVerdict::Drop,
+                        }
+                    }
+                    pc += 1;
+                }
+                _ => return BpfVerdict::Drop,
+            },
+        }
+    }
+    BpfVerdict::Drop
+}
+
+/// Big-endian packet load; out-of-bounds yields 0 (see
+/// [`evaluate_packet`]).
+fn load_be(packet: &[u8], off: u64, size: usize) -> u64 {
+    let Ok(off) = usize::try_from(off) else {
+        return 0;
+    };
+    let end = off.saturating_add(size);
+    if end > packet.len() {
+        return 0;
+    }
+    let mut value = 0u64;
+    for (i, byte) in packet[off..end].iter().enumerate() {
+        value |= (*byte as u64) << ((size - 1 - i) * 8);
+    }
+    value
+}
+
+/// Next program counter for a conditional jump (`off` is relative to
+/// the following instruction); `None` when the target underflows.
+fn jump_target(pc: usize, off: i16, taken: bool) -> Option<usize> {
+    if !taken {
+        return pc.checked_add(1);
+    }
+    usize::try_from(pc as i64 + 1 + i64::from(off)).ok()
 }
 
 /// Probe unprivileged socket-filter attachment: binds a loopback UDP
@@ -607,5 +839,153 @@ mod tests {
             .to_instructions()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn range_compares_use_32bit_domain() {
+        // Guards the sign-extension fix: 64-bit JEQ against high-bit
+        // nets can never match, so all four range checks must stay in
+        // the 32-bit domain.
+        let insns = EgressFilterProgram::new().to_instructions().unwrap();
+        let and32 = insns.iter().filter(|i| i.code == op::ALU_IMM_AND).count();
+        let jeq32 = insns.iter().filter(|i| i.code == op::JMP32_IMM_JEQ).count();
+        assert_eq!((and32, jeq32), (4, 4));
+    }
+
+    #[test]
+    fn evaluator_agrees_with_v4_mirror() {
+        // The bytecode, actually executed, must match the semantic
+        // mirror on every combination — including the high-bit ranges
+        // a 64-bit JEQ would fail open on.
+        let program = EgressFilterProgram::new();
+        let dsts = [
+            [10, 0, 0, 1],
+            [10, 255, 255, 254],
+            [172, 16, 5, 4],
+            [172, 31, 255, 254],
+            [172, 15, 0, 1],
+            [172, 32, 0, 1],
+            [192, 168, 1, 1],
+            [192, 167, 1, 1],
+            [169, 254, 169, 254],
+            [8, 8, 8, 8],
+            [1, 1, 1, 1],
+        ];
+        let mut vectors = 0;
+        for dst in dsts {
+            for proto in [6u8, 17] {
+                for dport in [53u16, 443, 80] {
+                    for ihl in [5u8, 6] {
+                        let pkt = v4_packet(ihl, proto, dst, dport);
+                        let expected = v4_verdict(&pkt, true, true);
+                        let verdict = evaluate_packet(&program, &pkt);
+                        assert_eq!(
+                            verdict == BpfVerdict::Pass,
+                            expected,
+                            "dst={dst:?} proto={proto} dport={dport} ihl={ihl}"
+                        );
+                        vectors += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(vectors, 132);
+    }
+
+    /// Minimal IPv6 header with tunable dst, next header, and dport
+    /// (no extension headers; transport at offset 40).
+    fn v6_packet(dst: [u8; 16], proto: u8, dport: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 44];
+        pkt[0] = 0x60;
+        pkt[6] = proto;
+        pkt[24..40].copy_from_slice(&dst);
+        pkt[42..44].copy_from_slice(&dport.to_be_bytes());
+        pkt
+    }
+
+    /// IPv6 with one Hop-by-Hop options header (8 bytes, ext-len 0).
+    fn v6_packet_hbh(dst: [u8; 16], proto: u8, dport: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 52];
+        pkt[0] = 0x60;
+        pkt[6] = 0; // Hop-by-Hop
+        pkt[24..40].copy_from_slice(&dst);
+        pkt[40] = proto;
+        pkt[41] = 0; // Hdr Ext Len 0 -> 8 bytes
+        pkt[50..52].copy_from_slice(&dport.to_be_bytes());
+        pkt
+    }
+
+    /// IPv6 with a first-fragment header (offset 0 carries transport).
+    fn v6_packet_frag(dst: [u8; 16], proto: u8, dport: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 52];
+        pkt[0] = 0x60;
+        pkt[6] = 44; // Fragment
+        pkt[24..40].copy_from_slice(&dst);
+        pkt[40] = proto;
+        pkt[41] = 0;
+        // Bytes 42..44 (frag offset/res/M) stay 0: first fragment.
+        pkt[50..52].copy_from_slice(&dport.to_be_bytes());
+        pkt
+    }
+
+    #[test]
+    fn evaluator_v6_vectors() {
+        use BpfVerdict::{Drop, Pass};
+        let program = EgressFilterProgram::new();
+        let public = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let fd = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let fc = [0xfc, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        // ULA drops on any port, both halves of fc00::/7.
+        assert_eq!(evaluate_packet(&program, &v6_packet(fd, 6, 443)), Drop);
+        assert_eq!(evaluate_packet(&program, &v6_packet(fd, 17, 53)), Drop);
+        assert_eq!(evaluate_packet(&program, &v6_packet(fc, 6, 443)), Drop);
+        // Public allowlist passes; anything else drops.
+        assert_eq!(evaluate_packet(&program, &v6_packet(public, 6, 443)), Pass);
+        assert_eq!(evaluate_packet(&program, &v6_packet(public, 17, 53)), Pass);
+        assert_eq!(evaluate_packet(&program, &v6_packet(public, 6, 80)), Drop);
+        assert_eq!(evaluate_packet(&program, &v6_packet(public, 6, 53)), Drop);
+        assert_eq!(evaluate_packet(&program, &v6_packet(public, 58, 443)), Drop);
+        // Extension headers resolve the shifted transport offset.
+        assert_eq!(
+            evaluate_packet(&program, &v6_packet_hbh(public, 6, 443)),
+            Pass
+        );
+        assert_eq!(
+            evaluate_packet(&program, &v6_packet_hbh(public, 6, 80)),
+            Drop
+        );
+        assert_eq!(evaluate_packet(&program, &v6_packet_hbh(fd, 6, 443)), Drop);
+        assert_eq!(
+            evaluate_packet(&program, &v6_packet_frag(public, 17, 53)),
+            Pass
+        );
+        assert_eq!(
+            evaluate_packet(&program, &v6_packet_frag(public, 6, 22)),
+            Drop
+        );
+        // Non-first fragments carry no transport header: drop.
+        let mut non_first = v6_packet_frag(public, 6, 443);
+        non_first[42] = 0x08; // frag offset 1 (top 13 bits nonzero)
+        assert_eq!(evaluate_packet(&program, &non_first), Drop);
+    }
+
+    #[test]
+    fn evaluator_malformed_packets_drop() {
+        use BpfVerdict::Drop;
+        let program = EgressFilterProgram::new();
+        assert_eq!(evaluate_packet(&program, &[]), Drop);
+        assert_eq!(evaluate_packet(&program, &[0x45u8; 10]), Drop);
+        assert_eq!(
+            evaluate_packet(&program, &v4_packet(4, 6, [1, 1, 1, 1], 443)),
+            Drop
+        );
+        let mut bad_version = v4_packet(5, 6, [1, 1, 1, 1], 443);
+        bad_version[0] = 0x50;
+        assert_eq!(evaluate_packet(&program, &bad_version), Drop);
+        // Truncated transport header: the port load reads past the end.
+        assert_eq!(
+            evaluate_packet(&program, &v4_packet(5, 6, [1, 1, 1, 1], 443)[..22]),
+            Drop
+        );
     }
 }

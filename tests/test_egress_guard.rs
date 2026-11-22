@@ -4,8 +4,10 @@
 //! the `RUNNER_LIVE_WFP`-gated unit test; execution fixtures here are
 //! Unix-gated like the worker module's own tests.)
 
+#[cfg(not(windows))]
 use runner::sandbox::ebpf::EgressFilterProgram;
 use runner::sandbox::egress::EgressGuard;
+#[cfg(unix)]
 use std::time::Duration;
 
 #[test]

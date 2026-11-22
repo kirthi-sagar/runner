@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod mcp;
 pub mod mesh;
 pub mod pidfile;
+pub mod power;
 pub mod status;
 pub mod test_support;
 #[cfg(windows)]

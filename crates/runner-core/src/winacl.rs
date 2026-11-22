@@ -11,8 +11,8 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, GENERIC_ALL};
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SE_OBJECT_TYPE,
-    TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP,
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT, SE_OBJECT_TYPE, TRUSTEE_IS_SID,
+    TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP,
 };
 #[cfg(test)]
 use windows_sys::Win32::Security::{
@@ -50,7 +50,10 @@ pub(crate) fn restrict_to_owner(path: &Path) -> io::Result<()> {
 /// instance the accept loop creates.
 pub(crate) fn restrict_pipe_dacl(pipe_name: &str) -> io::Result<()> {
     let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
-    apply_owner_system_dacl(&wide, SE_KERNEL_OBJECT)
+    // Named pipes live in NPFS, so the security APIs classify them
+    // as file objects; SE_KERNEL_OBJECT rejects the backslashes
+    // with ERROR_BAD_PATHNAME (161).
+    apply_owner_system_dacl(&wide, SE_FILE_OBJECT)
 }
 
 /// Read back the trustee SIDs on a DACL (raw SID bytes per ACE, in
@@ -69,7 +72,7 @@ pub(crate) fn read_dacl_sids(target: DaclTarget) -> io::Result<Vec<Vec<u8>>> {
         ),
         DaclTarget::Pipe(name) => (
             name.encode_utf16().chain(std::iter::once(0)).collect(),
-            SE_KERNEL_OBJECT,
+            SE_FILE_OBJECT,
         ),
     };
     let mut dacl: *mut ACL = std::ptr::null_mut();

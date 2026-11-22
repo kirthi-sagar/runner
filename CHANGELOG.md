@@ -6,6 +6,19 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.5.0 — 2026-11-22
+
+- MicroVM Hardware Resilience: vsock write-shutdown drain, 50ms
+  epoll pause, PID 1 clean poweroff, guest serial console capture
+  on test failure.
+- Cross-Platform Power & Lid Interception: Linux logind D-Bus /
+  ACPI, macOS IOKit, native Windows message window.
+- Pre-Sleep Quiesce: Sleep-drain latch, cache index disk flush,
+  audit log task.
+- Post-Resume Reconciliation & Clamshell Mode: Clock skew reporting
+  for >= 60s gaps, `[power] prevent_sleep_on_ac`, cross-platform
+  `WakeLockGuard`.
+
 ## [2.4.1] - 2026-11-22
 
 - Fix Windows named-pipe DACLs: pipes live in NPFS, so the

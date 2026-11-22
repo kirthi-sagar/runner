@@ -542,6 +542,16 @@ pub struct RunnerConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub power: PowerConfig,
+}
+
+/// Power management: clamshell keep-alive while AC-powered jobs run.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct PowerConfig {
+    /// Keep the host awake while AC power is connected and active jobs are running.
+    #[serde(default)]
+    pub prevent_sleep_on_ac: bool,
 }
 
 /// Transparent LAN cache proxy (`ACTIONS_CACHE_URL`) settings.
@@ -850,6 +860,13 @@ mod tests {
         assert_eq!(RunnerConfig::default().server.listen_port, None);
         let config: RunnerConfig = toml::from_str("[server]\nlisten_port = 9898\n").unwrap();
         assert_eq!(config.server.listen_port, Some(9898));
+    }
+
+    #[test]
+    fn power_prevent_sleep_defaults_off_and_parses() {
+        assert!(!RunnerConfig::default().power.prevent_sleep_on_ac);
+        let config: RunnerConfig = toml::from_str("[power]\nprevent_sleep_on_ac = true\n").unwrap();
+        assert!(config.power.prevent_sleep_on_ac);
     }
 
     #[test]

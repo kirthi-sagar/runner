@@ -34,6 +34,54 @@ pub fn map_power_message(message: u32) -> SystemPowerMessage {
     }
 }
 
+/// RAII sleep veto: a `PreventUserIdleSystemSleep` power assertion,
+/// released on drop.
+#[cfg(target_os = "macos")]
+pub struct WakeLockGuard {
+    id: u32,
+}
+
+#[cfg(target_os = "macos")]
+impl WakeLockGuard {
+    /// Acquire the veto; `None` when power management refuses.
+    pub fn acquire() -> Option<Self> {
+        // SAFETY: straight-line FFI; every pointer checked, the
+        // transient name string released on all paths.
+        unsafe {
+            let name = ffi::CFStringCreateWithCString(
+                std::ptr::null(),
+                c"Runner active compilation".as_ptr(),
+                ffi::K_CF_STRING_ENCODING_UTF8,
+            );
+            if name.is_null() {
+                return None;
+            }
+            let mut id = 0u32;
+            let status = ffi::IOPMAssertionCreateWithName(
+                ffi::kIOPMAssertionTypePreventUserIdleSystemSleep,
+                ffi::K_IOPM_ASSERTION_LEVEL_ON,
+                name,
+                &mut id,
+            );
+            ffi::CFRelease(name);
+            if status != 0 {
+                return None;
+            }
+            Some(Self { id })
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for WakeLockGuard {
+    fn drop(&mut self) {
+        // SAFETY: id came from a successful create call.
+        unsafe {
+            ffi::IOPMAssertionRelease(self.id);
+        }
+    }
+}
+
 /// Spawn the pump thread; `false` (with a loud note) when power
 /// management is unreachable. Rendezvous-bounded so boot never
 /// blocks on a broken backend.
@@ -141,9 +189,20 @@ extern "C" fn power_callback(
 mod ffi {
     use std::ffi::c_void;
 
+    pub const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
+    pub const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
     #[link(name = "IOKit", kind = "framework")]
     extern "C" {
         pub fn IOPMFindPowerManagement(master: u32) -> u32;
+        pub fn IOPMAssertionCreateWithName(
+            assertion_type: *const c_void,
+            level: u32,
+            name: *const c_void,
+            id: *mut u32,
+        ) -> i32;
+        pub fn IOPMAssertionRelease(id: u32) -> i32;
+        pub static kIOPMAssertionTypePreventUserIdleSystemSleep: *const c_void;
         pub fn IONotificationPortCreate(master: u32) -> *mut c_void;
         pub fn IONotificationPortGetRunLoopSource(port: *mut c_void) -> *mut c_void;
         pub fn IONotificationPortDestroy(port: *mut c_void);
@@ -162,6 +221,12 @@ mod ffi {
         pub fn CFRunLoopAddSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
         pub fn CFRunLoopRun();
         pub static kCFRunLoopDefaultMode: *const c_void;
+        pub fn CFStringCreateWithCString(
+            alloc: *const c_void,
+            bytes: *const i8,
+            encoding: u32,
+        ) -> *mut c_void;
+        pub fn CFRelease(obj: *const c_void);
     }
 }
 
@@ -181,5 +246,16 @@ mod tests {
         );
         assert_eq!(map_power_message(0), SystemPowerMessage::Other);
         assert_eq!(map_power_message(0xe000_0271), SystemPowerMessage::Other);
+    }
+
+    // Full lifecycle against live power management (macOS runners
+    // only; the Linux suite covers the shared contract instead).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wake_lock_acquires_and_releases() {
+        let guard = WakeLockGuard::acquire().expect("power assertion");
+        drop(guard);
+        let guard = WakeLockGuard::acquire().expect("re-acquire after release");
+        drop(guard);
     }
 }

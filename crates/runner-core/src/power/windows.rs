@@ -43,6 +43,40 @@ pub fn map_lid_byte(closed_byte: u8) -> crate::power::PowerEvent {
 /// Spawn the pump thread; `false` (with a loud note) when window
 /// creation or registration fails. Rendezvous-bounded so boot never
 /// blocks on a broken backend.
+/// RAII sleep veto: `ES_CONTINUOUS | ES_SYSTEM_REQUIRED`, reset
+/// to plain `ES_CONTINUOUS` on drop.
+#[cfg(windows)]
+pub struct WakeLockGuard;
+
+#[cfg(windows)]
+impl WakeLockGuard {
+    /// Acquire the veto; `None` when the system refuses (a zero
+    /// return from `SetThreadExecutionState`).
+    pub fn acquire() -> Option<Self> {
+        use windows_sys::Win32::System::Power::{
+            SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
+        };
+        // SAFETY: flag-only call, no pointers.
+        let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
+        if prev == 0 {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WakeLockGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS};
+        // SAFETY: flag-only call, no pointers.
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS);
+        }
+    }
+}
+
 /// Process-wide pump channel: set once by `spawn`, read by the
 /// window proc. Single-watcher assumption holds (the daemon starts
 /// one pump; a second start would reuse the first channel).
@@ -223,6 +257,17 @@ mod tests {
         use crate::power::PowerEvent;
         assert_eq!(map_lid_byte(0), PowerEvent::LidClosed);
         assert_eq!(map_lid_byte(1), PowerEvent::LidOpened);
+    }
+
+    // Full lifecycle against live power management (windows-native
+    // CI; the call cannot realistically fail there).
+    #[cfg(windows)]
+    #[test]
+    fn wake_lock_acquires_and_releases() {
+        let guard = WakeLockGuard::acquire().expect("execution state");
+        drop(guard);
+        let guard = WakeLockGuard::acquire().expect("re-acquire after release");
+        drop(guard);
     }
 
     // Pin the mirrored constants against the vendored values so the

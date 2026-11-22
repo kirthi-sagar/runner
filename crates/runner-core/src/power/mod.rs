@@ -42,6 +42,30 @@ impl PowerWatcher {
     }
 }
 
+/// RAII sleep veto, held while AC-powered jobs run. Exactly one
+/// platform backend is re-exported; unknown platforms get a stub
+/// that always declines.
+#[cfg(target_os = "linux")]
+pub use linux::WakeLockGuard;
+#[cfg(target_os = "macos")]
+pub use macos::WakeLockGuard;
+#[cfg(windows)]
+pub use windows::WakeLockGuard;
+
+/// Fallback for platforms without a wake backend: acquisition always
+/// declines (callers treat `None` as "stay unguarded").
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub struct WakeLockGuard {
+    _private: (),
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+impl WakeLockGuard {
+    pub fn acquire() -> Option<Self> {
+        None
+    }
+}
+
 /// Start the platform backend. Returns `None` (with a loud note)
 /// when power management is unavailable — containers, headless VMs,
 /// or unknown platforms — so daemon boot never blocks on it. Must be

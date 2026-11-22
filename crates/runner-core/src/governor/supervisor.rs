@@ -137,6 +137,12 @@ pub struct SupervisorState {
     /// Sleep-drain latch: set on pre-sleep, cleared on resume. While
     /// set, published slots clamp to zero (no new intake).
     pub sleep_halted: bool,
+    /// Clamshell keep-alive: hold a wake lock while AC-powered jobs
+    /// run (seeded from `power.prevent_sleep_on_ac`).
+    pub prevent_sleep_on_ac: bool,
+    /// Wall clock at the last tick; resume compares against it to
+    /// measure sleep gaps the monotonic clock cannot see.
+    pub last_tick_wall: std::time::SystemTime,
 }
 
 impl SupervisorState {
@@ -193,6 +199,8 @@ impl SupervisorState {
             thermal_throttled: false,
             discharging: false,
             sleep_halted: false,
+            prevent_sleep_on_ac: false,
+            last_tick_wall: std::time::SystemTime::now(),
         }
     }
 
@@ -251,6 +259,7 @@ impl SupervisorState {
         }
         self.afk_mode = AfkMode::parse(&config.governor.afk_mode);
         self.afk_idle_secs = config.governor.afk_idle_seconds;
+        self.prevent_sleep_on_ac = config.power.prevent_sleep_on_ac;
     }
 
     /// Evaluate AFK boost for this tick. Always/Never modes bypass the
@@ -665,6 +674,36 @@ fn sleep_clamped_slots(halted: bool, slots: u32) -> u32 {
     }
 }
 
+/// Clamshell policy: hold a wake lock while configured, AC-powered,
+/// and busy; anything else releases.
+fn wake_lock_wanted(prevent_sleep_on_ac: bool, discharging: bool, in_flight: u32) -> bool {
+    prevent_sleep_on_ac && !discharging && in_flight > 0
+}
+
+/// Clamshell keep-alive: acquire on idle-to-busy transitions, drop
+/// on the reverse. Transition-logged only (never per tick).
+fn sync_wake_lock(
+    wake_lock: &mut Option<crate::power::WakeLockGuard>,
+    prevent_sleep_on_ac: bool,
+    discharging: bool,
+    in_flight: u32,
+) {
+    let want = wake_lock_wanted(prevent_sleep_on_ac, discharging, in_flight);
+    match (want, wake_lock.is_some()) {
+        (true, false) => {
+            *wake_lock = crate::power::WakeLockGuard::acquire();
+            if wake_lock.is_some() {
+                eprintln!("runner: wake lock acquired ({in_flight} in-flight jobs on AC)");
+            }
+        }
+        (false, true) => {
+            *wake_lock = None;
+            eprintln!("runner: wake lock released");
+        }
+        _ => {}
+    }
+}
+
 /// Flush the cache index when a store is attached. Returns whether a
 /// flush ran (the sleep arm's observable; shutdown arms keep their
 /// own error-logging variant).
@@ -695,6 +734,21 @@ async fn power_event_or_pending(
     }
 }
 
+/// Sleep seconds worth reporting on resume: 60+ second gaps with
+/// live jobs suggest jobs ran (or died) unwatched. Backward clock
+/// jumps report nothing.
+fn reportable_sleep_secs(
+    last_tick_wall: std::time::SystemTime,
+    now: std::time::SystemTime,
+    in_flight: u32,
+) -> Option<u64> {
+    let secs = now
+        .duration_since(last_tick_wall)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    (secs >= 60 && in_flight > 0).then_some(secs)
+}
+
 /// One power transition: latch/flush on sleep, restore on resume,
 /// log lid edges. Shared by both supervisor loops.
 async fn handle_power_event(state: &SharedState, event: crate::power::PowerEvent) {
@@ -710,6 +764,20 @@ async fn handle_power_event(state: &SharedState, event: crate::power::PowerEvent
         }
         PowerEvent::Resumed => {
             eprintln!("runner: power event: host resumed from sleep; restoring intake");
+            {
+                let guard = state.read().await;
+                if let Some(secs) = reportable_sleep_secs(
+                    guard.last_tick_wall,
+                    std::time::SystemTime::now(),
+                    guard.in_flight,
+                ) {
+                    eprintln!(
+                        "runner: clock skew detected ({}s sleep with {} in-flight jobs); \
+                         evaluating forge job health",
+                        secs, guard.in_flight
+                    );
+                }
+            }
             state.write().await.resume_from_sleep();
         }
         PowerEvent::LidClosed => {
@@ -779,6 +847,7 @@ async fn run_supervisor_inner_windows(
         }
     }
     let mut sensor = super::windows::WindowsSensor::default();
+    let mut wake_lock: Option<crate::power::WakeLockGuard> = None;
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(
         super::psi::POLL_INTERVAL_MS,
     ));
@@ -822,6 +891,13 @@ async fn run_supervisor_inner_windows(
                     guard.sleep_halted,
                     apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging),
                 );
+                guard.last_tick_wall = std::time::SystemTime::now();
+                sync_wake_lock(
+                    &mut wake_lock,
+                    guard.prevent_sleep_on_ac,
+                    guard.discharging,
+                    guard.in_flight,
+                );
                 drop(guard);
                 if let Some(job) = job {
                     if let Err(e) = job.set_cpu_weight(weight) {
@@ -850,6 +926,7 @@ async fn run_supervisor_inner(
 
     let poller = PsiPoller::spawn();
     let mut rx = poller.subscribe();
+    let mut wake_lock: Option<crate::power::WakeLockGuard> = None;
     eprintln!("runner: supervisor loop started (250ms PSI cadence)");
 
     loop {
@@ -887,6 +964,13 @@ async fn run_supervisor_inner(
                     guard.sleep_halted,
                     apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging),
                 );
+                guard.last_tick_wall = std::time::SystemTime::now();
+                sync_wake_lock(
+                    &mut wake_lock,
+                    guard.prevent_sleep_on_ac,
+                    guard.discharging,
+                    guard.in_flight,
+                );
                 drop(guard);
                 if writable {
                     if let Err(e) = slice.set_weight(weight) {
@@ -919,6 +1003,45 @@ mod tests {
         state.resume_from_sleep();
         assert!(!state.sleep_halted);
         assert_eq!(sleep_clamped_slots(false, 4), 4);
+    }
+
+    // Only long sleeps with live jobs report skew; short gaps,
+    // idle resumes, and backward clock jumps stay silent.
+    #[test]
+    fn sleep_skew_reports_long_gaps_with_jobs() {
+        let now = std::time::SystemTime::now();
+        let ago = |secs: u64| now - std::time::Duration::from_secs(secs);
+        assert_eq!(reportable_sleep_secs(ago(90), now, 2), Some(90));
+        assert_eq!(reportable_sleep_secs(ago(30), now, 2), None);
+        assert_eq!(reportable_sleep_secs(ago(90), now, 0), None);
+        assert_eq!(
+            reportable_sleep_secs(now + std::time::Duration::from_secs(5), now, 2),
+            None
+        );
+    }
+
+    // The clamshell policy holds only while configured, AC-powered,
+    // and busy; every other combination releases.
+    #[test]
+    fn wake_lock_policy_needs_config_ac_and_jobs() {
+        assert!(wake_lock_wanted(true, false, 1));
+        assert!(!wake_lock_wanted(false, false, 1));
+        assert!(!wake_lock_wanted(true, true, 1));
+        assert!(!wake_lock_wanted(true, false, 0));
+    }
+
+    // Sync transitions acquire once and release once (the live
+    // inhibitor behind acquire is covered by the backend tests).
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn wake_lock_sync_acquires_and_releases() {
+        let mut held: Option<crate::power::WakeLockGuard> = None;
+        sync_wake_lock(&mut held, true, false, 2);
+        assert!(held.is_some());
+        sync_wake_lock(&mut held, true, false, 1);
+        assert!(held.is_some());
+        sync_wake_lock(&mut held, true, false, 0);
+        assert!(held.is_none());
     }
 
     // The sleep arm flushes a real attached store (index file lands

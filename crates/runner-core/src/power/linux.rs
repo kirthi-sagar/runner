@@ -64,6 +64,45 @@ pub fn find_lid_state_file_under(root: &Path) -> Option<PathBuf> {
     None
 }
 
+/// RAII sleep veto: a `systemd-inhibit` block lock over idle and
+/// sleep, held by a reaped `sleep infinity` child. Drop kills and
+/// reaps (no orphans, no zombies). Block (not delay): `idle` has no
+/// delay mode, and a hold-while-busy veto must not time out.
+#[cfg(target_os = "linux")]
+pub struct WakeLockGuard {
+    child: std::process::Child,
+}
+
+#[cfg(target_os = "linux")]
+impl WakeLockGuard {
+    /// Acquire the veto; `None` when logind is unreachable.
+    pub fn acquire() -> Option<Self> {
+        let child = std::process::Command::new("systemd-inhibit")
+            .args([
+                "--what=idle:sleep",
+                "--mode=block",
+                "--who=runner",
+                "--why=Runner active compilation",
+                "sleep",
+                "infinity",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(Self { child })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for WakeLockGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Spawn the backend: hold a logind sleep-delay lock, stream D-Bus
 /// sleep signals, poll lid state. Returns false (with a loud note)
 /// when the systemd tools are missing — containers and headless VMs
@@ -233,6 +272,37 @@ mod tests {
             lid_transition(Some(false), true),
             Some(PowerEvent::LidOpened)
         );
+    }
+
+    // Full lifecycle against the real inhibitor: acquire holds a
+    // live lock, drop releases it, and re-acquire works (systemd is
+    // guaranteed on the Linux CI runners; containers take the None
+    // path in spawn(), not here).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wake_lock_acquires_and_releases() {
+        let guard = WakeLockGuard::acquire().expect("inhibitor lock");
+        assert!(systemd_inhibit_lists_runner());
+        drop(guard);
+        let guard = WakeLockGuard::acquire().expect("re-acquire after release");
+        drop(guard);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn systemd_inhibit_lists_runner() -> bool {
+        // Registration races the spawn: poll briefly for the lock.
+        for _ in 0..20 {
+            let listed = std::process::Command::new("systemd-inhibit")
+                .arg("--list")
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stdout).contains("runner"))
+                .unwrap_or(false);
+            if listed {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
     }
 
     #[test]

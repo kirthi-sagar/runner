@@ -234,6 +234,7 @@ pub struct DispatchContext {
     pub worker_version: String,
     pub sandboxed: bool,
     pub strict: bool,
+    pub network_egress_filtering: bool,
     pub timeout: Duration,
     /// LAN cache proxy base URL (None when the proxy failed to bind).
     pub cache_url: Option<String>,
@@ -255,6 +256,7 @@ pub(crate) struct WorkerRunConfig {
     pub job_name: String,
     pub sandboxed: bool,
     pub strict: bool,
+    pub network_egress_filtering: bool,
     pub cache: Option<(String, String)>,
     pub timeout: Duration,
 }
@@ -294,6 +296,7 @@ pub(crate) async fn run_worker_with_jit(
         .map_err(|e| format!("workspace: {e}"))?;
     let mut launch = WorkerLaunch::new(work_dir, cfg.jit_blob.clone());
     launch.strict = cfg.strict;
+    launch.network_egress_filtering = cfg.network_egress_filtering;
     if cfg.sandboxed {
         let spec = workspace.sandbox_spec()?;
         launch = launch.sandboxed(spec);
@@ -355,6 +358,7 @@ pub async fn dispatch_local(
             job_name: job.name.clone(),
             sandboxed: ctx.sandboxed,
             strict: ctx.strict,
+            network_egress_filtering: ctx.network_egress_filtering,
             cache,
             timeout: ctx.timeout,
         },
@@ -745,6 +749,7 @@ mod tests {
             job_name: "strict test".to_string(),
             sandboxed: false,
             strict: true,
+            network_egress_filtering: false,
             cache: None,
             timeout: Duration::from_secs(5),
         };

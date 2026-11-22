@@ -61,6 +61,7 @@ pub struct SandboxEngine {
     microvm: Option<MicroVmConfig>,
     firecracker_bin: PathBuf,
     strict: bool,
+    network_egress_filtering: bool,
 }
 
 impl SandboxEngine {
@@ -70,6 +71,7 @@ impl SandboxEngine {
             microvm: None,
             firecracker_bin: PathBuf::from("firecracker"),
             strict: false,
+            network_egress_filtering: false,
         }
     }
 
@@ -84,6 +86,15 @@ impl SandboxEngine {
     /// unavailable (see [`is_strict`](runner_core::config::is_strict)).
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Enforce the outbound network boundary across the job (Process
+    /// tier only; the MicroVM tier's guest traffic never traverses the
+    /// host socket path these filters govern). Guard failures abort
+    /// the job instead of running unfiltered.
+    pub fn with_network_egress_filtering(mut self, enabled: bool) -> Self {
+        self.network_egress_filtering = enabled;
         self
     }
 
@@ -106,6 +117,7 @@ impl SandboxEngine {
                     timeout,
                     Arc::new(runner_core::governor::darwin::DarwinQos),
                     self.strict,
+                    self.network_egress_filtering,
                 )
                 .await
             }
@@ -187,10 +199,14 @@ async fn execute_process(
     timeout: Duration,
     qos: Arc<dyn QosBackend>,
     strict: bool,
+    network_egress_filtering: bool,
 ) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command to execute".to_string());
     }
+    // Egress boundary: acquire before any setup and hold across the
+    // job; any failure aborts instead of running unfiltered.
+    let _egress_guard = crate::egress::EgressGuard::acquire(network_egress_filtering)?;
     // No Tier-2 on Windows: strict fails here, before any spawn.
     #[cfg(windows)]
     if strict {
@@ -365,9 +381,15 @@ mod tests {
         let dir = runner_core::test_support::TempDir::new("driver-qos").unwrap();
         let log = dir.path().join("qos.log");
         let mock = Arc::new(MockQos::with_log(log.clone()));
-        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), mock, false)
-            .await
-            .unwrap();
+        let code = execute_process(
+            &exit_zero_argv(),
+            Duration::from_secs(30),
+            mock,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(code, 0);
         // The QoS log is written by the pre_exec child hook, which has
         // no Windows counterpart (no fork); spawns proceed unhooked.
@@ -377,9 +399,15 @@ mod tests {
         // A failing backend never fails the spawn.
         let failing = Arc::new(MockQos::new());
         failing.set_failing();
-        let code = execute_process(&exit_zero_argv(), Duration::from_secs(30), failing, false)
-            .await
-            .unwrap();
+        let code = execute_process(
+            &exit_zero_argv(),
+            Duration::from_secs(30),
+            failing,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(code, 0);
     }
 

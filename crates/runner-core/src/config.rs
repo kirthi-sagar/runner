@@ -176,6 +176,10 @@ fn default_false() -> bool {
     false
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_gitlab_url() -> String {
     "https://gitlab.com".to_string()
 }
@@ -402,6 +406,8 @@ pub struct SandboxProfile {
 pub struct SecurityProfile {
     #[serde(default)]
     pub air_gapped: Option<bool>,
+    #[serde(default)]
+    pub network_egress_filtering: Option<bool>,
 }
 
 /// Intuitive `runner.toml` profile. Layering precedence (highest first):
@@ -507,6 +513,9 @@ impl RunnerProfile {
         if let Some(security) = &self.security {
             if let Some(air_gapped) = security.air_gapped {
                 config.security.air_gapped = air_gapped;
+            }
+            if let Some(filtering) = security.network_egress_filtering {
+                config.security.network_egress_filtering = filtering;
             }
         }
         warnings
@@ -715,11 +724,25 @@ pub fn is_strict(explicit_flag: bool, config: &RunnerConfig) -> bool {
 }
 
 /// Zero-trust security posture.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// Air-gapped mode: cloud bursting is refused at the pool.
     #[serde(default)]
     pub air_gapped: bool,
+    /// Enforce outbound network boundary (block private/metadata, allow DNS/HTTPS).
+    #[serde(default = "default_true")]
+    pub network_egress_filtering: bool,
+}
+
+impl Default for SecurityConfig {
+    /// Secure by default, matching the serde default: filtering is on
+    /// unless explicitly disabled in either construction path.
+    fn default() -> Self {
+        Self {
+            air_gapped: false,
+            network_egress_filtering: true,
+        }
+    }
 }
 
 /// Embedded webhook listener for instant dispatch.
@@ -937,6 +960,22 @@ mod tests {
         assert_eq!(config.governor.warn_cpu_psi, 70.0);
         assert_eq!(config.governor.crit_cpu_psi, 90.0);
         assert_eq!(config.sandbox.driver, "process");
+    }
+
+    #[test]
+    fn egress_filtering_defaults_on_until_disabled() {
+        // Missing key and Rust default both enforce (secure default).
+        let missing: SecurityConfig = toml::from_str("").unwrap();
+        assert!(missing.network_egress_filtering);
+        assert!(SecurityConfig::default().network_egress_filtering);
+        // Explicit opt-out in either file layer disables.
+        let off: SecurityConfig = toml::from_str("network_egress_filtering = false").unwrap();
+        assert!(!off.network_egress_filtering);
+        let profile: RunnerProfile =
+            toml::from_str("[security]\nnetwork_egress_filtering = false\n").unwrap();
+        let mut config = RunnerConfig::default();
+        assert!(profile.apply_to(&mut config).is_empty());
+        assert!(!config.security.network_egress_filtering);
     }
 
     #[test]

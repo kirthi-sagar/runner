@@ -208,6 +208,10 @@ pub struct WorkerLaunch {
     /// Fail the spawn when the pre-exec sandbox setup fails, instead
     /// of running the worker unsandboxed.
     pub strict: bool,
+    /// Enforce the outbound network boundary for this worker (live WFP
+    /// session on Windows, validated filter program elsewhere). Guard
+    /// failures abort the spawn — never run unfiltered.
+    pub network_egress_filtering: bool,
     /// Extra environment for the child (e.g. cache endpoint injection).
     pub env: Vec<(String, String)>,
 }
@@ -219,6 +223,7 @@ impl WorkerLaunch {
             jit_config: jit_config.into(),
             sandbox: None,
             strict: false,
+            network_egress_filtering: false,
             env: Vec::new(),
         }
     }
@@ -332,6 +337,10 @@ pub async fn run_supervised(
             .clone()
             .map(|spec| move || crate::mounts::sandbox_pre_exec(&spec, strict)),
     );
+    // Egress boundary: acquire before spawn and hold across the
+    // job; any failure aborts instead of running unfiltered.
+    let _egress_guard = crate::egress::EgressGuard::acquire(launch.network_egress_filtering)
+        .map_err(io::Error::other)?;
     let mut child = spawn_with_busy_retry(&mut cmd).await?;
     if let (Some(pid), Some(slice)) = (child.id(), slice) {
         attach_to_slice(slice, pid);

@@ -3,6 +3,7 @@
 
 pub mod driver;
 pub mod ebpf;
+pub mod egress;
 pub mod microvm;
 pub mod mounts;
 pub mod network;

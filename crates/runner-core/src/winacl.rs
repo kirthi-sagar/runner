@@ -353,8 +353,27 @@ mod tests {
         let sock = dir.path().join("dacl.sock");
         let server = std::sync::Arc::new(IpcServer::bind(&sock, new_shared_state()).await.unwrap());
         let task = tokio::spawn(async move { server.serve().await });
-        let got = read_dacl_sids(DaclTarget::Pipe(&pipe_name_for(&sock))).expect("read pipe dacl");
-        assert_eq!(sorted(got), expected_trustees());
+        // Reading the DACL opens the pipe, which needs a listening
+        // instance: retry while serve() is still starting (same
+        // ERROR_PIPE_BUSY shape as the IPC client).
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+        let mut got = None;
+        for _ in 0..100 {
+            match read_dacl_sids(DaclTarget::Pipe(&pipe_name_for(&sock))) {
+                Ok(sids) => {
+                    got = Some(sids);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => panic!("read pipe dacl: {e}"),
+            }
+        }
+        assert_eq!(
+            sorted(got.expect("pipe became readable")),
+            expected_trustees()
+        );
         task.abort();
     }
 }

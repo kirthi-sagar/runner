@@ -111,6 +111,33 @@ pub struct WfpPortCondition {
     pub port: u16,
 }
 
+/// Application identity for per-app filter scoping
+/// (`FWPM_CONDITION_ALE_APP_ID`): the executable image path, resolved
+/// to a WFP app-id blob at install time on Windows.
+///
+/// Semantic boundary (read before relying on this): ALE app scoping
+/// matches the connecting process's OWN image only. Children with
+/// different images fall outside the filter, so app scoping narrows
+/// enforcement to one binary — it does not confine a process tree.
+/// True tree confinement needs token/package isolation (follow-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WfpAppId {
+    /// Executable image path (full path for kernel resolution).
+    pub path: String,
+}
+
+impl WfpAppId {
+    /// Build an app identity, rejecting empty paths fail-closed (an
+    /// empty condition would scope to nothing — or worse, to
+    /// everything — depending on the backend).
+    pub fn new(path: String) -> Result<Self, String> {
+        if path.trim().is_empty() {
+            return Err("application id path must not be empty".to_string());
+        }
+        Ok(WfpAppId { path })
+    }
+}
+
 /// Weight for private-range block rules: highest, so denies always
 /// arbitrate ahead of the DNS/HTTPS allowlist.
 pub const WEIGHT_BLOCK_PRIVATE: u64 = 0x1000;
@@ -139,13 +166,18 @@ pub struct WfpFilterRule {
     pub address: Option<WfpAddressCondition>,
     /// Remote-port condition, if any.
     pub port: Option<WfpPortCondition>,
+    /// Application-identity condition, if any (scoped rules only).
+    pub app: Option<WfpAppId>,
 }
 
 impl WfpFilterRule {
     /// True when this rule matches an outbound connection to `ip`
-    /// over `protocol`/`port`. Rules only match their own layer's
-    /// address family.
-    pub fn matches(&self, ip: IpAddr, protocol: WfpProtocol, port: u16) -> bool {
+    /// over `protocol`/`port` from `app`. Rules only match their own
+    /// layer's address family. Unscoped rules match any app; scoped
+    /// rules require the connecting image, compared
+    /// case-insensitively (Windows path reality), and an unknown app
+    /// (`None`) never satisfies scoping (fail-closed model).
+    pub fn matches(&self, ip: IpAddr, protocol: WfpProtocol, port: u16, app: Option<&str>) -> bool {
         let family_ok = matches!(
             (self.layer, ip),
             (WfpLayer::AleAuthConnectV4, IpAddr::V4(_))
@@ -156,6 +188,9 @@ impl WfpFilterRule {
             && self
                 .port
                 .is_none_or(|cond| cond.protocol == protocol && cond.port == port)
+            && self.app.as_ref().is_none_or(|cond| {
+                app.is_some_and(|candidate| candidate.eq_ignore_ascii_case(&cond.path))
+            })
     }
 }
 
@@ -277,6 +312,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 mask: 0xff00_0000,
             }),
             port: None,
+            app: None,
         },
         WfpFilterRule {
             name: "runner: block 172.16.0.0/12",
@@ -288,6 +324,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 mask: 0xfff0_0000,
             }),
             port: None,
+            app: None,
         },
         WfpFilterRule {
             name: "runner: block 192.168.0.0/16",
@@ -299,6 +336,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 mask: 0xffff_0000,
             }),
             port: None,
+            app: None,
         },
         WfpFilterRule {
             name: "runner: block 169.254.0.0/16",
@@ -310,6 +348,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 mask: 0xffff_0000,
             }),
             port: None,
+            app: None,
         },
         // --- IPv4: allow DNS + HTTPS only ---
         WfpFilterRule {
@@ -322,6 +361,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 protocol: WfpProtocol::Udp,
                 port: network::ALLOW_DNS_PORT,
             }),
+            app: None,
         },
         WfpFilterRule {
             name: "runner: allow TCP HTTPS",
@@ -333,6 +373,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 protocol: WfpProtocol::Tcp,
                 port: network::ALLOW_HTTPS_PORT,
             }),
+            app: None,
         },
         // --- IPv4: default drop (lowest weight) ---
         WfpFilterRule {
@@ -342,6 +383,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
             weight: WEIGHT_DEFAULT_DROP,
             address: None,
             port: None,
+            app: None,
         },
         // --- IPv6: drop ULA ---
         WfpFilterRule {
@@ -354,6 +396,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 mask: [0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             }),
             port: None,
+            app: None,
         },
         // --- IPv6: allow DNS + HTTPS only ---
         WfpFilterRule {
@@ -366,6 +409,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 protocol: WfpProtocol::Udp,
                 port: network::ALLOW_DNS_PORT,
             }),
+            app: None,
         },
         WfpFilterRule {
             name: "runner: allow TCP HTTPS",
@@ -377,6 +421,7 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
                 protocol: WfpProtocol::Tcp,
                 port: network::ALLOW_HTTPS_PORT,
             }),
+            app: None,
         },
         // --- IPv6: default drop ---
         WfpFilterRule {
@@ -386,23 +431,38 @@ pub fn sandbox_egress_rules() -> Vec<WfpFilterRule> {
             weight: WEIGHT_DEFAULT_DROP,
             address: None,
             port: None,
+            app: None,
         },
     ]
+}
+
+/// Build the sandbox egress ruleset scoped to one application
+/// image: the same 11 rules, each carrying the app-identity
+/// condition. Connections from other images match nothing and fall
+/// through to the fail-closed default (see [`arbitrate`]).
+pub fn sandbox_egress_rules_scoped(app: &WfpAppId) -> Vec<WfpFilterRule> {
+    let mut rules = sandbox_egress_rules();
+    for rule in &mut rules {
+        rule.app = Some(app.clone());
+    }
+    rules
 }
 
 /// Arbitrate `rules` for one outbound connection the way WFP does:
 /// the highest-weight matching rule decides. Fail-closed: with no
 /// matching rule the verdict is [`WfpAction::Block`] (unreachable in
-/// the built ruleset, whose default-drop rules match everything).
+/// the unscoped ruleset, whose default-drop rules match everything;
+/// reachable in scoped rulesets for other/unknown apps, by design).
 pub fn arbitrate(
     rules: &[WfpFilterRule],
     ip: IpAddr,
     protocol: WfpProtocol,
     port: u16,
+    app: Option<&str>,
 ) -> WfpAction {
     let mut best: Option<&WfpFilterRule> = None;
     for rule in rules {
-        if rule.matches(ip, protocol, port)
+        if rule.matches(ip, protocol, port, app)
             && best.is_none_or(|b: &WfpFilterRule| rule.weight > b.weight)
         {
             best = Some(rule);
@@ -613,31 +673,43 @@ mod tests {
         let rules = sandbox_egress_rules();
         // Private destinations drop even on allowlisted ports.
         assert_eq!(
-            arbitrate(&rules, v4("10.0.0.5"), Tcp, 443),
+            arbitrate(&rules, v4("10.0.0.5"), Tcp, 443, None),
             WfpAction::Block
         );
         assert_eq!(
-            arbitrate(&rules, v4("172.16.9.9"), Udp, 53),
+            arbitrate(&rules, v4("172.16.9.9"), Udp, 53, None),
             WfpAction::Block
         );
         assert_eq!(
-            arbitrate(&rules, v4("169.254.169.254"), Tcp, 80),
+            arbitrate(&rules, v4("169.254.169.254"), Tcp, 80, None),
             WfpAction::Block
         );
-        assert_eq!(arbitrate(&rules, v6("fd00::1"), Udp, 53), WfpAction::Block);
+        assert_eq!(
+            arbitrate(&rules, v6("fd00::1"), Udp, 53, None),
+            WfpAction::Block
+        );
         // Public DNS + HTTPS permit.
-        assert_eq!(arbitrate(&rules, v4("8.8.8.8"), Udp, 53), WfpAction::Permit);
         assert_eq!(
-            arbitrate(&rules, v4("140.82.112.4"), Tcp, 443),
+            arbitrate(&rules, v4("8.8.8.8"), Udp, 53, None),
             WfpAction::Permit
         );
         assert_eq!(
-            arbitrate(&rules, v6("2606:4700:4700::1111"), Udp, 53),
+            arbitrate(&rules, v4("140.82.112.4"), Tcp, 443, None),
+            WfpAction::Permit
+        );
+        assert_eq!(
+            arbitrate(&rules, v6("2606:4700:4700::1111"), Udp, 53, None),
             WfpAction::Permit
         );
         // Everything else default-drops.
-        assert_eq!(arbitrate(&rules, v4("1.1.1.1"), Tcp, 80), WfpAction::Block);
-        assert_eq!(arbitrate(&rules, v4("8.8.8.8"), Tcp, 53), WfpAction::Block);
+        assert_eq!(
+            arbitrate(&rules, v4("1.1.1.1"), Tcp, 80, None),
+            WfpAction::Block
+        );
+        assert_eq!(
+            arbitrate(&rules, v4("8.8.8.8"), Tcp, 53, None),
+            WfpAction::Block
+        );
         // Family isolation: v4 block rules never match v6 traffic, so
         // an IPv4-mapped address on the v6 layer falls through to the
         // v6 allowlist instead of the v4 10/8 block.
@@ -647,10 +719,13 @@ mod tests {
             .filter(|r| r.layer == WfpLayer::AleAuthConnectV4
                 && r.action == WfpAction::Block
                 && r.address.is_some())
-            .all(|r| !r.matches(mapped, Tcp, 443)));
-        assert_eq!(arbitrate(&rules, mapped, Tcp, 443), WfpAction::Permit);
+            .all(|r| !r.matches(mapped, Tcp, 443, None)));
+        assert_eq!(arbitrate(&rules, mapped, Tcp, 443, None), WfpAction::Permit);
         // Fail-closed with no matching rule.
-        assert_eq!(arbitrate(&[], v4("8.8.8.8"), Udp, 53), WfpAction::Block);
+        assert_eq!(
+            arbitrate(&[], v4("8.8.8.8"), Udp, 53, None),
+            WfpAction::Block
+        );
     }
 
     #[test]
@@ -666,5 +741,65 @@ mod tests {
     fn protocol_numbers_match_ip_assignments() {
         assert_eq!(WfpProtocol::Tcp.number(), 6);
         assert_eq!(WfpProtocol::Udp.number(), 17);
+    }
+
+    #[test]
+    fn app_id_rejects_empty_paths() {
+        assert!(WfpAppId::new("C:\\worker\\Runner.Worker.exe".to_string()).is_ok());
+        for bad in ["", "   ", "\t\n"] {
+            assert!(WfpAppId::new(bad.to_string()).is_err(), "{bad:?}");
+        }
+    }
+
+    const WORKER_EXE: &str = "C:\\worker\\bin\\Runner.Worker.exe";
+
+    #[test]
+    fn scoped_builder_attaches_app_to_all_rules() {
+        let app = WfpAppId::new(WORKER_EXE.to_string()).unwrap();
+        let rules = sandbox_egress_rules_scoped(&app);
+        assert_eq!(rules.len(), 11);
+        assert!(rules.iter().all(|r| r.app.as_ref() == Some(&app)));
+        // The unscoped builder stays app-free.
+        assert!(sandbox_egress_rules().iter().all(|r| r.app.is_none()));
+    }
+
+    #[test]
+    fn scoped_matching_requires_the_image_case_insensitively() {
+        use WfpProtocol::Tcp;
+        let app = WfpAppId::new(WORKER_EXE.to_string()).unwrap();
+        let rules = sandbox_egress_rules_scoped(&app);
+        let ip = v4("140.82.112.4");
+        // Rightful app (any case) arbitrates exactly like unscoped.
+        for candidate in [WORKER_EXE, "c:\\worker\\bin\\runner.worker.exe"] {
+            assert_eq!(
+                arbitrate(&rules, ip, Tcp, 443, Some(candidate)),
+                WfpAction::Permit,
+                "{candidate}"
+            );
+            assert_eq!(
+                arbitrate(&rules, ip, Tcp, 80, Some(candidate)),
+                WfpAction::Block,
+                "{candidate}"
+            );
+            assert_eq!(
+                arbitrate(&rules, v4("10.0.0.5"), Tcp, 443, Some(candidate)),
+                WfpAction::Block,
+                "{candidate}"
+            );
+        }
+        // Other images and unknown apps match nothing: fail-closed.
+        for candidate in [Some("C:\\Windows\\System32\\cmd.exe"), None] {
+            assert_eq!(
+                arbitrate(&rules, ip, Tcp, 443, candidate),
+                WfpAction::Block,
+                "{candidate:?}"
+            );
+        }
+        // Unscoped rules ignore the app dimension entirely.
+        let open = sandbox_egress_rules();
+        assert_eq!(
+            arbitrate(&open, ip, Tcp, 443, Some("C:\\anything\\x.exe")),
+            WfpAction::Permit
+        );
     }
 }

@@ -306,6 +306,24 @@ async fn spawn_with_busy_retry(cmd: &mut TokioCommand) -> io::Result<tokio::proc
     }
 }
 
+/// Resolve the worker executable image for WFP app scoping. The
+/// official packages lay out `bin/Runner.Worker.exe` (Windows) —
+/// with a top-level fallback for repacked trees. Existence-gated:
+/// anything unrecognized (scripts like `run.cmd` have no image of
+/// their own) yields `None` and the guard falls back to unscoped
+/// session filters, never to unfiltered execution.
+fn worker_app_path(work_dir: &std::path::Path) -> Option<String> {
+    for candidate in [
+        work_dir.join("bin").join("Runner.Worker.exe"),
+        work_dir.join("Runner.Worker.exe"),
+    ] {
+        if candidate.is_file() {
+            return candidate.to_str().map(str::to_string);
+        }
+    }
+    None
+}
+
 /// completion. Kills the child on timeout. Never freezes: a stuck worker
 /// is killed, never suspended mid-test.
 pub async fn run_supervised(
@@ -341,9 +359,14 @@ pub async fn run_supervised(
         }),
     );
     // Egress boundary: acquire before spawn and hold across the
-    // job; any failure aborts instead of running unfiltered.
-    let _egress_guard = crate::egress::EgressGuard::acquire(launch.network_egress_filtering)
-        .map_err(io::Error::other)?;
+    // job; any failure aborts instead of running unfiltered. The
+    // worker image scopes Windows filters when resolvable.
+    let app_path = worker_app_path(&launch.work_dir);
+    let _egress_guard = crate::egress::EgressGuard::acquire_scoped(
+        launch.network_egress_filtering,
+        app_path.as_deref(),
+    )
+    .map_err(io::Error::other)?;
     let mut child = spawn_with_busy_retry(&mut cmd).await?;
     if let (Some(pid), Some(slice)) = (child.id(), slice) {
         attach_to_slice(slice, pid);
@@ -386,6 +409,34 @@ mod tests {
         let mut file = std::fs::File::create(path).unwrap();
         file.write_all(contents.as_bytes()).unwrap();
         file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn worker_app_path_prefers_packaged_exe() {
+        let dir = runner_core::test_support::TempDir::new("worker-app").unwrap();
+        // Bare tree (scripts only): no image, unscoped fallback.
+        assert_eq!(worker_app_path(dir.path()), None);
+        // Top-level repack fallback.
+        let top = dir.path().join("Runner.Worker.exe");
+        std::fs::write(&top, b"fake").unwrap();
+        assert_eq!(
+            worker_app_path(dir.path()),
+            Some(top.to_str().unwrap().to_string())
+        );
+        // Official bin/ layout wins when present.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let packaged = bin.join("Runner.Worker.exe");
+        std::fs::write(&packaged, b"fake").unwrap();
+        assert_eq!(
+            worker_app_path(dir.path()),
+            Some(packaged.to_str().unwrap().to_string())
+        );
+        // Directories named like the exe do not count.
+        std::fs::remove_file(&packaged).unwrap();
+        std::fs::remove_file(&top).unwrap();
+        std::fs::create_dir_all(&top).unwrap();
+        assert_eq!(worker_app_path(dir.path()), None);
     }
 
     #[tokio::test]

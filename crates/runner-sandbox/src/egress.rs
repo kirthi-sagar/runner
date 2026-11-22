@@ -30,6 +30,9 @@ pub struct EgressGuard {
     /// Live WFP session (Windows only; dynamic teardown on drop).
     #[cfg(windows)]
     _session: crate::wfp::WfpEngineSession,
+    /// Scoping identity when filters attach per-app (Windows only).
+    #[cfg(windows)]
+    scoped_app: Option<crate::wfp::WfpAppId>,
     /// Validated filter program, held live across the job.
     #[cfg(not(windows))]
     _program: EgressFilterProgram,
@@ -40,21 +43,70 @@ impl EgressGuard {
     /// (bypassed); otherwise engages the platform leg and fails
     /// closed with a descriptive error on any failure.
     pub fn acquire(enabled: bool) -> Result<Option<Self>, String> {
+        Self::acquire_scoped(enabled, None)
+    }
+
+    /// Acquire enforcement scoped to one application image. With no
+    /// path, installs the unscoped session rules (clean fallback).
+    /// On Windows a resolvable path scopes all 11 filters to that
+    /// image; when resolution fails the guard falls back to unscoped
+    /// filters with a loud log — filtering (the invariant) is
+    /// preserved while precision degrades, never the reverse. Off
+    /// Windows the path validates non-empty and is otherwise ignored
+    /// (app scoping is a Windows-kernel concept).
+    pub fn acquire_scoped(enabled: bool, app_path: Option<&str>) -> Result<Option<Self>, String> {
         if !enabled {
             return Ok(None);
         }
+        let app = app_path
+            .map(|path| crate::wfp::WfpAppId::new(path.to_string()))
+            .transpose()?;
         #[cfg(windows)]
         {
             let session = crate::wfp::WfpEngineSession::open().map_err(|e| {
                 format!("network egress filtering: failed to open WFP engine session: {e}")
             })?;
-            session.install_sandbox_rules().map_err(|e| {
-                format!("network egress filtering: failed to install sandbox filters: {e}")
-            })?;
-            Ok(Some(EgressGuard { _session: session }))
+            match app {
+                Some(app) => match session.install_sandbox_rules_scoped(&app) {
+                    Ok(_) => Ok(Some(EgressGuard {
+                        _session: session,
+                        scoped_app: Some(app),
+                    })),
+                    Err(e) => {
+                        // Partial scoped filters may already be
+                        // installed; they share weights/actions with
+                        // the unscoped set, so verdicts stay identical
+                        // and everything dies with the session.
+                        eprintln!(
+                            "wfp: app-id resolution failed for '{}': {e}; \
+                             falling back to unscoped session filters",
+                            app.path
+                        );
+                        session.install_sandbox_rules().map_err(|e| {
+                            format!(
+                                "network egress filtering: failed to install sandbox filters: {e}"
+                            )
+                        })?;
+                        Ok(Some(EgressGuard {
+                            _session: session,
+                            scoped_app: None,
+                        }))
+                    }
+                },
+                None => {
+                    session.install_sandbox_rules().map_err(|e| {
+                        format!("network egress filtering: failed to install sandbox filters: {e}")
+                    })?;
+                    Ok(Some(EgressGuard {
+                        _session: session,
+                        scoped_app: None,
+                    }))
+                }
+            }
         }
         #[cfg(not(windows))]
         {
+            let _ = app;
             Self::acquire_from(&EgressFilterProgram::new()).map(Some)
         }
     }
@@ -76,6 +128,19 @@ impl EgressGuard {
     /// program) backs this guard.
     pub fn is_live(&self) -> bool {
         cfg!(windows)
+    }
+
+    /// True when the installed filters carry an app-identity
+    /// condition (Windows scoped installs only).
+    pub fn is_scoped(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.scoped_app.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 }
 
@@ -140,6 +205,29 @@ mod tests {
     #[test]
     fn acquire_disabled_bypasses() {
         assert!(EgressGuard::acquire(false).unwrap().is_none());
+        assert!(
+            EgressGuard::acquire_scoped(false, Some("C:\\w\\Worker.exe"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn acquire_scoped_rejects_empty_path() {
+        let err = EgressGuard::acquire_scoped(true, Some("  ")).unwrap_err();
+        assert!(err.contains("must not be empty"), "{err}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn acquire_scoped_validates_then_behaves_validated() {
+        // App scoping is a Windows-kernel concept: elsewhere the path
+        // validates and the guard holds the validated program.
+        let guard = EgressGuard::acquire_scoped(true, Some("C:\\w\\Worker.exe"))
+            .unwrap()
+            .expect("guard");
+        assert!(!guard.is_live());
+        assert!(!guard.is_scoped());
     }
 
     #[cfg(not(windows))]
@@ -185,5 +273,23 @@ mod tests {
             .expect("acquire live guard")
             .expect("guard");
         assert!(guard.is_live());
+    }
+
+    /// Live scoped acquisition: filters attach with the app-id
+    /// condition resolved from this test binary's own image. Same
+    /// elevation + `RUNNER_LIVE_WFP=1` gate as the unscoped test.
+    #[cfg(windows)]
+    #[test]
+    fn live_acquire_scoped_installs() {
+        if std::env::var("RUNNER_LIVE_WFP").is_err() {
+            eprintln!("live egress-guard harness skipped (needs RUNNER_LIVE_WFP=1)");
+            return;
+        }
+        let exe = std::env::current_exe().expect("own exe path");
+        let guard = EgressGuard::acquire_scoped(true, exe.to_str())
+            .expect("acquire live scoped guard")
+            .expect("guard");
+        assert!(guard.is_live());
+        assert!(guard.is_scoped());
     }
 }

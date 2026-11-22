@@ -98,7 +98,7 @@ fn check_vector(
     let wfp_protocol = wfp_proto(proto);
     let expected = oracle(ip, wfp_protocol, port);
     let rules = sandbox_egress_rules();
-    let wfp = match arbitrate(&rules, ip, wfp_protocol, port) {
+    let wfp = match arbitrate(&rules, ip, wfp_protocol, port, None) {
         WfpAction::Block => BpfVerdict::Drop,
         WfpAction::Permit => BpfVerdict::Pass,
     };
@@ -237,4 +237,51 @@ fn egress_parity_with_ip_options_and_ext_headers() {
         &packet,
         "hbh-sport-collision",
     );
+}
+
+#[test]
+fn egress_parity_scoped_rules_match_unscoped_for_rightful_app() {
+    use runner::sandbox::wfp::{sandbox_egress_rules_scoped, WfpAppId};
+    let program = EgressFilterProgram::new();
+    let app = WfpAppId::new("C:\\worker\\bin\\Runner.Worker.exe".to_string()).unwrap();
+    let scoped = sandbox_egress_rules_scoped(&app);
+    // (address, proto, port): the rightful app arbitrates exactly like
+    // the unscoped ruleset; any other image drops everything.
+    let vectors = [
+        ("10.0.0.1", 6u8, 443u16),
+        ("169.254.169.254", 17, 53),
+        ("8.8.8.8", 17, 53),
+        ("8.8.8.8", 6, 80),
+        ("140.82.112.4", 6, 443),
+        ("fd00::1", 6, 443),
+        ("2001:db8::1", 6, 443),
+    ];
+    for (ip_text, proto, port) in vectors {
+        let ip = IpAddr::from_str(ip_text).unwrap();
+        let wfp_protocol = wfp_proto(proto);
+        let expected = oracle(ip, wfp_protocol, port);
+        let packet = match ip {
+            IpAddr::V4(v4) => v4_packet(v4, proto, port, 5),
+            IpAddr::V6(v6) => v6_packet(v6, proto, port),
+        };
+        // Unscoped baseline still agrees with eBPF.
+        let baseline = match arbitrate(&sandbox_egress_rules(), ip, wfp_protocol, port, None) {
+            WfpAction::Block => BpfVerdict::Drop,
+            WfpAction::Permit => BpfVerdict::Pass,
+        };
+        let ebpf = evaluate_packet(&program, &packet);
+        assert_eq!((baseline, ebpf), (expected, expected), "{ip_text}");
+        // Rightful app: identical verdicts.
+        let scoped_verdict = match arbitrate(&scoped, ip, wfp_protocol, port, Some(&app.path)) {
+            WfpAction::Block => BpfVerdict::Drop,
+            WfpAction::Permit => BpfVerdict::Pass,
+        };
+        assert_eq!(scoped_verdict, expected, "scoped diverged: {ip_text}");
+        // Foreign app: everything drops, including the allowlist.
+        let foreign = match arbitrate(&scoped, ip, wfp_protocol, port, Some("C:\\other\\app.exe")) {
+            WfpAction::Block => BpfVerdict::Drop,
+            WfpAction::Permit => BpfVerdict::Pass,
+        };
+        assert_eq!(foreign, BpfVerdict::Drop, "foreign leaked: {ip_text}");
+    }
 }

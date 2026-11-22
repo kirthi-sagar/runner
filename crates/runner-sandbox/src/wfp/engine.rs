@@ -19,6 +19,8 @@
 //!   CIDR-contiguous masks the contract builds).
 //! * Port rules → `FWPM_CONDITION_IP_PROTOCOL` (`FWP_UINT8`) plus
 //!   `FWPM_CONDITION_IP_REMOTE_PORT` (`FWP_UINT16`).
+//! * App rules → `FWPM_CONDITION_ALE_APP_ID` with a resolved
+//!   `FWP_BYTE_BLOB` (one resolution shared across the install).
 //! * Filter weight → `FWP_UINT64` value; block/permit → `FWPM_ACTION0`.
 //!
 //! Non-Windows builds get a disabled stub exposing the same method
@@ -115,7 +117,8 @@ mod imp {
     use super::{plan_conditions, WfpConditionPlan};
     use crate::wfp::api;
     use crate::wfp::types::{
-        sandbox_egress_rules, WfpFilterRule, SESSION_DESCRIPTION, SESSION_NAME,
+        sandbox_egress_rules, sandbox_egress_rules_scoped, WfpAppId, WfpFilterRule,
+        SESSION_DESCRIPTION, SESSION_NAME,
     };
 
     /// RAII handle to a dynamic WFP engine session (Windows only).
@@ -143,8 +146,8 @@ mod imp {
         /// Open a dynamic engine session on the local host with
         /// default authentication.
         pub fn open() -> io::Result<Self> {
-            let name = wide_string(SESSION_NAME);
-            let description = wide_string(SESSION_DESCRIPTION);
+            let name = api::wide_string(SESSION_NAME);
+            let description = api::wide_string(SESSION_DESCRIPTION);
             let session = wfp::FWPM_SESSION0 {
                 sessionKey: random_guid(),
                 displayData: wfp::FWPM_DISPLAY_DATA0 {
@@ -184,13 +187,33 @@ mod imp {
         pub fn install_sandbox_rules(&self) -> io::Result<Vec<u64>> {
             let mut ids = Vec::new();
             for rule in sandbox_egress_rules() {
-                ids.push(self.install_rule(&rule)?);
+                ids.push(self.install_rule(&rule, None)?);
             }
             Ok(ids)
         }
 
-        /// Install one portable rule as a native ALE connect filter.
-        fn install_rule(&self, rule: &WfpFilterRule) -> io::Result<u64> {
+        /// Install the 11 sandbox egress filters scoped to one
+        /// application image; returns their filter IDs. The app id is
+        /// resolved once and shared across the install. See
+        /// [`WfpAppId`] for the scoping boundary (one image, not a
+        /// process tree).
+        pub fn install_sandbox_rules_scoped(&self, app: &WfpAppId) -> io::Result<Vec<u64>> {
+            let mut blob = api::AppIdBlob::resolve(&app.path)?;
+            let mut ids = Vec::new();
+            for rule in sandbox_egress_rules_scoped(app) {
+                ids.push(self.install_rule(&rule, Some(&mut blob))?);
+            }
+            Ok(ids)
+        }
+
+        /// Install one portable rule as a native ALE connect filter,
+        /// attaching the app-identity condition when the rule carries
+        /// one (the resolved blob must accompany it).
+        fn install_rule(
+            &self,
+            rule: &WfpFilterRule,
+            app: Option<&mut api::AppIdBlob>,
+        ) -> io::Result<u64> {
             // Scratch storage: everything the filter points at must
             // outlive the FwpmFilterAdd0 call (the engine copies on
             // add). Each slot is written in the arm that stores its
@@ -250,6 +273,23 @@ mod imp {
                     },
                 });
             }
+            if rule.app.is_some() {
+                let Some(blob) = app else {
+                    return Err(io::Error::other(
+                        "wfp: app-scoped rule without resolved application id",
+                    ));
+                };
+                conditions.push(wfp::FWPM_FILTER_CONDITION0 {
+                    fieldKey: api::app_id_condition(),
+                    matchType: wfp::FWP_MATCH_EQUAL,
+                    conditionValue: wfp::FWP_CONDITION_VALUE0 {
+                        r#type: wfp::FWP_BYTE_BLOB_TYPE,
+                        Anonymous: wfp::FWP_CONDITION_VALUE0_0 {
+                            byteBlob: blob.as_mut_ptr(),
+                        },
+                    },
+                });
+            }
             let mut weight_value = rule.weight;
             let weight = wfp::FWP_VALUE0 {
                 r#type: wfp::FWP_UINT64,
@@ -257,7 +297,7 @@ mod imp {
                     uint64: &mut weight_value as *mut u64,
                 },
             };
-            let name = wide_string(rule.name);
+            let name = api::wide_string(rule.name);
             let filter = wfp::FWPM_FILTER0 {
                 filterKey: random_guid(),
                 displayData: wfp::FWPM_DISPLAY_DATA0 {
@@ -285,8 +325,9 @@ mod imp {
             let mut id: u64 = 0;
             // SAFETY: live session handle; `filter` and every value it
             // points at are owned locals alive for the call (address
-            // slots are written before their pointers are stored); null
-            // SD selects the default security descriptor.
+            // slots are written before their pointers are stored, and
+            // the app blob outlives the install loop); null SD selects
+            // the default security descriptor.
             let code =
                 unsafe { wfp::FwpmFilterAdd0(self.handle, &filter, ptr::null_mut(), &mut id) };
             if code != ERROR_SUCCESS {
@@ -306,11 +347,6 @@ mod imp {
                 wfp::FwpmEngineClose0(self.handle);
             }
         }
-    }
-
-    /// Nul-terminated UTF-16 buffer (mirrors `winacl` string handling).
-    fn wide_string(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     /// Fresh random GUID for session/filter keys.
@@ -349,6 +385,21 @@ mod imp {
             eprintln!(
                 "wfp: engine sessions require Windows; \
                  cannot install filters on this platform"
+            );
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "WFP engine sessions require Windows",
+            ))
+        }
+
+        /// Unreachable via `open`, but fails loudly all the same.
+        pub fn install_sandbox_rules_scoped(
+            &self,
+            _app: &crate::wfp::types::WfpAppId,
+        ) -> io::Result<Vec<u64>> {
+            eprintln!(
+                "wfp: engine sessions require Windows; \
+                 cannot install scoped filters on this platform"
             );
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -542,5 +593,31 @@ mod tests {
         assert_eq!(sorted.len(), 11, "filter IDs are unique");
         // `session` drops here: explicit engine close, and dynamic
         // teardown reaps the 11 filters either way.
+    }
+
+    /// Live scoped install: all 11 filters attach with the app-id
+    /// condition resolved from this test binary's own image. Same
+    /// elevation + `RUNNER_LIVE_WFP=1` gate as the unscoped test.
+    #[cfg(windows)]
+    #[test]
+    fn live_engine_scoped_install() {
+        if std::env::var("RUNNER_LIVE_WFP").is_err() {
+            eprintln!("live WFP harness skipped (needs RUNNER_LIVE_WFP=1 on elevated Windows)");
+            return;
+        }
+        let exe = std::env::current_exe().expect("own exe path");
+        let app =
+            crate::wfp::types::WfpAppId::new(exe.to_str().expect("utf-8 exe path").to_string())
+                .expect("non-empty app path");
+        let session = WfpEngineSession::open().expect("open dynamic WFP session");
+        let ids = session
+            .install_sandbox_rules_scoped(&app)
+            .expect("install 11 scoped sandbox filters");
+        assert_eq!(ids.len(), 11);
+        assert!(ids.iter().all(|id| *id != 0));
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 11, "filter IDs are unique");
     }
 }

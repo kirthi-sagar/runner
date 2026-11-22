@@ -27,8 +27,10 @@
 //! Phase 1 delivered the core contract plus the pure-logic rule
 //! engine ([`types`]). Phase 2 adds the live engine half ([`engine`]):
 //! a dynamic session (`FwpmEngineOpen0`) with RAII close plus ALE
-//! filter installation (`FwpmFilterAdd0`). Job-scoped
-//! install/remove wiring lands in a later phase.
+//! filter installation (`FwpmFilterAdd0`). Per-app scoping
+//! (`FWPM_CONDITION_ALE_APP_ID`, resolved in the Windows-only `api`
+//! module) narrows filters to one image; true process-tree
+//! confinement needs token/package isolation (follow-up).
 
 pub mod engine;
 pub mod types;
@@ -36,59 +38,13 @@ pub mod types;
 pub use engine::{plan_conditions, WfpConditionPlan, WfpEngineSession};
 
 pub use types::{
-    arbitrate, parse_v4_cidr, parse_v6_cidr, sandbox_egress_rules, v4_prefix_mask, v6_prefix_mask,
-    WfpAction, WfpAddressCondition, WfpFilterRule, WfpLayer, WfpPortCondition, WfpProtocol,
-    WfpSession, SESSION_DESCRIPTION, SESSION_NAME, WEIGHT_BLOCK_PRIVATE, WEIGHT_DEFAULT_DROP,
-    WEIGHT_PERMIT_ALLOWLIST,
+    arbitrate, parse_v4_cidr, parse_v6_cidr, sandbox_egress_rules, sandbox_egress_rules_scoped,
+    v4_prefix_mask, v6_prefix_mask, WfpAction, WfpAddressCondition, WfpAppId, WfpFilterRule,
+    WfpLayer, WfpPortCondition, WfpProtocol, WfpSession, SESSION_DESCRIPTION, SESSION_NAME,
+    WEIGHT_BLOCK_PRIVATE, WEIGHT_DEFAULT_DROP, WEIGHT_PERMIT_ALLOWLIST,
 };
 
 /// `#[cfg(windows)]` mappings from the portable contract to real WFP
-/// constants. Pure value mappings only — engine calls arrive in
-/// Phase 2.
+/// constants, plus the app-id resolver.
 #[cfg(windows)]
-pub mod api {
-    use windows_sys::core::GUID;
-    use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform as wfp;
-
-    use super::types::{WfpAction, WfpLayer};
-
-    /// ALE authorize layer GUID for a portable [`WfpLayer`].
-    pub fn layer_guid(layer: WfpLayer) -> GUID {
-        match layer {
-            WfpLayer::AleAuthConnectV4 => wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V4,
-            WfpLayer::AleAuthConnectV6 => wfp::FWPM_LAYER_ALE_AUTH_CONNECT_V6,
-        }
-    }
-
-    /// Session flags for the sandbox egress session: dynamic only,
-    /// so the kernel reaps every filter if the runner dies.
-    pub fn session_flags() -> u32 {
-        wfp::FWPM_SESSION_FLAG_DYNAMIC
-    }
-
-    /// WFP action code for a portable [`WfpAction`].
-    pub fn action_type(action: WfpAction) -> wfp::FWP_ACTION_TYPE {
-        match action {
-            WfpAction::Block => wfp::FWP_ACTION_BLOCK,
-            WfpAction::Permit => wfp::FWP_ACTION_PERMIT,
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn mappings_cover_both_layers_and_actions() {
-            // GUID has no PartialEq; compare the leading fields.
-            let v4 = layer_guid(WfpLayer::AleAuthConnectV4);
-            let v6 = layer_guid(WfpLayer::AleAuthConnectV6);
-            assert_ne!(v4.data1, 0);
-            assert_ne!(v6.data1, 0);
-            assert_ne!(v4.data1, v6.data1);
-            assert_eq!(session_flags(), wfp::FWPM_SESSION_FLAG_DYNAMIC);
-            assert_eq!(action_type(WfpAction::Block), wfp::FWP_ACTION_BLOCK);
-            assert_eq!(action_type(WfpAction::Permit), wfp::FWP_ACTION_PERMIT);
-        }
-    }
-}
+pub mod api;

@@ -16,9 +16,10 @@
 //! Groundwork laid here, wired later:
 //!
 //! * Governor preemption: [`ReservationPriority`] ordering is the
-//!   eviction rank, [`Reservation::preemptible_by`] the per-victim
-//!   predicate, and [`select_preemption_victims`] the greedy victim
-//!   policy. No governor behavior changes in Phase 1.
+//!   eviction rank, per-victim
+//!   [`Reservation::preemptible_by`](crate::governor::supervisor::Reservation::preemptible_by)
+//!   predicate, and [`select_preemption_victims`] greedy victim policy,
+//!   wired into the reservation workflow with slot clamping in Phase 2.
 //! * Spend ledger: [`ReservationRequest::billable_core_hours`] and
 //!   [`estimated_cost_usd`](ReservationRequest::estimated_cost_usd)
 //!   are the pure charging inputs a future `SpendLedger::record_*`
@@ -29,7 +30,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::tools::ReserveHostResourcesArgs;
-use crate::governor::supervisor::{Reservation, ReservationPriority};
+use crate::governor::supervisor::ReservationPriority;
+
+/// Re-exported victim policy (defined beside the governor state it
+/// acts on); the preemption groundwork tests below resolve through it.
+pub use crate::governor::supervisor::select_preemption_victims;
 
 /// Sanity ceilings for one reservation request. These guard against
 /// absurd or typo'd requests (1e18 cores), not capacity planning —
@@ -217,47 +222,10 @@ impl TryFrom<&ReserveHostResourcesArgs> for ReservationRequest {
     }
 }
 
-/// Greedy preemption policy (groundwork — no governor wiring yet):
-/// lowest rank first, earliest expiry within a rank, accumulating
-/// freed headroom until BOTH needs are met. All-or-nothing: when the
-/// preemptible set cannot cover the request, returns empty (never
-/// evicts victims that would not even satisfy the incomer).
-pub fn select_preemption_victims(
-    reservations: &[Reservation],
-    need_cores: f64,
-    need_ram_mb: u64,
-    incoming: ReservationPriority,
-) -> Vec<String> {
-    let mut candidates: Vec<&Reservation> = reservations
-        .iter()
-        .filter(|r| r.preemptible_by(incoming))
-        .collect();
-    candidates.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then(a.expires_at.cmp(&b.expires_at))
-    });
-    let mut freed_cores = 0.0;
-    let mut freed_ram_mb = 0u64;
-    let mut victims = Vec::new();
-    for candidate in candidates {
-        if freed_cores >= need_cores && freed_ram_mb >= need_ram_mb {
-            break;
-        }
-        freed_cores += candidate.cores;
-        freed_ram_mb += candidate.ram_mb;
-        victims.push(candidate.id.clone());
-    }
-    if freed_cores >= need_cores && freed_ram_mb >= need_ram_mb {
-        victims
-    } else {
-        Vec::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::governor::supervisor::Reservation;
     use crate::governor::supervisor::ReservationPriority::*;
 
     fn v1_args(cores: f64, ram_gb: f64, mins: u64) -> ReserveHostResourcesArgs {

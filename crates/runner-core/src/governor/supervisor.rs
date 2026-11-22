@@ -23,6 +23,7 @@ use super::psi::PsiPoller;
 use super::psi::{PressureLevel, PsiSnapshot};
 #[cfg(unix)]
 use super::topology::detect_slots;
+use super::topology::{JOB_MIN_CORES, JOB_MIN_MEM_MB};
 use crate::cache::server::CacheServerState;
 use crate::cache::CacheStore;
 use crate::config::{PeerRecord, RunnerConfig};
@@ -345,6 +346,24 @@ impl SupervisorState {
         self.reservations.remove(id).is_some()
     }
 
+    /// Evict lower-priority leases whose combined headroom covers an
+    /// incoming request, returning the evicted ids. All-or-nothing:
+    /// when nothing preemptible covers the need, evicts nothing.
+    /// Callers prune expired leases first.
+    pub fn preempt_for(
+        &mut self,
+        need_cores: f64,
+        need_ram_mb: u64,
+        incoming: ReservationPriority,
+    ) -> Vec<String> {
+        let live: Vec<Reservation> = self.reservations.values().cloned().collect();
+        let victims = select_preemption_victims(&live, need_cores, need_ram_mb, incoming);
+        for id in &victims {
+            self.reservations.remove(id);
+        }
+        victims
+    }
+
     pub fn reservations(&self) -> Vec<Reservation> {
         self.reservations.values().cloned().collect()
     }
@@ -352,6 +371,24 @@ impl SupervisorState {
     /// Live reservation count (callers prune first).
     pub fn reservation_count(&self) -> usize {
         self.reservations.len()
+    }
+
+    /// Total headroom held by live reservations, as
+    /// `(cores, ram_mb)`. Callers prune expired leases first.
+    pub fn reserved_totals(&self) -> (f64, u64) {
+        self.reservations
+            .values()
+            .fold((0.0, 0), |(cores, ram), r| {
+                (cores + r.cores, ram + r.ram_mb)
+            })
+    }
+
+    /// Scale batch intake down by the job-slots worth of headroom
+    /// held in live reservations. Releases and expiry restore
+    /// capacity on the next tick (both tick loops prune first).
+    pub fn clamp_slots_for_reservations(&self, slots: u32) -> u32 {
+        let (cores, ram_mb) = self.reserved_totals();
+        clamp_slots_for_reserved(slots, cores, ram_mb)
     }
 
     pub fn set_throttle(&mut self, weight: u32, duration: Duration, now: Instant) {
@@ -598,6 +635,57 @@ pub type SharedState = Arc<RwLock<SupervisorState>>;
 
 pub fn new_shared_state() -> SharedState {
     Arc::new(RwLock::new(SupervisorState::new()))
+}
+
+/// Greedy preemption policy: lowest rank first, earliest expiry
+/// within a rank, accumulating freed headroom until BOTH needs are
+/// met. All-or-nothing: when the preemptible set cannot cover the
+/// request, returns empty (never evicts victims that would not even
+/// satisfy the incomer).
+pub fn select_preemption_victims(
+    reservations: &[Reservation],
+    need_cores: f64,
+    need_ram_mb: u64,
+    incoming: ReservationPriority,
+) -> Vec<String> {
+    let mut candidates: Vec<&Reservation> = reservations
+        .iter()
+        .filter(|r| r.preemptible_by(incoming))
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then(a.expires_at.cmp(&b.expires_at))
+    });
+    let mut freed_cores = 0.0;
+    let mut freed_ram_mb = 0u64;
+    let mut victims = Vec::new();
+    for candidate in candidates {
+        if freed_cores >= need_cores && freed_ram_mb >= need_ram_mb {
+            break;
+        }
+        freed_cores += candidate.cores;
+        freed_ram_mb += candidate.ram_mb;
+        victims.push(candidate.id.clone());
+    }
+    if freed_cores >= need_cores && freed_ram_mb >= need_ram_mb {
+        victims
+    } else {
+        Vec::new()
+    }
+}
+
+/// Batch slots remaining after carving out reserved headroom: each
+/// per-job minimum held removes one slot (floor both dimensions, so
+/// fractional holds below one job-minimum displace nothing; `as`
+/// casts saturate NaN/negatives to zero). Saturates at zero.
+pub fn clamp_slots_for_reserved(slots: u32, reserved_cores: f64, reserved_ram_mb: u64) -> u32 {
+    if slots == 0 {
+        return 0;
+    }
+    let cpu_slots = (reserved_cores / JOB_MIN_CORES).floor().max(0.0) as u32;
+    let mem_slots = u32::try_from(reserved_ram_mb / JOB_MIN_MEM_MB).unwrap_or(u32::MAX);
+    slots.saturating_sub(cpu_slots.max(mem_slots))
 }
 
 /// Effective slots under live pressure (Phase 1b policy): any critical
@@ -917,7 +1005,9 @@ async fn run_supervisor_inner_windows(
                 let base = std::thread::available_parallelism()
                     .map(|n| n.get() as u32)
                     .unwrap_or(1);
-                let slots = guard.clamp_slots(effective_slots(base, &snapshot));
+                let slots = guard.clamp_slots_for_reservations(guard.clamp_slots(
+                    effective_slots(base, &snapshot),
+                ));
                 guard.last_slots = sleep_clamped_slots(
                     guard.sleep_halted,
                     apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging),
@@ -990,7 +1080,9 @@ async fn run_supervisor_inner(
                 let weight = tick_weight(&guard, &snapshot, now);
                 guard.last_weight = Some(weight);
                 let base = detect_slots(guard.afk.boosted()).map(|r| r.slots).unwrap_or(1);
-                let slots = guard.clamp_slots(effective_slots(base, &snapshot));
+                let slots = guard.clamp_slots_for_reservations(guard.clamp_slots(
+                    effective_slots(base, &snapshot),
+                ));
                 guard.last_slots = sleep_clamped_slots(
                     guard.sleep_halted,
                     apply_workstation_guards(slots, guard.thermal_throttled, guard.discharging),
@@ -1423,6 +1515,93 @@ mod tests {
         );
         state.prune_expired(now + Duration::from_secs(2));
         assert!(state.reservations().is_empty());
+    }
+
+    fn lease(
+        state: &mut SupervisorState,
+        cores: f64,
+        ram_mb: u64,
+        priority: ReservationPriority,
+        now: Instant,
+    ) -> String {
+        state
+            .reserve(
+                cores,
+                ram_mb,
+                Duration::from_secs(600),
+                "t".into(),
+                priority,
+                now,
+            )
+            .id
+    }
+
+    #[test]
+    fn preempt_for_evicts_covering_victims_lowest_first() {
+        use ReservationPriority::*;
+        let mut state = SupervisorState::new();
+        let now = Instant::now();
+        let low_big = lease(&mut state, 8.0, 8192, Low, now);
+        let normal = lease(&mut state, 2.0, 2048, Normal, now);
+        // Distinct later expiry: tie-breaks stay deterministic
+        // regardless of HashMap iteration order.
+        let low_small = lease(&mut state, 1.0, 512, Low, now + Duration::from_secs(1));
+        // High incomer needing 2 cores / 2 GiB: lowest rank first.
+        let victims = state.preempt_for(2.0, 2048, High);
+        assert_eq!(victims, vec![low_big.clone()]);
+        assert!(!state.release(&low_big), "victim already evicted");
+        assert!(state.release(&normal));
+        assert!(state.release(&low_small));
+        // Equal rank never preempts.
+        let _ = lease(&mut state, 8.0, 8192, Normal, now);
+        assert!(state.preempt_for(1.0, 512, Normal).is_empty());
+        assert_eq!(state.reservation_count(), 1);
+    }
+
+    #[test]
+    fn preempt_for_evicts_nothing_when_uncovered() {
+        use ReservationPriority::*;
+        let mut state = SupervisorState::new();
+        let now = Instant::now();
+        let low = lease(&mut state, 1.0, 512, Low, now);
+        // Needs exceed all preemptible headroom: no evictions.
+        assert!(state.preempt_for(64.0, 65536, Critical).is_empty());
+        assert_eq!(state.reservation_count(), 1);
+        assert!(state.release(&low));
+    }
+
+    #[test]
+    fn clamp_slots_for_reserved_scales_with_headroom() {
+        // No holds: unchanged. Zero slots stay zero.
+        assert_eq!(clamp_slots_for_reserved(8, 0.0, 0), 8);
+        assert_eq!(clamp_slots_for_reserved(0, 64.0, 65536), 0);
+        // One job-minimum (1.5 cores / 2048 MiB) removes one slot.
+        assert_eq!(clamp_slots_for_reserved(8, 1.5, 0), 7);
+        assert_eq!(clamp_slots_for_reserved(8, 0.0, 2048), 7);
+        // Fractional holds below one minimum displace nothing.
+        assert_eq!(clamp_slots_for_reserved(8, 1.0, 1024), 8);
+        // CPU and RAM bounds take the max; saturation floors at zero.
+        assert_eq!(clamp_slots_for_reserved(8, 3.0, 8192), 4);
+        assert_eq!(clamp_slots_for_reserved(2, 64.0, 65536), 0);
+        // Non-finite input degrades to no clamp, never panics.
+        assert_eq!(clamp_slots_for_reserved(8, f64::NAN, 0), 8);
+    }
+
+    #[test]
+    fn clamp_restores_on_release_and_expiry() {
+        use ReservationPriority::*;
+        let mut state = SupervisorState::new();
+        let now = Instant::now();
+        // 3 cores + 8 GiB held: max(floor(3/1.5), 8192/2048) = 4 slots.
+        let id = lease(&mut state, 3.0, 8192, Normal, now);
+        assert_eq!(state.clamp_slots_for_reservations(8), 4);
+        assert!(state.release(&id));
+        assert_eq!(state.clamp_slots_for_reservations(8), 8);
+        // Expiry restores on the next prune, like the tick loops do.
+        state.reserve(3.0, 8192, Duration::from_secs(1), "t".into(), Normal, now);
+        assert_eq!(state.clamp_slots_for_reservations(8), 4);
+        state.prune_expired(now + Duration::from_secs(2));
+        assert_eq!(state.clamp_slots_for_reservations(8), 8);
     }
 
     #[test]

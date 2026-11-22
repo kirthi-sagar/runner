@@ -236,6 +236,8 @@ impl AgentTools for CliAgentTools {
                 .unwrap_or(serde_json::json!("normal")),
             "duration_secs": out.get("duration_secs").cloned()
                 .unwrap_or(serde_json::json!(request.duration_secs)),
+            "preempted": out.get("preempted").cloned()
+                .unwrap_or(serde_json::json!([])),
             "reason": request.reason,
         }))
     }

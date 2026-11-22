@@ -106,7 +106,11 @@ changes must update this doc and that test together.
 v2 fields win when both are present. `priority` (v2, `low`|`normal`|
 `high`|`critical`, default `normal`) ranks preemption. Output:
 `reservation_id`, `cores`, `ram_mb`, `priority`, `duration_secs`,
-`reason`. A full table denies with `-32603` (retryable).
+`preempted` (evicted ids, empty when the table had room), `reason`.
+When the table is full, a strictly higher priority evicts the lowest
+leases whose headroom covers the request; otherwise a full table
+denies with `-32603` (retryable). Live reservations scale batch
+intake slots down until release or expiry.
 
 `release_host_resources` — input: `reservation_id` (string,
 required). Output: `released`. Unknown id → `-32602`.

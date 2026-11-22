@@ -337,8 +337,8 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                     "error": { "code": -32602, "message": e } })
                 }
             };
-            let r = match crate::mcp::tools::reserve_on(state, &request).await {
-                Ok(r) => r,
+            let outcome = match crate::mcp::tools::reserve_on(state, &request).await {
+                Ok(outcome) => outcome,
                 Err(crate::mcp::reservation::ReserveError::Invalid(message)) => {
                     return serde_json::json!({ "jsonrpc": "2.0", "id": id,
                     "error": { "code": -32602, "message": message } })
@@ -349,12 +349,13 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                 }
             };
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
-                "reservation_id": r.id,
-                "cores": r.cores,
-                "ram_mb": r.ram_mb,
-                "priority": r.priority,
+                "reservation_id": outcome.reservation.id,
+                "cores": outcome.reservation.cores,
+                "ram_mb": outcome.reservation.ram_mb,
+                "priority": outcome.reservation.priority,
                 "duration_secs": request.duration_secs,
-                "reason": r.reason,
+                "preempted": outcome.preempted,
+                "reason": outcome.reservation.reason,
             } })
         }
         "release" => {

@@ -361,22 +361,63 @@ fn parse_args<T: for<'de> Deserialize<'de>>(
 /// validation live in the reservation envelope; [`ReserveError`]
 /// variants are caller-mapped (`Invalid` → `invalid_params` locally /
 /// `-32602` over IPC, `Full` → internal / `-32603`).
+/// Granted reservation plus the ids it preempted (empty when the
+/// table had room).
+pub(crate) struct ReserveOutcome {
+    pub reservation: crate::governor::supervisor::Reservation,
+    pub preempted: Vec<String>,
+}
+
 pub(crate) async fn reserve_on(
     state: &SharedState,
     request: &ReservationRequest,
-) -> Result<crate::governor::supervisor::Reservation, ReserveError> {
+) -> Result<ReserveOutcome, ReserveError> {
     let now = Instant::now();
     let mut guard = state.write().await;
     guard.prune_expired(now);
-    request.validate(&ReservationLimits::default(), guard.reservation_count())?;
-    Ok(guard.reserve(
+    let limits = ReservationLimits::default();
+    if let Err(e) = request.validate(&limits, guard.reservation_count()) {
+        match e {
+            // Malformed or over-limit requests never evict anyone.
+            invalid @ ReserveError::Invalid(_) => return Err(invalid),
+            ReserveError::Full { .. } => {
+                let preempted =
+                    guard.preempt_for(request.cores, request.memory_mb, request.priority);
+                if preempted.is_empty() {
+                    return Err(ReserveError::Full {
+                        active: guard.reservation_count(),
+                        max: limits.max_active,
+                    });
+                }
+                // Recount after eviction (a zero cap still denies).
+                request.validate(&limits, guard.reservation_count())?;
+                let reservation = guard.reserve(
+                    request.cores,
+                    request.memory_mb,
+                    request.duration(),
+                    request.reason.clone(),
+                    request.priority,
+                    now,
+                );
+                return Ok(ReserveOutcome {
+                    reservation,
+                    preempted,
+                });
+            }
+        }
+    }
+    let reservation = guard.reserve(
         request.cores,
         request.memory_mb,
         request.duration(),
         request.reason.clone(),
         request.priority,
         now,
-    ))
+    );
+    Ok(ReserveOutcome {
+        reservation,
+        preempted: Vec::new(),
+    })
 }
 
 pub(crate) async fn release_on(state: &SharedState, id: &str) -> bool {
@@ -704,17 +745,18 @@ async fn reserve_host_resources(
     request: &ReservationRequest,
     ctx: &ToolContext,
 ) -> Result<serde_json::Value, ToolError> {
-    let reservation = reserve_on(&ctx.state, request).await.map_err(|e| match e {
+    let outcome = reserve_on(&ctx.state, request).await.map_err(|e| match e {
         ReserveError::Invalid(message) => ToolError::invalid_params(message),
         full @ ReserveError::Full { .. } => ToolError::internal(full.to_string()),
     })?;
     Ok(serde_json::json!({
-        "reservation_id": reservation.id,
-        "cores": reservation.cores,
-        "ram_mb": reservation.ram_mb,
-        "priority": reservation.priority,
+        "reservation_id": outcome.reservation.id,
+        "cores": outcome.reservation.cores,
+        "ram_mb": outcome.reservation.ram_mb,
+        "priority": outcome.reservation.priority,
         "duration_secs": request.duration_secs,
-        "reason": reservation.reason,
+        "preempted": outcome.preempted,
+        "reason": outcome.reservation.reason,
     }))
 }
 
@@ -1072,6 +1114,45 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, -32603);
         assert!(err.message.contains("table full"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn reserve_preempts_low_when_full() {
+        let ctx = ctx();
+        let low = serde_json::json!({
+            "cores": 0.5, "memory_mb": 64, "duration_secs": 3600,
+            "priority": "low",
+        });
+        for _ in 0..crate::mcp::reservation::ReservationLimits::default().max_active {
+            execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&low), &ctx)
+                .await
+                .unwrap();
+        }
+        // A High incomer evicts exactly one Low lease and is admitted.
+        // (Victim identity depends on expiry tie-breaks, so the test
+        // pins the count and the eviction effect, not the id.)
+        let high = serde_json::json!({
+            "cores": 0.5, "memory_mb": 64, "duration_secs": 3600,
+            "priority": "high",
+        });
+        let out = execute_tool(TOOL_RESERVE_HOST_RESOURCES, Some(&high), &ctx)
+            .await
+            .unwrap();
+        let preempted = out["preempted"].as_array().unwrap();
+        assert_eq!(preempted.len(), 1);
+        let victim = preempted[0].as_str().unwrap().to_string();
+        assert_ne!(out["reservation_id"].as_str().unwrap(), victim);
+        // The victim is gone: releasing it now fails unknown-id, and
+        // the table sits back at capacity.
+        let rel = serde_json::json!({ "reservation_id": victim });
+        let err = execute_tool(TOOL_RELEASE_HOST_RESOURCES, Some(&rel), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert_eq!(
+            ctx.state.read().await.reservation_count(),
+            crate::mcp::reservation::ReservationLimits::default().max_active
+        );
     }
 
     #[test]

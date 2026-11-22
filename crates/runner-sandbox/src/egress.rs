@@ -9,17 +9,19 @@
 //! Platform legs:
 //!
 //! * Windows: opens a dynamic WFP engine session and installs the 11
-//!   sandbox filters — live kernel enforcement. The filters are
-//!   unscoped ALE connect rules, so they cover every host process
-//!   while the job runs (bounded in time by the dynamic session);
-//!   per-job app scoping is a follow-up.
-//! * Elsewhere (Linux, macOS): builds the filter program, validates
-//!   its assembly, and runs canary packets through the executed
-//!   bytecode (private destinations must drop, public DNS/HTTPS must
-//!   pass) before the job runs. Privileged kernel attachment
-//!   (`bpf()`/`nft`) is a follow-up; the guard guarantees a live,
-//!   self-verified enforcement descriptor, reported as such by
-//!   [`EgressGuard::is_live`].
+//!   sandbox filters — live kernel enforcement — scoped to the
+//!   worker image when resolvable, unscoped otherwise (both bounded
+//!   in time by the dynamic session).
+//! * Linux, privileged: validates the filter program, runs the
+//!   canary packets, then attaches the rendered ruleset as a unique
+//!   nftables table (RAII-torn-down). A failed attach after a
+//!   successful probe aborts the job — capable yet broken never runs
+//!   unfiltered.
+//! * Linux, unprivileged, and macOS: builds the filter program,
+//!   validates its assembly, and runs canary packets through the
+//!   executed bytecode before the job runs (no kernel attachment).
+//!   [`EgressGuard::is_live`] reports true exactly when kernel
+//!   enforcement backs the guard.
 
 #[cfg(not(windows))]
 use crate::ebpf::{evaluate_packet, BpfVerdict, EgressFilterProgram};
@@ -36,6 +38,10 @@ pub struct EgressGuard {
     /// Validated filter program, held live across the job.
     #[cfg(not(windows))]
     _program: EgressFilterProgram,
+    /// Live nftables attachment when the kernel accepted our table
+    /// (Linux privileged path; `None` in canary mode).
+    #[cfg(not(windows))]
+    _attachment: Option<crate::ebpf::nft::NftEgressAttachment>,
 }
 
 impl EgressGuard {
@@ -107,12 +113,25 @@ impl EgressGuard {
         #[cfg(not(windows))]
         {
             let _ = app;
-            Self::acquire_from(&EgressFilterProgram::new()).map(Some)
+            let mut guard = Self::acquire_from(&EgressFilterProgram::new())?;
+            // Privileged Linux attaches live kernel enforcement; the
+            // probe failing means incapable (unprivileged, no nft),
+            // which degrades to canary mode — but a failed attach
+            // AFTER a successful probe aborts (capable yet broken
+            // must never run unfiltered).
+            if crate::ebpf::nft::probe_nft_egress() {
+                guard._attachment = Some(crate::ebpf::nft::NftEgressAttachment::attach().map_err(
+                    |e| format!("network egress filtering: nftables attach failed: {e}"),
+                )?);
+            }
+            Ok(Some(guard))
         }
     }
 
     /// Validated-leg acquisition over an explicit program (the seam
-    /// fail-closed tests use to prove broken programs abort).
+    /// fail-closed tests use to prove broken programs abort). Always
+    /// canary mode: callers that want kernel enforcement attach
+    /// separately (see [`EgressGuard::acquire`]).
     #[cfg(not(windows))]
     pub fn acquire_from(program: &EgressFilterProgram) -> Result<Self, String> {
         program
@@ -121,13 +140,22 @@ impl EgressGuard {
         check_canaries(program)?;
         Ok(EgressGuard {
             _program: program.clone(),
+            _attachment: None,
         })
     }
 
     /// True when live kernel enforcement (not just a validated
-    /// program) backs this guard.
+    /// program) backs this guard: a WFP session on Windows, an
+    /// attached nftables table on Linux, never in canary mode.
     pub fn is_live(&self) -> bool {
-        cfg!(windows)
+        #[cfg(windows)]
+        {
+            true
+        }
+        #[cfg(not(windows))]
+        {
+            self._attachment.is_some()
+        }
     }
 
     /// True when the installed filters carry an app-identity
@@ -226,15 +254,18 @@ mod tests {
         let guard = EgressGuard::acquire_scoped(true, Some("C:\\w\\Worker.exe"))
             .unwrap()
             .expect("guard");
-        assert!(!guard.is_live());
+        assert_eq!(guard.is_live(), crate::ebpf::nft::probe_nft_egress());
         assert!(!guard.is_scoped());
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn acquire_enabled_holds_validated_program() {
+    fn acquire_enabled_matches_probe() {
+        // Unprivileged boxes hold the validated program (canary
+        // mode); privileged Linux attaches live. Either way,
+        // `is_live` tracks the probe exactly.
         let guard = EgressGuard::acquire(true).unwrap().expect("guard");
-        assert!(!guard.is_live());
+        assert_eq!(guard.is_live(), crate::ebpf::nft::probe_nft_egress());
     }
 
     #[cfg(not(windows))]

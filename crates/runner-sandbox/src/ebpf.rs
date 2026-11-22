@@ -637,6 +637,264 @@ fn jump_target(pc: usize, off: i16, taken: bool) -> Option<usize> {
     usize::try_from(pc as i64 + 1 + i64::from(off)).ok()
 }
 
+/// Live nftables egress attachment engine (Unix only): probe,
+/// apply, sweep, and RAII teardown for the sandbox table.
+#[cfg(unix)]
+pub mod nft {
+    /// nftables tool name (Linux packet filter CLI; absent elsewhere,
+    /// which the probe reports as incapable).
+    const NFT_BIN: &str = "nft";
+    /// Guard table namespace (`runner_egress_<pid>_<counter>`); the stale
+    /// sweeper only ever touches this prefix.
+    const NFT_TABLE_PREFIX: &str = "runner_egress_";
+    /// Per-process table counter (unique names under concurrency).
+    static NFT_TABLE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Live nftables egress attachment (Linux privileged path): a unique
+    /// `inet` table holding the rendered sandbox chain, deleted on drop.
+    ///
+    /// Temporal scoping (mirrors WFP): the table filters the box while
+    /// the job runs and is torn down with the guard. Cgroup scoping is a
+    /// follow-up — job cgroup placement is currently best-effort, and a
+    /// cgroup-scoped rule would silently miss unsliced jobs (fail-open).
+    /// Crash-stale tables (SIGKILL skips `Drop`) are swept by owner pid
+    /// at the next attach; see [`NftEgressAttachment::sweep_stale_tables`].
+    #[derive(Debug)]
+    pub(crate) struct NftEgressAttachment {
+        table: String,
+    }
+
+    /// True when the kernel accepts our tables: creates then deletes a
+    /// uniquely-named empty probe table. Fresh every call — no cache, so
+    /// capability changes are never stale.
+    pub fn probe_nft_egress() -> bool {
+        let table = fresh_table_name();
+        if run_nft(&["add", "table", "inet", &table]).is_err() {
+            return false;
+        }
+        run_nft(&["delete", "table", "inet", &table]).is_ok()
+    }
+
+    impl NftEgressAttachment {
+        /// Render, syntax-check, sweep stale, and apply the sandbox
+        /// egress table. Fails closed: any step failing aborts before the
+        /// job runs (a syntax rejection means our own render broke).
+        pub(crate) fn attach() -> std::io::Result<Self> {
+            let table = fresh_table_name();
+            Self::attach_with_ruleset(&render_egress_table(&table), &table)
+        }
+
+        /// Attach an explicit ruleset text (the live test applies an
+        /// empty table through this seam: mechanics without filtering).
+        fn attach_with_ruleset(ruleset: &str, table: &str) -> std::io::Result<Self> {
+            let path = std::env::temp_dir().join(format!("{table}.nft"));
+            std::fs::write(&path, ruleset)?;
+            let result = Self::apply_ruleset_file(&path);
+            let _ = std::fs::remove_file(&path);
+            result?;
+            Ok(Self {
+                table: table.to_string(),
+            })
+        }
+
+        fn apply_ruleset_file(path: &std::path::Path) -> std::io::Result<()> {
+            let path = path.to_string_lossy();
+            run_nft(&["--check", "-f", &path]).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("nftables ruleset rejected by --check: {e}"),
+                )
+            })?;
+            Self::sweep_stale_tables();
+            run_nft(&["-f", &path])
+        }
+
+        /// Delete our tables whose owner pid is dead (crash recovery).
+        /// Only touches the guard namespace, never foreign tables; pid
+        /// reuse races resolve toward keeping (fail-closed: stays
+        /// filtered) and clear on later sweeps.
+        fn sweep_stale_tables() {
+            let Ok(out) = run_nft_output(&["list", "tables"]) else {
+                return;
+            };
+            for line in out.lines() {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                if let ["table", "inet", name] = words.as_slice() {
+                    if let Some(pid) = parse_table_owner(name) {
+                        if !pid_alive(pid) {
+                            let _ = run_nft(&["delete", "table", "inet", name]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for NftEgressAttachment {
+        fn drop(&mut self) {
+            if let Err(e) = run_nft(&["delete", "table", "inet", &self.table]) {
+                eprintln!(
+                    "runner: nftables egress teardown failed for table {}: {e} \
+                     (stale table may filter traffic; remove with: nft delete table inet {})",
+                    self.table, self.table
+                );
+            }
+        }
+    }
+
+    /// Unique guard table name for this process.
+    fn fresh_table_name() -> String {
+        format!(
+            "{}{}_{}",
+            NFT_TABLE_PREFIX,
+            std::process::id(),
+            NFT_TABLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    /// Wrap the rendered sandbox chain in a uniquely-named `inet` table
+    /// (dual-stack: one chain carries both `ip` and `ip6` rules).
+    fn render_egress_table(table: &str) -> String {
+        format!(
+            "table inet {table} {{\n{}\n}}\n",
+            crate::network::nftables_sandbox_ruleset()
+        )
+    }
+
+    /// Owner pid from a guard table name (`runner_egress_<pid>_<ctr>`);
+    /// `None` for foreign or malformed names (never touched).
+    fn parse_table_owner(name: &str) -> Option<u32> {
+        let rest = name.strip_prefix(NFT_TABLE_PREFIX)?;
+        let (pid, _) = rest.split_once('_')?;
+        pid.parse::<u32>().ok()
+    }
+
+    /// True when `pid` names a live process. `EPERM` means exists-but-owned
+    /// (alive); anything unrecognized conservatively counts as alive so
+    /// the sweeper never deletes a live guard's table.
+    fn pid_alive(pid: u32) -> bool {
+        // SAFETY: signal 0 performs no delivery; it only error-checks.
+        let r = unsafe { libc::kill(pid as i32, 0) };
+        if r == 0 {
+            return true;
+        }
+        !matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code) if code == libc::ESRCH
+        )
+    }
+
+    /// Run `nft` with inherited environment, no stdin, captured output.
+    /// Ok only on exit success.
+    fn run_nft(args: &[&str]) -> std::io::Result<()> {
+        run_nft_output(args).map(|_| ())
+    }
+
+    fn run_nft_output(args: &[&str]) -> std::io::Result<String> {
+        let out = std::process::Command::new(NFT_BIN)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        if !out.status.success() {
+            let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            stderr.truncate(300);
+            return Err(std::io::Error::other(format!(
+                "nft {} failed: {stderr}",
+                args.join(" ")
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn render_egress_table_pins_exact_text() {
+            // Any render drift breaks kernel application: pin it bytewise.
+            let expected = "table inet runner_egress_1_2 {\n\
+                             chain runner_egress {\n\
+                             \x20 type filter hook output priority 0; policy accept;\n\
+                             \x20 ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } drop\n\
+                             \x20 ip6 daddr { fc00::/7 } drop\n\
+                             \x20 ct state established,related accept\n\
+                             \x20 udp dport 53 accept\n\
+                             \x20 tcp dport 443 accept\n\
+                             \x20 drop\n\
+                             }\n\
+                             }\n";
+            assert_eq!(render_egress_table("runner_egress_1_2"), expected);
+        }
+
+        #[test]
+        fn table_owner_parses_guarded_namespace_only() {
+            assert_eq!(parse_table_owner("runner_egress_1234_7"), Some(1234));
+            assert_eq!(parse_table_owner("runner_egress_1_0"), Some(1));
+            for foreign in [
+                "filter",
+                "runner_egress",
+                "runner_egress_x",
+                "runner_egress_x_1",
+                "runner_egress__1",
+                "other_egress_1_2",
+                "",
+            ] {
+                assert_eq!(parse_table_owner(foreign), None, "{foreign}");
+            }
+        }
+
+        #[test]
+        fn pid_alive_distinguishes_live_and_dead() {
+            // Own pid always qualifies.
+            assert!(pid_alive(std::process::id()));
+            #[cfg(unix)]
+            {
+                // A reaped child is dead: Linux allocates pids sequentially
+                // toward a multi-million pid_max, so reuse within the
+                // microseconds before the check below is impossible.
+                let mut child = std::process::Command::new("/bin/true")
+                    .spawn()
+                    .expect("spawn true");
+                let pid = child.id();
+                child.wait().expect("reap");
+                assert!(!pid_alive(pid));
+            }
+        }
+
+        #[test]
+        fn probe_is_stable_and_side_effect_free() {
+            // Capability cannot flap between adjacent calls; whatever the
+            // answer, both probes agree (and probe tables never leak:
+            // each probe deletes what it creates).
+            assert_eq!(probe_nft_egress(), probe_nft_egress());
+        }
+
+        #[test]
+        fn live_attach_empty_table_roundtrip() {
+            // Self-gating: only capable boxes (root/CAP_NET_ADMIN) run
+            // this; everyone else skips. The empty table filters nothing,
+            // so mechanics prove out with zero traffic impact.
+            if !probe_nft_egress() {
+                eprintln!("live nft harness skipped (needs nft + privilege)");
+                return;
+            }
+            let table = fresh_table_name();
+            let text = format!("table inet {table} {{}}");
+            {
+                let _guard =
+                    NftEgressAttachment::attach_with_ruleset(&text, &table).expect("attach empty");
+                assert!(
+                    run_nft(&["list", "table", "inet", &table]).is_ok(),
+                    "table missing after attach"
+                );
+            }
+            assert!(
+                run_nft(&["list", "table", "inet", &table]).is_err(),
+                "table survived drop"
+            );
+        }
+    }
+}
 /// Probe unprivileged socket-filter attachment: binds a loopback UDP
 /// socket and attempts a harmless accept-all `SO_ATTACH_FILTER`.
 /// Returns false (never panics) when the kernel refuses. Linux-only;

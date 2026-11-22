@@ -17,9 +17,12 @@ fn disabled_bypasses_guard() {
 
 #[cfg(not(windows))]
 #[test]
-fn enabled_acquires_validated_guard() {
+fn enabled_acquires_guard_matching_probe() {
     let guard = EgressGuard::acquire(true).unwrap().expect("guard");
-    assert!(!guard.is_live());
+    assert_eq!(
+        guard.is_live(),
+        runner::sandbox::ebpf::nft::probe_nft_egress()
+    );
 }
 
 #[cfg(not(windows))]

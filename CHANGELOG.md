@@ -6,6 +6,16 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## [2.4.1] - 2026-11-22
+
+- Fix Windows named-pipe DACLs: pipes live in NPFS, so the
+  security APIs classify them as file objects — `SE_KERNEL_OBJECT`
+  failed with `ERROR_BAD_PATHNAME` (161). Both the bind-time stamp
+  and the read-back now use `SE_FILE_OBJECT`.
+- Fix pipe-DACL verification race: the DACL read retries while the
+  accept loop starts listening (`ERROR_PIPE_BUSY`), instead of
+  racing the first `serve()` poll.
+
 ## [2.4.0] - 2026-11-22
 
 - **Strict Everywhere & macOS Parity**: Full-chain `--strict`

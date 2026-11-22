@@ -3,7 +3,7 @@
 [![CI](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/kirthi-sagar/runner?color=blue&label=release)](https://github.com/kirthi-sagar/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/kirthi-sagar/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-487%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-517%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
@@ -178,7 +178,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)), or Windows via WSL2 (see [`docs/windows.md`](docs/windows.md)).
 
-Zero-dependency install (downloads the prebuilt v2.5.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v2.6.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -215,7 +215,7 @@ runner top
 ```
 
 ```text
-runner top v2.5.0  (q quit, live cadence)
+runner top v2.6.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -343,7 +343,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "2.5.0", "governor": "normal",
+{"status": "healthy", "version": "2.6.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -436,6 +436,9 @@ afk_idle_seconds = 300    # desktop idle time before AFK boost engages
 
 [power]                   # clamshell resilience (v2.5.0+)
 prevent_sleep_on_ac = false  # hold a wake lock while AC-powered jobs run
+
+[security]                # zero-trust posture (v2.6.0+)
+network_egress_filtering = true  # enforce the outbound network boundary
 ```
 
 Key behaviors:
@@ -448,6 +451,12 @@ Key behaviors:
   assertion, execution state) while AC-powered jobs run, halts intake
   ahead of suspend, flushes the cache index, and reports clock skew on
   resume.
+- **Network boundary**: with `[security] network_egress_filtering = true`
+  (the default), every job runs under the egress boundary — private
+  ranges and cloud metadata drop, only DNS and public HTTPS pass.
+  Native Windows gets live WFP kernel enforcement; other platforms
+  hold a self-verified filter program. Guard failures abort the job
+  instead of running unfiltered; set `false` to opt out.
 - **Headroom**: the governor reserves `max(2, 25%)` cores and
   `max(4 GiB, 20%)` RAM for interactive apps; AFK Boost collapses headroom
   when the desktop is idle and restores it on first input. Idle state is
@@ -618,7 +627,7 @@ provider's outage never stalls the others.
 
 ## 11. Enterprise Hardening (v0.3.0)
 
-Three production capabilities for regulated and large-scale fleets:
+Four production capabilities for regulated and large-scale fleets:
 
 ### Native eBPF Egress Filtering
 
@@ -627,6 +636,18 @@ external `nftables` CLI execution. The program drops RFC 1918, `169.254/16`
 metadata, and IPv6 ULA destinations, allows only UDP 53 (DNS) and TCP 443
 (HTTPS), and default-drops everything else. `probe_ebpf()` detects
 unprivileged attach support at runtime without panicking.
+
+### Native WFP Egress Filtering (Windows)
+
+`crates/runner-sandbox/src/wfp/` enforces the same boundary in the
+Windows kernel: a dynamic engine session (`FWPM_SESSION_FLAG_DYNAMIC`,
+so the kernel reaps every filter if the runner dies) with 11 ALE
+connect filters — drop RFC 1918, link-local/metadata, and ULA;
+allow only UDP 53 and TCP 443; default drop. User-mode APIs only,
+zero new crates. A 210-vector parity suite proves WFP arbitration,
+executed eBPF bytecode, and the shared contract agree on every
+verdict, and the job-scoped `EgressGuard` holds enforcement across
+worker execution, aborting the job if acquisition fails.
 
 ### Firecracker MicroVM Execution (Tier-1)
 

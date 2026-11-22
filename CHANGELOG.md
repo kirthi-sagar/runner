@@ -6,6 +6,22 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.6.0 — 2026-11-22
+
+- Windows Filtering Platform egress: dynamic engine session
+  (`FWPM_SESSION_FLAG_DYNAMIC`) with 11 ALE connect filters — drop
+  RFC 1918, link-local/metadata, and ULA; allow only UDP 53 and TCP
+  443; default drop. Zero new crates, user-mode APIs only.
+- Three-way egress parity suite: 210 vectors proving identical
+  verdicts across WFP arbitration, executed eBPF bytecode, and the
+  shared network contract.
+- eBPF correctness fixes: 32-bit `AND32`/`JEQ32` range compares
+  (64-bit JEQ sign-extension failed open on 172.16/12, 192.168/16,
+  and 169.254/16) and IPv6 extension-header walk next-header order.
+- `EgressGuard` lifecycle integration: job-scoped enforcement held
+  across worker execution with fail-closed canary verification
+  (`[security] network_egress_filtering`, default on).
+
 ## v2.5.0 — 2026-11-22
 
 - MicroVM Hardware Resilience: vsock write-shutdown drain, 50ms

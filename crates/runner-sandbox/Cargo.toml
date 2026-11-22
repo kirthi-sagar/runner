@@ -20,3 +20,6 @@ base64.workspace = true
 nix.workspace = true
 tar.workspace = true
 flate2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

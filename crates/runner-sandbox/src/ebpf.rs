@@ -5,7 +5,7 @@
 //! offset 0 (no Ethernet header in socket-filter context):
 //!
 //! * Drops RFC 1918 IPv4 destinations and `169.254/16` metadata.
-//! * Drops IPv6 ULA (`fd00::/8`).
+//! * Drops IPv6 ULA (`fc00::/7`).
 //! * Allows only UDP 53 (DNS) and TCP 443 (public HTTPS).
 //! * Default-drops everything else.
 //!

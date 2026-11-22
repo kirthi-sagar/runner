@@ -70,7 +70,7 @@ fn sandbox_ruleset_drops_private_allows_dns_https() {
         "172.16.0.0/12",
         "192.168.0.0/16",
         "169.254.0.0/16",
-        "fd00::/8",
+        "fc00::/7",
     ] {
         assert!(rules.contains(cidr), "{cidr}");
     }

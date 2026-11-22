@@ -14,8 +14,9 @@ pub use super::ebpf::EgressFilterProgram;
 pub const RFC1918_CIDRS: [&str; 3] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
 /// Link-local / cloud-metadata range.
 pub const LINK_LOCAL_CIDR: &str = "169.254.0.0/16";
-/// IPv6 unique-local range.
-pub const ULA_CIDR: &str = "fd00::/8";
+/// IPv6 unique-local range (RFC 4193 `fc00::/7`, covering both the
+/// `fc00::/8` centrally-assigned and `fd00::/8` locally-assigned halves).
+pub const ULA_CIDR: &str = "fc00::/7";
 /// Allowed egress: DNS.
 pub const ALLOW_DNS_PORT: u16 = 53;
 /// Allowed egress: public HTTPS.
@@ -33,7 +34,7 @@ pub fn is_link_local(ip: Ipv4Addr) -> bool {
     o[0] == 169 && o[1] == 254
 }
 
-/// True for IPv6 unique-local `fd00::/8`.
+/// True for IPv6 unique-local `fc00::/7`.
 pub fn is_ula(ip: Ipv6Addr) -> bool {
     (ip.octets()[0] & 0xfe) == 0xfc
 }
@@ -124,7 +125,7 @@ mod tests {
         let rules = nftables_sandbox_ruleset();
         assert!(rules.contains("10.0.0.0/8"));
         assert!(rules.contains("169.254.0.0/16"));
-        assert!(rules.contains("fd00::/8"));
+        assert!(rules.contains("fc00::/7"));
         assert!(rules.contains("udp dport 53 accept"));
         assert!(rules.contains("tcp dport 443 accept"));
     }

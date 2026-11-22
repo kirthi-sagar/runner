@@ -8,4 +8,5 @@ pub mod mounts;
 pub mod network;
 pub mod seatbelt;
 pub mod vsock;
+pub mod wfp;
 pub mod worker;

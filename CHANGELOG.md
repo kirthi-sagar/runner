@@ -6,6 +6,24 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.7.0 — 2026-11-23
+
+- Phase 1: Canonical v2 `ReservationRequest` envelope with
+  backward-compatible normalization (v2 fields win), checked
+  arithmetic overflow fix, and greedy all-or-nothing preemption
+  selector.
+- Phase 2: Governor preemption execution
+  (`SupervisorState::preempt_for`) with victim eviction, continuous
+  batch slot clamping (`clamp_slots_for_reserved`), and the additive
+  `"preempted"` response.
+- Phase 3: Spend-ledger integration (`ReservationSpendLedger` at
+  `~/.runner/reservation_spend.json`), atomic budget checking and
+  rollback under the write lock, opt-in `[reservations]`
+  monthly_spend_cap_usd, and SHA-256 audit logging.
+- Phase 4: Watchdog auto-reap reconciliation (`prune_expired` →
+  `on_released`) with non-blocking accounting IO, natural expiry
+  audit logging, and instant headroom reclamation on the next tick.
+
 ## [2.6.1] - 2026-11-22
 
 - Fix Windows CI triage: `WfpEngineSession` is `Send` (owned engine

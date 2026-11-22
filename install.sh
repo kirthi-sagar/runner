@@ -6,7 +6,7 @@
 #   ./install.sh --help       show help
 set -eu
 
-VERSION="2.6.1"
+VERSION="2.7.0"
 MIN_KERNEL_MAJOR=5
 MIN_KERNEL_MINOR=8
 

@@ -3,7 +3,7 @@
 [![CI](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/kirthi-sagar/runner?color=blue&label=release)](https://github.com/kirthi-sagar/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/kirthi-sagar/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-517%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-546%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
@@ -110,6 +110,7 @@ Existing self-hosted runners fail at this because:
    - Terminal-native JSON CLI (`runner status --format=json`, `runner throttle --level=high --duration=5`).
    - High-speed Unix domain socket (`/run/runner.sock`).
    - Native **Model Context Protocol (MCP)** server (`runner mcp`) enabling agents (Claude Code, Cursor, Windsurf, Codex CLI, Antigravity) to mount runner tools (`reserve_host_resources`, `get_ci_status`, `request_cloud_capacity`) directly into their context window.
+   - **Dynamic resource reservations** (`reserve_host_resources`): agents hold CPU/RAM headroom via versioned envelopes (`cores`, `memory_mb`, `priority`, `duration_secs`) with strict priority preemption (low/normal/high/critical), live batch-slot clamping while leases run, budget-gated spend ledger accounting, and SHA-256 audit trail coverage.
    - **AFK Boost Mode**: Listens to desktop screen-lock events (`org.freedesktop.ScreenSaver` / Wayland idle notify) to automatically collapse reserved headroom to zero when the user is away, converting the workstation into a 100% dedicated build server until user input resumes.
 
 3. **Federated Hybrid Mesh & Cloud Bursting**:
@@ -178,7 +179,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)), or Windows via WSL2 (see [`docs/windows.md`](docs/windows.md)).
 
-Zero-dependency install (downloads the prebuilt v2.6.1 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v2.7.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -215,7 +216,7 @@ runner top
 ```
 
 ```text
-runner top v2.6.1  (q quit, live cadence)
+runner top v2.7.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -343,7 +344,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "2.6.1", "governor": "normal",
+{"status": "healthy", "version": "2.7.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -439,6 +440,9 @@ prevent_sleep_on_ac = false  # hold a wake lock while AC-powered jobs run
 
 [security]                # zero-trust posture (v2.6.0+)
 network_egress_filtering = true  # enforce the outbound network boundary
+
+[reservations]            # agent headroom budgets (v2.7.0+)
+monthly_spend_cap_usd = 0  # reservation spend cap; 0 = unenforced
 ```
 
 Key behaviors:
@@ -471,6 +475,11 @@ Key behaviors:
 - **Spend caps (Super Admin)**: agents and automation can request cloud
   capacity only within `max_monthly_spend`, and only for providers with
   configured tokens. A zero cap denies every request with a reason.
+- **Reservation budgets**: with `[reservations] monthly_spend_cap_usd` set
+  above zero, reservation grants whose estimated cost exceeds the
+  remaining budget are denied fail-closed; every grant, release, and
+  preemption is spend-ledgered and audit-trailed. Zero (the default)
+  leaves budgeting unenforced.
 
 Secrets: the GitHub token lives in `~/.config/runner/env`
 (`RUNNER_GITHUB_TOKEN=`), sourced by systemd — never in `config.toml`.

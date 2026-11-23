@@ -6,6 +6,21 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.9.0 — 2026-11-23
+
+- Phase 1: Continuous background mDNS peer table
+  (`MdnsCachePeerTable`) with heartbeat TTL, dedup, self-exclusion,
+  and 0ms snapshot resolution on cache misses.
+- Phase 2: Concurrent scatter-gather peer queries (`JoinSet`
+  fan-out): first-responder streaming, immediate loser
+  cancellation, deterministic fail-open fall-through.
+- Phase 3: High-throughput `BufWriter` chunk streaming, 15s idle
+  chunk watchdog, 60s + 1s/10MB transfer ceiling, and in-flight
+  SHA-256 digest verification against advertised digests.
+- Phase 4: Donor cache governance (`[cache.federation]`
+  concurrency semaphore, 429 throttling, 403 disabled-serving
+  protection) and the `runner cache peers` inspection CLI.
+
 ## v2.8.0 — 2026-11-23
 
 - Phase 1: macOS Seatbelt network egress verbs (`(deny

@@ -3,7 +3,7 @@
 [![CI](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/kirthi-sagar/runner?color=blue&label=release)](https://github.com/kirthi-sagar/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/kirthi-sagar/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-565%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-605%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
@@ -127,6 +127,7 @@ Existing self-hosted runners fail at this because:
    - Injects `ACTIONS_CACHE_URL` pointing to `runner`'s local LAN caching daemon (`127.0.0.1:8787` by default) into standard runner environments.
    - Standard actions (`actions/cache@v4`, `actions/setup-node`, `actions/setup-python`, `Swatinem/rust-cache`) read and write cache archives over Gigabit LAN at **100–120 MB/s** with **zero workflow file edits**.
    - Content-addressed disk store (`~/.runner/cache/`, 10 GB LRU budget); inspect with `runner cache stats`, purge with `runner cache clear --all`.
+   - **LAN mesh cache federation**: local misses scatter-gather across continuously discovered peers (first responder streams, losers cancel), with digest-verified imports, donor concurrency governance (`[cache.federation]`), and peer inspection via `runner cache peers`.
 
 6. **100% GitHub Compatibility via Official Worker Wrapping**:
    - Embeds an ephemeral, pre-cached copy of Microsoft's official `actions/runner` worker binary inside an unprivileged container or microVM.
@@ -180,7 +181,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)), or Windows via WSL2 (see [`docs/windows.md`](docs/windows.md)).
 
-Zero-dependency install (downloads the prebuilt v2.8.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v2.9.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
@@ -217,7 +218,7 @@ runner top
 ```
 
 ```text
-runner top v2.8.0  (q quit, live cadence)
+runner top v2.9.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -345,7 +346,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "2.8.0", "governor": "normal",
+{"status": "healthy", "version": "2.9.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -429,6 +430,10 @@ listen = "127.0.0.1:8787" # proxy bind address
 max_size_gb = 10          # disk budget before LRU eviction
 ttl_secs = 604800         # entry age before background sweep evicts (7d; 0 disables)
 sweep_secs = 3600         # TTL sweep cadence (60s floor)
+
+[cache.federation]       # LAN donor governance (v2.9.0+)
+max_concurrent_peer_streams = 4  # simultaneous donor streams; excess get 429
+enable_peer_serving = true       # serve archives to LAN peers (false 403s)
 
 [governor]                # PSI weight ladder + AFK boost
 warn_cpu_psi = 20.0       # CPU some-avg10 where throttling begins (weight 25)

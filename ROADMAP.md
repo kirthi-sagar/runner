@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.8.0 and prior)
+## Shipped (v2.9.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -42,20 +42,27 @@ services or heavyweight frameworks.
 - Network boundary hardening follow-through: Seatbelt network
   verbs, per-job WFP app scoping, nftables attach, configurable
   reservation limits & pricing (v2.8.0).
+- LAN mesh cache federation & peer streaming: background peer
+  table, scatter-gather queries, verified chunk streaming, donor
+  governance + `cache peers` CLI (v2.9.0).
 
-## Current: v2.8.0 (Network Boundary Hardening Follow-Through & Resource Governance)
+## Current: v2.9.0 (LAN Mesh Cache Federation & Peer Streaming)
+
+- Continuous mDNS peer table with 0ms miss-path snapshots.
+- Scatter-gather first-responder streaming with cancellation.
+- Digest-verified imports + donor concurrency governance.
+
+## Next: Candidate D — Container Runtime Isolation Tier
+
+- Container runtime isolation tier for OCI workloads.
+- No further roadmap candidates staged.
+
+## Shipped in v2.8.0: Network Boundary Hardening Follow-Through & Resource Governance
 
 - Full cross-platform network egress boundary: Seatbelt verbs,
   app-scoped WFP, privileged nftables attach.
 - Configurable reservation ceilings + transfer pricing.
 - Per-request `-32602` enforcement of configured limits.
-
-## Next: Candidate B — LAN Mesh Cache Federation & Peer Streaming
-
-- Cross-node cache federation across the LAN mesh.
-- Peer-to-peer artifact streaming between donors.
-- Remaining roadmap candidates: container runtime isolation
-  tier (D).
 
 ## Shipped in v2.7.0: MCP Dynamic Resource Reservations
 

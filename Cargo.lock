@@ -1475,6 +1475,7 @@ dependencies = [
  "runner-guest-agent",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tokio",
  "windows-sys 0.61.2",

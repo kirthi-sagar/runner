@@ -2,6 +2,8 @@
 //! generation, rootless execution, and daemonless registry pulls
 //! ([`registry`] resolves references to verified layer descriptors).
 
+pub mod cache;
+pub mod download;
 pub mod registry;
 
 use std::collections::HashMap;

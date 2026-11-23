@@ -293,8 +293,10 @@ pub struct ResolvedImage {
     pub layers: Vec<OciDescriptor>,
 }
 
-/// Per-request HTTP budget for registry metadata (manifests and
-/// tokens are small; layers stream in a later phase).
+/// Per-operation HTTP budget for registry metadata (manifests and
+/// tokens are small). Applied per call, never client-wide: blob
+/// streams outlive any fixed total and pace themselves with an idle
+/// watchdog instead.
 const REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Minimal registry client with a single-flight token cache (one
@@ -314,7 +316,6 @@ impl RegistryClient {
     pub fn new() -> Self {
         Self {
             http: reqwest::Client::builder()
-                .timeout(REGISTRY_TIMEOUT)
                 .user_agent("runner")
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
@@ -322,8 +323,15 @@ impl RegistryClient {
         }
     }
 
-    /// Fetch a bearer token for one challenge (cached per scope).
+    /// Fetch a bearer token for one challenge (cached per scope,
+    /// bounded per call).
     async fn token_for(&self, challenge: &BearerChallenge) -> Result<String, String> {
+        tokio::time::timeout(REGISTRY_TIMEOUT, self.token_for_inner(challenge))
+            .await
+            .map_err(|_| "token request timed out".to_string())?
+    }
+
+    async fn token_for_inner(&self, challenge: &BearerChallenge) -> Result<String, String> {
         let scope = challenge.scope.clone().unwrap_or_default();
         if let Some((cached_scope, token)) = self.cached.lock().await.clone() {
             if cached_scope == scope {
@@ -362,18 +370,23 @@ impl RegistryClient {
         Ok(token)
     }
 
-    /// GET with Accept + bearer dance: one anonymous attempt, then a
-    /// single challenged retry. Returns the final body on success.
-    async fn get_manifest_doc(&self, url: &str) -> Result<serde_json::Value, String> {
-        const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
-            application/vnd.oci.image.manifest.v1+json, \
-            application/vnd.docker.distribution.manifest.list.v2+json, \
-            application/vnd.docker.distribution.manifest.v2+json";
+    /// GET with the bearer dance: one anonymous attempt, then a single
+    /// challenged retry. Returns the live response; the caller maps
+    /// statuses and streams the body.
+    async fn get_authed(
+        &self,
+        url: &str,
+        accept: Option<&str>,
+    ) -> Result<reqwest::Response, String> {
         let attempt = |token: Option<String>| {
             let http = &self.http;
             let url = url.to_string();
+            let accept = accept.map(str::to_string);
             async move {
-                let mut request = http.get(&url).header(reqwest::header::ACCEPT, ACCEPT);
+                let mut request = http.get(&url);
+                if let Some(accept) = accept {
+                    request = request.header(reqwest::header::ACCEPT, accept);
+                }
                 if let Some(token) = token {
                     request =
                         request.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"));
@@ -385,7 +398,7 @@ impl RegistryClient {
             }
         };
         let response = attempt(None).await?;
-        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             let challenge = response
                 .headers()
                 .get(reqwest::header::WWW_AUTHENTICATE)
@@ -393,23 +406,52 @@ impl RegistryClient {
                 .ok_or_else(|| "registry 401 without a bearer challenge".to_string())?;
             let challenge = parse_bearer_challenge(challenge)?;
             let token = self.token_for(&challenge).await?;
-            attempt(Some(token)).await?
+            attempt(Some(token)).await
         } else {
+            Ok(response)
+        }
+    }
+
+    /// GET one manifest document with Accept + bearer dance, bounded.
+    /// Returns the final body on success.
+    async fn get_manifest_doc(&self, url: &str) -> Result<serde_json::Value, String> {
+        const ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+            application/vnd.oci.image.manifest.v1+json, \
+            application/vnd.docker.distribution.manifest.list.v2+json, \
+            application/vnd.docker.distribution.manifest.v2+json";
+        let fetch = async {
+            let response = self.get_authed(url, Some(ACCEPT)).await?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(format!("manifest not found: {url}"));
+            }
+            if !response.status().is_success() {
+                return Err(format!(
+                    "registry request failed: HTTP {}",
+                    response.status()
+                ));
+            }
             response
+                .json()
+                .await
+                .map_err(|e| format!("manifest response is not JSON: {e}"))
         };
+        tokio::time::timeout(REGISTRY_TIMEOUT, fetch)
+            .await
+            .map_err(|_| format!("manifest request timed out: {url}"))?
+    }
+
+    /// GET one blob with the bearer dance, returning the live response
+    /// for streaming. No total timeout: the caller paces the stream
+    /// with an idle watchdog instead.
+    pub(crate) async fn get_blob(&self, url: &str) -> Result<reqwest::Response, String> {
+        let response = self.get_authed(url, None).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(format!("manifest not found: {url}"));
+            return Err(format!("blob not found: {url}"));
         }
         if !response.status().is_success() {
-            return Err(format!(
-                "registry request failed: HTTP {}",
-                response.status()
-            ));
+            return Err(format!("blob request failed: HTTP {}", response.status()));
         }
-        response
-            .json()
-            .await
-            .map_err(|e| format!("manifest response is not JSON: {e}"))
+        Ok(response)
     }
 
     fn check_descriptor(descriptor: &OciDescriptor, role: &str) -> Result<(), String> {

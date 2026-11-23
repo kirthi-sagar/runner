@@ -6,6 +6,17 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## [2.10.1] - 2026-11-23
+
+### Fixed
+
+- Fix Windows-only clippy lints in the OCI container tier:
+  `#[cfg(unix)]` on `TIMEOUT_GRACE` (dead code where the SIGTERM
+  escalation path does not compile) and a platform-split
+  `has_exec_bit` helper replacing the cfg-collapsed branch in
+  `is_runnable` (`needless_bool`). Clean `-D warnings` clippy on
+  Windows-MSVC, Windows-GNU, macOS, and Linux.
+
 ## v2.10.0 — 2026-11-23
 
 - Phase 1: Tier-3 OCI container sandbox (`SandboxDriver::Container`):

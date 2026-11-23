@@ -12,7 +12,7 @@ Prefers the daemon's state-enriched report over IPC; falls back to a
 local kernel read when the daemon is down.
 
 - `status`: `"healthy"` (fixed string).
-- `version`: semver string (e.g. `"2.10.0"`).
+- `version`: semver string (e.g. `"2.10.1"`).
 - `host`: `total_cores`, `physical_cores`,
   `available_cores_for_ci`, `total_memory_bytes`,
   `available_memory_bytes`, `psi_pressure` (`cpu_some_avg10`,

@@ -120,7 +120,7 @@ impl CacheServerState {
             token: base64_url_no_pad(&token_bytes),
             download_secret: secret,
             http: reqwest::Client::new(),
-            peers: std::sync::Arc::new(MdnsPeerResolver),
+            peers: std::sync::Arc::new(MdnsPeerResolver::new()),
         }
     }
 }
@@ -139,48 +139,70 @@ pub trait PeerResolver: Send + Sync {
     async fn cache_peers(&self) -> Vec<CachePeer>;
 }
 
-/// Production resolver: one short mDNS browse per call (off the async
-/// runtime; multicast is blocking by nature).
-pub struct MdnsPeerResolver;
+/// Production resolver: instant snapshot of the continuous
+/// background peer table — no browse, no I/O, no latency penalty
+/// on cache misses.
+#[derive(Debug, Clone)]
+pub struct MdnsPeerResolver {
+    table: crate::mesh::discovery::MdnsCachePeerTable,
+}
+
+impl Default for MdnsPeerResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MdnsPeerResolver {
+    /// Resolver over a fresh, unstarted table (unit tests; the daemon
+    /// injects its started table via [`with_table`](Self::with_table)).
+    pub fn new() -> Self {
+        Self::with_table(crate::mesh::discovery::MdnsCachePeerTable::new())
+    }
+
+    /// Resolver over the daemon's shared peer table.
+    pub fn with_table(table: crate::mesh::discovery::MdnsCachePeerTable) -> Self {
+        Self { table }
+    }
+}
 
 #[async_trait::async_trait]
 impl PeerResolver for MdnsPeerResolver {
     async fn cache_peers(&self) -> Vec<CachePeer> {
-        let nodes = tokio::task::spawn_blocking(|| {
-            crate::mesh::discovery::LanDiscovery::browse_only(std::time::Duration::from_millis(300))
-        })
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
-        nodes
-            .into_iter()
-            .filter_map(|n| {
-                let metrics = n.metrics?;
-                if !metrics.cache_enabled {
-                    return None;
-                }
-                let port = metrics.cache_port?;
-                if metrics.cache_token.is_empty() {
-                    return None;
-                }
-                let ip = n
-                    .addrs
-                    .iter()
-                    .find(|a| !a.is_loopback() && !a.is_unspecified())?;
-                Some(CachePeer {
-                    node_id: if metrics.node_id.is_empty() {
-                        n.instance.clone()
-                    } else {
-                        metrics.node_id.clone()
-                    },
-                    base_url: format!("http://{ip}:{port}"),
-                    token: metrics.cache_token.clone(),
-                })
-            })
+        self.table
+            .snapshot(std::time::Instant::now())
+            .iter()
+            .filter_map(cache_peer_from_node)
             .take(MAX_FEDERATION_PEERS)
             .collect()
     }
+}
+
+/// Resolve one discovered node to a cache endpoint (pure; unit-tested).
+/// Strictly active cache servers only: federation must never aim at
+/// nodes that did not opt in or cannot be addressed.
+pub fn cache_peer_from_node(node: &crate::mesh::discovery::DiscoveredNode) -> Option<CachePeer> {
+    let metrics = node.metrics.as_ref()?;
+    if !metrics.cache_enabled {
+        return None;
+    }
+    let port = metrics.cache_port?;
+    if metrics.cache_token.is_empty() {
+        return None;
+    }
+    let ip = node
+        .addrs
+        .iter()
+        .find(|a| !a.is_loopback() && !a.is_unspecified())?;
+    Some(CachePeer {
+        node_id: if metrics.node_id.is_empty() {
+            node.instance.clone()
+        } else {
+            metrics.node_id.clone()
+        },
+        base_url: format!("http://{ip}:{port}"),
+        token: metrics.cache_token.clone(),
+    })
 }
 
 /// Cap on peers queried per local miss (bounds spoof-amplified fan-out).
@@ -975,5 +997,89 @@ mod tests {
             "http://127.0.0.1:8787"
         );
         assert_eq!(public_base_url("[::]:9000", 9000), "http://127.0.0.1:9000");
+    }
+
+    use crate::mesh::discovery::{DiscoveredNode, LanMetrics, MdnsCachePeerTable};
+
+    fn active_node(node_id: &str, ip: &str) -> DiscoveredNode {
+        DiscoveredNode {
+            instance: format!("{node_id}._runner._tcp.local."),
+            host: format!("{node_id}.local"),
+            port: 9535,
+            addrs: vec![ip.parse().unwrap()],
+            metrics: Some(LanMetrics {
+                cores: 8,
+                ram_mb: 16384,
+                slots: 4,
+                cache_port: Some(8787),
+                cache_enabled: true,
+                node_id: node_id.to_string(),
+                cache_token: "tok".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn cache_peer_from_node_accepts_active_servers() {
+        let peer = cache_peer_from_node(&active_node("node-a", "10.0.0.2")).unwrap();
+        assert_eq!(peer.node_id, "node-a");
+        assert_eq!(peer.base_url, "http://10.0.0.2:8787");
+        assert_eq!(peer.token, "tok");
+        // Empty broadcast id falls back to the instance name.
+        let mut legacy = active_node("", "10.0.0.3");
+        legacy.instance = "legacy._runner._tcp.local.".to_string();
+        let peer = cache_peer_from_node(&legacy).unwrap();
+        assert_eq!(peer.node_id, "legacy._runner._tcp.local.");
+    }
+
+    #[test]
+    fn cache_peer_from_node_rejects_inactive() {
+        // No metrics at all.
+        let mut node = active_node("node-a", "10.0.0.2");
+        node.metrics = None;
+        assert!(cache_peer_from_node(&node).is_none());
+        // Federation not enabled.
+        let mut node = active_node("node-a", "10.0.0.2");
+        node.metrics.as_mut().unwrap().cache_enabled = false;
+        assert!(cache_peer_from_node(&node).is_none());
+        // No cache port.
+        let mut node = active_node("node-a", "10.0.0.2");
+        node.metrics.as_mut().unwrap().cache_port = None;
+        assert!(cache_peer_from_node(&node).is_none());
+        // Empty bearer token.
+        let mut node = active_node("node-a", "10.0.0.2");
+        node.metrics.as_mut().unwrap().cache_token.clear();
+        assert!(cache_peer_from_node(&node).is_none());
+        // No usable address (loopback / unspecified / none).
+        for addrs in [
+            vec!["127.0.0.1".parse().unwrap()],
+            vec!["0.0.0.0".parse().unwrap()],
+            vec![],
+        ] {
+            let mut node = active_node("node-a", "10.0.0.2");
+            node.addrs = addrs;
+            assert!(cache_peer_from_node(&node).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_snapshots_table_without_io() {
+        use std::time::Instant;
+        let table = MdnsCachePeerTable::new();
+        let now = Instant::now();
+        // Inactive rows never surface; actives do, capped per miss.
+        let mut quiet = active_node("quiet", "10.0.0.9");
+        quiet.metrics.as_mut().unwrap().cache_enabled = false;
+        table.register_heartbeat(quiet, now);
+        for i in 0..MAX_FEDERATION_PEERS + 3 {
+            table.register_heartbeat(
+                active_node(&format!("node-{i}"), &format!("10.0.0.{}", i + 10)),
+                now,
+            );
+        }
+        let resolver = MdnsPeerResolver::with_table(table);
+        let peers = resolver.cache_peers().await;
+        assert_eq!(peers.len(), MAX_FEDERATION_PEERS);
+        assert!(peers.iter().all(|p| p.node_id.starts_with("node-")));
     }
 }

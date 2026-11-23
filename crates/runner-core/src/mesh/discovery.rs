@@ -3,9 +3,10 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::sync::{Arc, Once, RwLock};
+use std::time::{Duration, Instant};
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 
 /// Service type advertised by mesh nodes on the LAN.
 pub const MESH_SERVICE_TYPE: &str = "_runner._tcp.local.";
@@ -102,6 +103,221 @@ pub struct DiscoveredNode {
     pub metrics: Option<LanMetrics>,
 }
 
+/// Decode one resolved mDNS record into a node (shared by the
+/// one-shot browses and the continuous peer table).
+fn node_from_info(info: &ResolvedService) -> DiscoveredNode {
+    let mut props = HashMap::new();
+    for key in [
+        "cores",
+        "ram_mb",
+        "slots",
+        "cache_port",
+        "cache_enabled",
+        "node_id",
+        "cache_token",
+    ] {
+        if let Some(value) = info.get_property_val_str(key) {
+            props.insert(key.to_string(), value.to_string());
+        }
+    }
+    let addrs = info
+        .get_addresses()
+        .iter()
+        .map(|ip| ip.to_ip_addr())
+        .collect();
+    assemble_node(
+        info.get_fullname().to_string(),
+        info.get_hostname().to_string(),
+        info.get_port(),
+        addrs,
+        props,
+    )
+}
+
+/// Assemble a node from decoded parts (pure; unit-tested).
+fn assemble_node(
+    instance: String,
+    host: String,
+    port: u16,
+    addrs: Vec<IpAddr>,
+    props: HashMap<String, String>,
+) -> DiscoveredNode {
+    DiscoveredNode {
+        instance,
+        host,
+        port,
+        addrs,
+        metrics: decode_metrics(&props),
+    }
+}
+
+/// Peer heartbeat time-to-live: 3x the 60s advertise cadence, so a
+/// single missed re-announcement never flaps a live peer out of the
+/// table. Clean exits still vanish promptly via goodbye packets
+/// (`ServiceRemoved`); the TTL only covers crash-silence.
+pub const PEER_HEARTBEAT_TTL: Duration = Duration::from_secs(180);
+
+/// One table row: last-seen resolved node plus its heartbeat stamp.
+#[derive(Debug, Clone)]
+struct PeerEntry {
+    node: DiscoveredNode,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PeerTableInner {
+    peers: HashMap<String, PeerEntry>,
+    own_node_id: Option<String>,
+}
+
+/// Continuous background registry of LAN cache peers, fed by mDNS
+/// resolve/remove events. Cheap-clone handle: the daemon owns one,
+/// the resolver snapshots it on every cache miss with no I/O.
+#[derive(Debug, Clone)]
+pub struct MdnsCachePeerTable {
+    inner: Arc<RwLock<PeerTableInner>>,
+    started: Arc<Once>,
+}
+
+impl Default for MdnsCachePeerTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MdnsCachePeerTable {
+    /// Empty table; the background browse starts on
+    /// [`start_background_loop`](Self::start_background_loop), never
+    /// here, so unit tests stay side-effect-free.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(PeerTableInner::default())),
+            started: Arc::new(Once::new()),
+        }
+    }
+
+    /// Dedup key: the stable broadcast node id, falling back to the
+    /// mDNS instance name for legacy peers without one.
+    pub fn node_key(node: &DiscoveredNode) -> &str {
+        match &node.metrics {
+            Some(metrics) if !metrics.node_id.is_empty() => &metrics.node_id,
+            _ => &node.instance,
+        }
+    }
+
+    /// Exclude our own advertisement from snapshots (self is not a
+    /// peer; without this every miss would re-query our own cache
+    /// over the LAN first).
+    pub fn set_own_node_id(&self, node_id: &str) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.own_node_id = Some(node_id.to_string());
+        }
+    }
+
+    /// Record a resolve heartbeat: insert new peers, refresh
+    /// addresses and stamps on known ones.
+    pub fn register_heartbeat(&self, node: DiscoveredNode, now: Instant) {
+        let key = Self::node_key(&node).to_string();
+        if let Ok(mut inner) = self.inner.write() {
+            inner.peers.insert(
+                key,
+                PeerEntry {
+                    node,
+                    last_seen: now,
+                },
+            );
+        }
+    }
+
+    /// Drop the row whose mDNS instance said goodbye.
+    pub fn remove_instance(&self, instance_fullname: &str) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner
+                .peers
+                .retain(|_, entry| entry.node.instance != instance_fullname);
+        }
+    }
+
+    /// Prune rows whose heartbeat is older than
+    /// [`PEER_HEARTBEAT_TTL`].
+    pub fn sweep_expired(&self, now: Instant) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner
+                .peers
+                .retain(|_, entry| now.duration_since(entry.last_seen) <= PEER_HEARTBEAT_TTL);
+        }
+    }
+
+    /// Instant snapshot of live, non-self peers. Read lock only, no
+    /// mutation or I/O: safe on the cache-miss hot path. Expired
+    /// rows are filtered here even between sweeps, so the TTL is a
+    /// hard visibility bound, not a sweep-schedule artifact.
+    pub fn snapshot(&self, now: Instant) -> Vec<DiscoveredNode> {
+        let Ok(inner) = self.inner.read() else {
+            return Vec::new();
+        };
+        inner
+            .peers
+            .values()
+            .filter(|entry| now.duration_since(entry.last_seen) <= PEER_HEARTBEAT_TTL)
+            .map(|entry| &entry.node)
+            .filter(|node| match &inner.own_node_id {
+                Some(own) => Self::node_key(node) != own,
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Spawn the continuous browse thread (idempotent: the first
+    /// call wins, later calls are no-ops). Fail-open: when mDNS is
+    /// unavailable the table simply stays empty and cache misses
+    /// fall through to upstream, exactly like a failed one-shot
+    /// browse today.
+    pub fn start_background_loop(&self) {
+        let table = self.clone();
+        self.started.call_once(move || {
+            std::thread::Builder::new()
+                .name("mdns-peer-table".to_string())
+                .spawn(move || Self::browse_loop(&table))
+                .inspect_err(|e| eprintln!("runner: peer table browse thread failed ({e})"))
+                .ok();
+        });
+    }
+
+    /// Blocking browse forever: heartbeats in, goodbyes out, TTL
+    /// sweep on every quiet tick. Runs off the async runtime on its
+    /// own OS thread (multicast recv is blocking by nature).
+    fn browse_loop(table: &Self) {
+        let daemon = match ServiceDaemon::new() {
+            Ok(daemon) => daemon,
+            Err(e) => {
+                eprintln!("runner: peer table mDNS unavailable ({e}); LAN federation off");
+                return;
+            }
+        };
+        let receiver = match daemon.browse(MESH_SERVICE_TYPE) {
+            Ok(receiver) => receiver,
+            Err(e) => {
+                eprintln!("runner: peer table browse failed ({e}); LAN federation off");
+                return;
+            }
+        };
+        loop {
+            match receiver.recv_timeout(Duration::from_secs(10)) {
+                Ok(ServiceEvent::ServiceResolved(info)) => {
+                    table.register_heartbeat(node_from_info(&info), Instant::now());
+                }
+                Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
+                    table.remove_instance(&fullname);
+                }
+                Ok(_) => {}
+                Err(_) => table.sweep_expired(Instant::now()),
+            }
+        }
+    }
+}
+
 /// Zero-config LAN presence: register this node and browse for peers.
 pub struct LanDiscovery {
     daemon: ServiceDaemon,
@@ -174,34 +390,7 @@ impl LanDiscovery {
                     if info.get_fullname() == self.fullname {
                         continue;
                     }
-                    let mut props = HashMap::new();
-                    for key in [
-                        "cores",
-                        "ram_mb",
-                        "slots",
-                        "cache_port",
-                        "cache_enabled",
-                        "node_id",
-                        "cache_token",
-                    ] {
-                        if let Some(value) = info.get_property_val_str(key) {
-                            props.insert(key.to_string(), value.to_string());
-                        }
-                    }
-                    nodes.insert(
-                        info.get_fullname().to_string(),
-                        DiscoveredNode {
-                            instance: info.get_fullname().to_string(),
-                            host: info.get_hostname().to_string(),
-                            port: info.get_port(),
-                            addrs: info
-                                .get_addresses()
-                                .iter()
-                                .map(|ip| ip.to_ip_addr())
-                                .collect(),
-                            metrics: decode_metrics(&props),
-                        },
-                    );
+                    nodes.insert(info.get_fullname().to_string(), node_from_info(&info));
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
                     nodes.remove(&fullname);
@@ -223,34 +412,7 @@ impl LanDiscovery {
         while let Ok(event) = receiver.recv_deadline(deadline) {
             match event {
                 ServiceEvent::ServiceResolved(info) => {
-                    let mut props = HashMap::new();
-                    for key in [
-                        "cores",
-                        "ram_mb",
-                        "slots",
-                        "cache_port",
-                        "cache_enabled",
-                        "node_id",
-                        "cache_token",
-                    ] {
-                        if let Some(value) = info.get_property_val_str(key) {
-                            props.insert(key.to_string(), value.to_string());
-                        }
-                    }
-                    nodes.insert(
-                        info.get_fullname().to_string(),
-                        DiscoveredNode {
-                            instance: info.get_fullname().to_string(),
-                            host: info.get_hostname().to_string(),
-                            port: info.get_port(),
-                            addrs: info
-                                .get_addresses()
-                                .iter()
-                                .map(|ip| ip.to_ip_addr())
-                                .collect(),
-                            metrics: decode_metrics(&props),
-                        },
-                    );
+                    nodes.insert(info.get_fullname().to_string(), node_from_info(&info));
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
                     nodes.remove(&fullname);
@@ -407,5 +569,170 @@ mod tests {
             assert!(!ip.is_loopback());
             assert!(!ip.is_unspecified());
         }
+    }
+
+    fn table_node(instance: &str, node_id: &str, ip: &str) -> DiscoveredNode {
+        DiscoveredNode {
+            instance: instance.to_string(),
+            host: format!("{node_id}.local"),
+            port: MESH_MDNS_PORT,
+            addrs: vec![ip.parse().unwrap()],
+            metrics: Some(LanMetrics {
+                cores: 8,
+                ram_mb: 16384,
+                slots: 4,
+                cache_port: Some(8787),
+                cache_enabled: true,
+                node_id: node_id.to_string(),
+                cache_token: "tok".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn peer_table_registers_and_snapshots() {
+        let table = MdnsCachePeerTable::new();
+        let now = Instant::now();
+        assert!(table.snapshot(now).is_empty());
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.2"),
+            now,
+        );
+        table.register_heartbeat(
+            table_node("b._runner._tcp.local.", "node-b", "10.0.0.3"),
+            now,
+        );
+        let snap = table.snapshot(now + Duration::from_secs(1));
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn peer_table_heartbeat_updates_addresses_in_place() {
+        let table = MdnsCachePeerTable::new();
+        let now = Instant::now();
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.2"),
+            now,
+        );
+        // Same stable id, new address (DHCP renumber): one row, new IP.
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.9"),
+            now + Duration::from_secs(5),
+        );
+        let snap = table.snapshot(now + Duration::from_secs(6));
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].addrs, vec!["10.0.0.9".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn peer_table_expires_and_sweeps_stale_rows() {
+        let table = MdnsCachePeerTable::new();
+        let now = Instant::now();
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.2"),
+            now,
+        );
+        // Past the TTL the row is invisible even before any sweep.
+        let stale = now + PEER_HEARTBEAT_TTL + Duration::from_secs(1);
+        assert!(table.snapshot(stale).is_empty());
+        table.sweep_expired(stale);
+        // Still gone after the sweep; a fresh heartbeat re-adds it.
+        assert!(table.snapshot(stale).is_empty());
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.2"),
+            stale,
+        );
+        assert_eq!(table.snapshot(stale).len(), 1);
+    }
+
+    #[test]
+    fn peer_table_removes_goodbye_instances() {
+        let table = MdnsCachePeerTable::new();
+        let now = Instant::now();
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.2"),
+            now,
+        );
+        table.register_heartbeat(
+            table_node("b._runner._tcp.local.", "node-b", "10.0.0.3"),
+            now,
+        );
+        table.remove_instance("a._runner._tcp.local.");
+        let snap = table.snapshot(now);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].instance, "b._runner._tcp.local.");
+        // Unknown goodbye is a no-op.
+        table.remove_instance("ghost._runner._tcp.local.");
+        assert_eq!(table.snapshot(now).len(), 1);
+    }
+
+    #[test]
+    fn peer_table_excludes_own_advertisement() {
+        let table = MdnsCachePeerTable::new();
+        table.set_own_node_id("node-a");
+        let now = Instant::now();
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.2"),
+            now,
+        );
+        table.register_heartbeat(
+            table_node("b._runner._tcp.local.", "node-b", "10.0.0.3"),
+            now,
+        );
+        let snap = table.snapshot(now);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].instance, "b._runner._tcp.local.");
+    }
+
+    #[test]
+    fn node_key_prefers_stable_id_with_instance_fallback() {
+        let with_id = table_node("a._runner._tcp.local.", "node-a", "10.0.0.2");
+        assert_eq!(MdnsCachePeerTable::node_key(&with_id), "node-a");
+        let legacy = DiscoveredNode {
+            metrics: None,
+            ..table_node("legacy._runner._tcp.local.", "", "10.0.0.4")
+        };
+        assert_eq!(
+            MdnsCachePeerTable::node_key(&legacy),
+            "legacy._runner._tcp.local."
+        );
+        let empty_id = table_node("empty._runner._tcp.local.", "", "10.0.0.5");
+        assert_eq!(
+            MdnsCachePeerTable::node_key(&empty_id),
+            "empty._runner._tcp.local."
+        );
+    }
+
+    #[test]
+    fn assemble_node_carries_identity_and_metrics() {
+        let props: HashMap<String, String> = [
+            ("cores", "8"),
+            ("ram_mb", "16384"),
+            ("slots", "4"),
+            ("cache_enabled", "1"),
+            ("node_id", "node-a"),
+            ("cache_port", "8787"),
+            ("cache_token", "tok"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let node = assemble_node(
+            "node-a._runner._tcp.local.".to_string(),
+            "node-a.local.".to_string(),
+            MESH_MDNS_PORT,
+            vec!["10.0.0.2".parse::<IpAddr>().unwrap()],
+            props,
+        );
+        assert_eq!(node.instance, "node-a._runner._tcp.local.");
+        assert_eq!(node.host, "node-a.local.");
+        assert_eq!(node.port, MESH_MDNS_PORT);
+        assert_eq!(node.addrs, vec!["10.0.0.2".parse::<IpAddr>().unwrap()]);
+        let metrics = node.metrics.expect("capacity keys suffice");
+        assert_eq!(metrics.cores, 8);
+        assert!(metrics.cache_enabled);
+        assert_eq!(metrics.cache_port, Some(8787));
+        assert_eq!(metrics.node_id, "node-a");
+        assert_eq!(metrics.cache_token, "tok");
     }
 }

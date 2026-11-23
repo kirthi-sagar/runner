@@ -1246,7 +1246,7 @@ mod tests {
             token: "test".to_string(),
             download_secret: [7u8; 32],
             http: reqwest::Client::new(),
-            peers: std::sync::Arc::new(MdnsPeerResolver),
+            peers: std::sync::Arc::new(MdnsPeerResolver::new()),
         });
         assert!(flush_cache_index(&state).await);
         let index = std::fs::read_dir(dir.path())

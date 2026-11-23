@@ -1334,7 +1334,17 @@ async fn main() -> Result<()> {
                         Ok(listener) => {
                             let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
                             let base = public_base_url(&config.cache.listen, port);
-                            let server_state = CacheServerState::new(store, base.clone());
+                            // Continuous peer registry: the resolver
+                            // snapshots this table on every miss; the
+                            // background browse starts below when LAN-bound.
+                            let peer_table =
+                                runner_core::mesh::discovery::MdnsCachePeerTable::new();
+                            let mut server_state = CacheServerState::new(store, base.clone());
+                            server_state.peers = std::sync::Arc::new(
+                                runner_core::cache::server::MdnsPeerResolver::with_table(
+                                    peer_table.clone(),
+                                ),
+                            );
                             state.write().await.set_cache(server_state.clone());
                             eprintln!(
                                 "runner: cache proxy on {} (advertised {base})",
@@ -1359,6 +1369,11 @@ async fn main() -> Result<()> {
                                     Some(ip) => {
                                         let node_id =
                                             runner_core::mesh::discovery::generate_node_id();
+                                        // Exclude our own advertisement from
+                                        // peer snapshots, then start the
+                                        // continuous background browse.
+                                        peer_table.set_own_node_id(&node_id);
+                                        peer_table.start_background_loop();
                                         let token = server_state.token.clone();
                                         let state = state.clone();
                                         tokio::spawn(async move {

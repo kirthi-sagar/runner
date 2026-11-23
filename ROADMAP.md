@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.10.0 and prior)
+## Shipped (v2.11.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -48,19 +48,28 @@ services or heavyweight frameworks.
 - Container runtime isolation tier: OCI probing, rootless
   lifecycle, egress/offline boundaries, CLI/doctor/MCP wire-up
   (v2.10.0, Candidate D delivered).
+- Windows clippy patch: cfg-gated timeout const, platform-split
+  exec-bit helper (v2.10.1).
+- Standalone OCI image pull & layer assembly: registry client,
+  verified layer cache, safe unpacker, auto-pull, `runner image`
+  CLI, platform-aware doctor guidance (v2.11.0, Candidate E
+  delivered).
 
-## Current: v2.10.0 (Container Runtime Isolation Tier)
+## Current: v2.11.0 (Standalone OCI Image Pull & Layer Assembly)
 
-- Standalone-runtime execution (crun/runc/youki) with RAII teardown.
-- Egress-guarded, offline-capable, scrubbed container jobs.
-- Full CLI, doctor, config-profile, and MCP surfaces.
+- Daemonless pull: HTTPS registry client with Bearer auth,
+  content-addressed cache, tar-slip-safe unpacking.
+- Auto-pull on container exec plus `runner image` management CLI.
+- Platform-aware runtime guidance on every supported host.
 
-## Next: v2.11.0 candidates (all lettered candidates shipped)
+## Next: v2.12.0 candidates (all lettered candidates shipped)
 
-- Container engine flows: registry image pull, rootfs population,
-  podman/docker execution (the explicit Phase 2 deferral).
+- Podman/docker engine dispatch (remaining half of the container
+  Phase 2 deferral; engines manage their own image storage).
 - Loopback prestart hook for offline containers needing `lo` up.
 - Config-file volume declarations for container jobs.
+- Manifest-byte verification against the index digest (currently
+  covered by TLS + trusted registry).
 
 ## Shipped in v2.9.0: LAN Mesh Cache Federation & Peer Streaming
 

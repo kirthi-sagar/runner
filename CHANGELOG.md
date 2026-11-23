@@ -6,6 +6,28 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.11.0 — 2026-11-23
+
+- Phase 1: Pure-Rust HTTPS registry client: `OciReference`
+  parsing (Docker Hub defaulting, custom hosts, tag/digest pins),
+  Bearer challenge negotiation with single-token caching,
+  multi-arch index resolution to the Linux host platform, and the
+  `localhost` HTTP exception.
+- Phase 2: Content-addressed layer cache with a streaming
+  downloader: misses fetch through a 15s idle watchdog, SHA-256
+  is verified in flight, exact-size hits skip the network, and
+  per-image manifest records bind references to resolutions.
+- Phase 3: Safe layer unpacker: dual-layer tar-slip defense
+  (lexical + canonical `ensure_within`), OCI whiteout and opaque
+  directory resolution, rootfs-relative absolute-symlink
+  rewriting, and a 10GB cumulative anti-zip-bomb budget.
+- Phase 4: Seamless auto-pull on `runner exec --driver container`
+  (validate → probe → pull → assemble → unpack → spawn), the
+  `runner image pull/list/prune` CLI, `[sandbox.container]`
+  `cache_dir`/`auto_pull` config, and platform-aware install
+  guidance in `runner doctor` across Linux, macOS, native
+  Windows NT, and WSL2.
+
 ## [2.10.1] - 2026-11-23
 
 ### Fixed

@@ -2,6 +2,7 @@
 //! generation. Phase 1 ships discovery + spec emission; execution
 //! binds a probed runtime in a later phase.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -113,6 +114,10 @@ pub struct OciBundleSpec {
     pub hostname: String,
     pub mounts: Vec<OciMount>,
     pub linux: OciLinux,
+    /// Free-form annotations (records the requested image; the
+    /// rootfs itself stays minimal until the engine flows land).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -270,6 +275,7 @@ impl OciBundleSpec {
             },
             hostname: "runner-job".to_string(),
             mounts: default_mounts(),
+            annotations: HashMap::new(),
             linux: OciLinux {
                 namespaces: ["pid", "mount", "ipc", "uts", "user"]
                     .into_iter()
@@ -389,6 +395,72 @@ impl OciBundleSpec {
         }
         Ok(self)
     }
+}
+
+/// Parse one `-v/--volume` spec (`host:container[:ro|rw]`) into
+/// a bind volume. Syntax-only: `/home` policy enforces later at
+/// [`OciBundleSpec::with_mount`]. Windows drive letters (`C:\…`)
+/// are honored; anything else with a stray `:` fails closed (same
+/// quirk as docker `-v`).
+pub fn parse_volume_spec(spec: &str) -> Result<OciVolume, String> {
+    let invalid = || format!("invalid volume spec '{spec}' (want host:container[:ro|rw])");
+    // Peel a Windows drive prefix so its colon never splits.
+    let bytes = spec.as_bytes();
+    let (drive, rest) = if bytes.len() > 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    {
+        spec.split_at(2)
+    } else {
+        ("", spec)
+    };
+    let mut parts = rest.split(':');
+    let host = parts.next().ok_or_else(&invalid)?;
+    let container = parts.next().ok_or_else(&invalid)?;
+    let opts = parts.next().unwrap_or("rw");
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    if host.is_empty() || container.is_empty() {
+        return Err(invalid());
+    }
+    if !container.starts_with('/') {
+        return Err(format!(
+            "invalid volume spec '{spec}': container path must be absolute"
+        ));
+    }
+    let readonly = match opts {
+        "ro" => true,
+        "rw" => false,
+        _ => {
+            return Err(format!(
+                "invalid volume spec '{spec}': options must be ro|rw, got '{opts}'"
+            ));
+        }
+    };
+    Ok(OciVolume {
+        source: PathBuf::from(format!("{drive}{host}")),
+        destination: container.to_string(),
+        readonly,
+    })
+}
+
+/// Resolve the container image: explicit flag first, config default
+/// second, fail closed when both are missing or blank.
+pub fn resolve_container_image(
+    flag: Option<&str>,
+    config: &runner_core::config::SandboxContainerConfig,
+) -> Result<String, String> {
+    flag.map(str::trim)
+        .filter(|flag| !flag.is_empty())
+        .map(str::to_string)
+        .or_else(|| config.default_image.clone())
+        .filter(|image| !image.trim().is_empty())
+        .ok_or_else(|| {
+            "container execution requires an image (--image or [sandbox.container] default_image)"
+                .to_string()
+        })
 }
 
 /// Ring capacity for container stdio capture (tail only; the live
@@ -576,7 +648,93 @@ async fn escalate_timeout(child: &mut tokio::process::Child, runtime: &Path, id:
     let _ = child.wait().await;
 }
 
-/// Supervise one running container: stream stdio, enforce the
+/// Launch parameters for one container execution, assembled by
+/// the CLI (`--image`, `--volume`, `--no-network`) or the MCP agent
+/// from tool args plus config fallbacks.
+#[derive(Debug, Clone)]
+pub struct ContainerLaunch {
+    pub runtime_override: Option<PathBuf>,
+    pub command: Vec<String>,
+    pub timeout: std::time::Duration,
+    pub volumes: Vec<OciVolume>,
+    pub network_egress_filtering: bool,
+    /// Resolved image reference (flag over config default); empty
+    /// fails closed at launch.
+    pub image: String,
+    pub no_network: bool,
+    /// Container environment (`None` inherits the host).
+    pub env: Option<Vec<String>>,
+}
+
+impl Default for ContainerLaunch {
+    fn default() -> Self {
+        Self {
+            runtime_override: None,
+            command: Vec::new(),
+            timeout: std::time::Duration::from_secs(60),
+            volumes: Vec::new(),
+            network_egress_filtering: false,
+            image: String::new(),
+            no_network: false,
+            env: None,
+        }
+    }
+}
+
+/// Captured container result (MCP path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerOutput {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Per-stream capture cap (agents get bounded payloads).
+const CAPTURE_CAP_BYTES: usize = 1024 * 1024;
+
+/// Collect a pipe to bytes, capped: past the cap the reader keeps
+/// draining (a capped stream must never backpressure the pump into
+/// a false timeout).
+async fn collect_capped<R>(mut reader: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.len() < cap {
+                    out.extend_from_slice(&buf[..n.min(cap - out.len())]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Wait with timeout escalation; returns the exit status (never hangs
+/// past timeout+grace+kill). Shared by both supervision modes.
+async fn wait_supervised(
+    child: &mut tokio::process::Child,
+    runtime: &Path,
+    id: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus, String> {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(e)) => Err(format!("container wait failed: {e}")),
+        Err(_) => {
+            escalate_timeout(child, runtime, id).await;
+            Err(format!("container timed out after {}s", timeout.as_secs()))
+        }
+    }
+}
+
+/// Supervise one running container: stream stdio live, enforce the
 /// timeout, propagate the exit code. Pumps always join before
 /// returning so no output or task is orphaned.
 async fn supervise_container(
@@ -591,16 +749,11 @@ async fn supervise_container(
     let ring: OutputRing = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
     let out_pump = tokio::spawn(pump_pipe(out, tokio::io::stdout(), ring.clone()));
     let err_pump = tokio::spawn(pump_pipe(err, tokio::io::stderr(), ring.clone()));
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => {
+    let status = match wait_supervised(child, runtime, id, timeout).await {
+        Ok(status) => status,
+        Err(e) => {
             let _ = tokio::join!(out_pump, err_pump);
-            return Err(format!("container wait failed: {e}"));
-        }
-        Err(_) => {
-            escalate_timeout(child, runtime, id).await;
-            let _ = tokio::join!(out_pump, err_pump);
-            return Err(format!("container timed out after {}s", timeout.as_secs()));
+            return Err(e);
         }
     };
     let _ = tokio::join!(out_pump, err_pump);
@@ -619,50 +772,76 @@ async fn supervise_container(
     Ok(code)
 }
 
-/// Execute one command in an ephemeral OCI container: guard, probe,
-/// bundle, spawn, supervise, tear down. The egress guard and the
-/// runtime probe both run before any setup so failures abort before
-/// touching disk or spawn — in every mode (there is no tier fallback
-/// to gate, so `--strict` needs no separate branch).
-pub async fn execute_container(
-    runtime_override: Option<&Path>,
-    command: &[String],
+/// Supervise one running container with captured (not inherited)
+/// stdio for the MCP path. Collectors drain concurrently with the
+/// pumps so a chatty container can never deadlock the capture.
+async fn supervise_container_captured(
+    child: &mut tokio::process::Child,
+    runtime: &Path,
+    id: &str,
     timeout: std::time::Duration,
-    volumes: &[OciVolume],
-    network_egress_filtering: bool,
-) -> Result<i32, String> {
-    execute_container_in(
-        &crate::mounts::job_root(),
-        runtime_override,
-        command,
-        timeout,
-        volumes,
-        network_egress_filtering,
-    )
-    .await
+) -> Result<ContainerOutput, String> {
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err("container stdio pipes unavailable".to_string());
+    };
+    // Ring unused here (full output returns); the pumps require one.
+    let ring: OutputRing = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+    let (out_sink, out_source) = tokio::io::duplex(65536);
+    let (err_sink, err_source) = tokio::io::duplex(65536);
+    let out_pump = tokio::spawn(pump_pipe(out, out_sink, ring.clone()));
+    let err_pump = tokio::spawn(pump_pipe(err, err_sink, ring.clone()));
+    let out_collect = tokio::spawn(collect_capped(out_source, CAPTURE_CAP_BYTES));
+    let err_collect = tokio::spawn(collect_capped(err_source, CAPTURE_CAP_BYTES));
+    let status = match wait_supervised(child, runtime, id, timeout).await {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = tokio::join!(out_pump, err_pump, out_collect, err_collect);
+            return Err(e);
+        }
+    };
+    let _ = tokio::join!(out_pump, err_pump);
+    let (stdout, stderr) = tokio::join!(out_collect, err_collect);
+    Ok(ContainerOutput {
+        code: status.code().unwrap_or(1),
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    })
 }
 
-/// [`execute_container`] with an explicit bundle parent (tests pin a
-/// temp dir; production always passes [`job_root`](crate::mounts::job_root)).
-async fn execute_container_in(
+/// Spawned container plus its teardown guard and identity.
+struct LaunchedContainer {
+    child: tokio::process::Child,
+    guard: OciBundleGuard,
+    runtime: PathBuf,
+    id: String,
+}
+
+/// Validate, probe, assemble, and spawn one container (shared by the
+/// streaming and captured paths). Pure validations run before any
+/// side effect; each fallible setup step tears down on failure.
+async fn launch_container(
     bundle_parent: &Path,
-    runtime_override: Option<&Path>,
-    command: &[String],
-    timeout: std::time::Duration,
-    volumes: &[OciVolume],
-    network_egress_filtering: bool,
-) -> Result<i32, String> {
-    if command.is_empty() {
+    launch: &ContainerLaunch,
+) -> Result<LaunchedContainer, String> {
+    if launch.command.is_empty() {
         return Err("no command to execute".to_string());
     }
-    // Egress boundary first (mirrors the process tier): held across
-    // the whole lifecycle; acquisition failure aborts unfiltered-never.
-    let _egress_guard = crate::egress::EgressGuard::acquire(network_egress_filtering)?;
-    let runtime = probe_oci_runtime(runtime_override)?;
+    if launch.image.trim().is_empty() {
+        return Err(
+            "container execution requires an image (--image or [sandbox.container] default_image)"
+                .to_string(),
+        );
+    }
+    let runtime = probe_oci_runtime(launch.runtime_override.as_deref())?;
     let id = next_container_id();
+    let env = launch.env.clone().unwrap_or_else(host_env);
     // Volumes validate before anything is written: a /home source
     // fails closed with no bundle and no spawn.
-    let spec = OciBundleSpec::new(command.to_vec(), host_env()).with_volumes(volumes)?;
+    let mut spec = OciBundleSpec::new(launch.command.clone(), env)
+        .with_volumes(&launch.volumes)?
+        .with_offline_network(launch.no_network);
+    spec.annotations
+        .insert("org.runner.image".to_string(), launch.image.clone());
     let dir = assemble_bundle_at(bundle_parent, &id, &spec)?;
     let mut guard = OciBundleGuard::new(runtime.clone(), id.clone(), dir.clone());
     let argv = match runtime_argv(&runtime, &dir, &id) {
@@ -682,15 +861,74 @@ async fn execute_container_in(
     // whole tree (unix; no-op elsewhere).
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             guard.teardown().await;
             return Err(format!("failed to spawn OCI runtime: {e}"));
         }
     };
-    let outcome = supervise_container(&mut child, &runtime, &id, timeout).await;
-    guard.teardown().await;
+    Ok(LaunchedContainer {
+        child,
+        guard,
+        runtime,
+        id,
+    })
+}
+
+/// Execute one command in an ephemeral OCI container: guard, launch,
+/// supervise (live stdio), tear down. The egress guard runs before
+/// any setup so failures abort before touching disk or spawn — in
+/// every mode (there is no tier fallback to gate, so `--strict`
+/// needs no separate branch).
+pub async fn execute_container(launch: ContainerLaunch) -> Result<i32, String> {
+    execute_container_in(&crate::mounts::job_root(), launch).await
+}
+
+/// [`execute_container`] with an explicit bundle parent (tests pin a
+/// temp dir; production always passes [`job_root`](crate::mounts::job_root)).
+async fn execute_container_in(
+    bundle_parent: &Path,
+    launch: ContainerLaunch,
+) -> Result<i32, String> {
+    // Egress boundary first (mirrors the process tier): held across
+    // the whole lifecycle; acquisition failure aborts unfiltered-never.
+    let _egress_guard = crate::egress::EgressGuard::acquire(launch.network_egress_filtering)?;
+    let mut launched = launch_container(bundle_parent, &launch).await?;
+    let outcome = supervise_container(
+        &mut launched.child,
+        &launched.runtime,
+        &launched.id,
+        launch.timeout,
+    )
+    .await;
+    launched.guard.teardown().await;
+    outcome
+}
+
+/// [`execute_container`] with captured (not inherited) stdio for the
+/// MCP agent path.
+pub async fn execute_container_captured(
+    launch: ContainerLaunch,
+) -> Result<ContainerOutput, String> {
+    execute_container_captured_in(&crate::mounts::job_root(), launch).await
+}
+
+/// Captured [`execute_container_in`] (tests pin a temp dir).
+async fn execute_container_captured_in(
+    bundle_parent: &Path,
+    launch: ContainerLaunch,
+) -> Result<ContainerOutput, String> {
+    let _egress_guard = crate::egress::EgressGuard::acquire(launch.network_egress_filtering)?;
+    let mut launched = launch_container(bundle_parent, &launch).await?;
+    let outcome = supervise_container_captured(
+        &mut launched.child,
+        &launched.runtime,
+        &launched.id,
+        launch.timeout,
+    )
+    .await;
+    launched.guard.teardown().await;
     outcome
 }
 
@@ -910,6 +1148,21 @@ mod tests {
         assert!(leftovers.is_empty(), "orphaned bundles: {leftovers:?}");
     }
 
+    /// Launch builder for tests (image pre-resolved; tweak per test).
+    fn test_launch(
+        runtime: Option<PathBuf>,
+        command: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> ContainerLaunch {
+        ContainerLaunch {
+            runtime_override: runtime,
+            command,
+            timeout,
+            image: "test:latest".to_string(),
+            ..Default::default()
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn execute_propagates_shim_exit_codes() {
@@ -919,11 +1172,11 @@ mod tests {
             let shim = shim_script(dir.path(), &format!("rt-{code}"), body);
             let got = execute_container_in(
                 &parent,
-                Some(&shim),
-                &["true".to_string()],
-                std::time::Duration::from_secs(10),
-                &[],
-                false,
+                test_launch(
+                    Some(shim),
+                    vec!["true".to_string()],
+                    std::time::Duration::from_secs(10),
+                ),
             )
             .await
             .unwrap();
@@ -948,11 +1201,11 @@ mod tests {
         let start = std::time::Instant::now();
         let err = execute_container_in(
             &parent,
-            Some(&shim),
-            &["true".to_string()],
-            std::time::Duration::from_secs(1),
-            &[],
-            false,
+            test_launch(
+                Some(shim),
+                vec!["true".to_string()],
+                std::time::Duration::from_secs(1),
+            ),
         )
         .await
         .unwrap_err();
@@ -973,13 +1226,11 @@ mod tests {
         let dir = runner_core::test_support::TempDir::new("oci-nospawn").unwrap();
         let marker = dir.path().join("RAN");
         // If any child spawned, this command would create the marker.
-        let err = execute_container(
-            Some(&dir.path().join("no-such-runtime")),
-            &["touch".to_string(), marker.display().to_string()],
+        let err = execute_container(test_launch(
+            Some(dir.path().join("no-such-runtime")),
+            vec!["touch".to_string(), marker.display().to_string()],
             std::time::Duration::from_secs(5),
-            &[],
-            false,
-        )
+        ))
         .await
         .unwrap_err();
         assert!(err.contains("not a runnable binary"), "{err}");
@@ -993,11 +1244,11 @@ mod tests {
         let docker = fake_runtime(dir.path(), "docker");
         let err = execute_container_in(
             &parent,
-            Some(&docker),
-            &["true".to_string()],
-            std::time::Duration::from_secs(5),
-            &[],
-            false,
+            test_launch(
+                Some(docker),
+                vec!["true".to_string()],
+                std::time::Duration::from_secs(5),
+            ),
         )
         .await
         .unwrap_err();
@@ -1019,11 +1270,11 @@ mod tests {
         }
         let err = execute_container_in(
             &parent,
-            Some(&garbage),
-            &["true".to_string()],
-            std::time::Duration::from_secs(5),
-            &[],
-            false,
+            test_launch(
+                Some(garbage),
+                vec!["true".to_string()],
+                std::time::Duration::from_secs(5),
+            ),
         )
         .await
         .unwrap_err();
@@ -1130,16 +1381,15 @@ mod tests {
             readonly: true,
         }];
         let runtime = fake_runtime(dir.path(), "vol-rt");
-        let err = execute_container_in(
-            &parent,
-            Some(&runtime),
-            &["true".to_string()],
-            std::time::Duration::from_secs(5),
-            &volumes,
-            false,
-        )
-        .await
-        .unwrap_err();
+        let launch = ContainerLaunch {
+            volumes,
+            ..test_launch(
+                Some(runtime),
+                vec!["true".to_string()],
+                std::time::Duration::from_secs(5),
+            )
+        };
+        let err = execute_container_in(&parent, launch).await.unwrap_err();
         assert!(err.contains("/home"), "{err}");
         assert_parent_empty(&parent);
     }
@@ -1153,17 +1403,150 @@ mod tests {
         let dir = runner_core::test_support::TempDir::new("oci-egress").unwrap();
         let parent = bundle_parent(dir.path());
         let shim = shim_script(dir.path(), "guard-rt", "exit 0");
-        let code = execute_container_in(
-            &parent,
-            Some(&shim),
-            &["true".to_string()],
-            std::time::Duration::from_secs(10),
-            &[],
-            true,
-        )
-        .await
-        .unwrap();
+        let launch = ContainerLaunch {
+            network_egress_filtering: true,
+            ..test_launch(
+                Some(shim),
+                vec!["true".to_string()],
+                std::time::Duration::from_secs(10),
+            )
+        };
+        let code = execute_container_in(&parent, launch).await.unwrap();
         assert_eq!(code, 0);
+        assert_parent_empty(&parent);
+    }
+
+    #[test]
+    fn volume_specs_parse_and_reject() {
+        // Happy paths.
+        let volume = parse_volume_spec("/opt/data:/data").unwrap();
+        assert_eq!(volume.source, PathBuf::from("/opt/data"));
+        assert_eq!(volume.destination, "/data");
+        assert!(!volume.readonly);
+        let volume = parse_volume_spec("/opt/data:/data:ro").unwrap();
+        assert!(volume.readonly);
+        let volume = parse_volume_spec("/opt/data:/data:rw").unwrap();
+        assert!(!volume.readonly);
+        // Windows drive hosts (pure string logic: runs everywhere).
+        let volume = parse_volume_spec("C:\\data:/data:ro").unwrap();
+        assert_eq!(volume.source, PathBuf::from("C:\\data"));
+        assert_eq!(volume.destination, "/data");
+        assert!(volume.readonly);
+        // Malformed specs fail closed.
+        for bad in [
+            "",
+            "justahost",
+            "/data",
+            ":/data",
+            "/host:",
+            "/host:relative",
+            "/host:/data:z",
+            "/a:/b:ro:extra",
+        ] {
+            assert!(parse_volume_spec(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn image_resolves_flag_over_config_or_fails_closed() {
+        use runner_core::config::SandboxContainerConfig;
+        let blank = SandboxContainerConfig::default();
+        // Neither: fail closed naming both sources.
+        let err = resolve_container_image(None, &blank).unwrap_err();
+        assert!(err.contains("--image"), "{err}");
+        assert!(err.contains("default_image"), "{err}");
+        // Blank flag falls through to the default.
+        let configured = SandboxContainerConfig {
+            default_image: Some("ubuntu:24.04".to_string()),
+            ..SandboxContainerConfig::default()
+        };
+        assert_eq!(
+            resolve_container_image(None, &configured).unwrap(),
+            "ubuntu:24.04"
+        );
+        assert_eq!(
+            resolve_container_image(Some("  "), &configured).unwrap(),
+            "ubuntu:24.04"
+        );
+        // Explicit flag wins.
+        assert_eq!(
+            resolve_container_image(Some("alpine:3"), &configured).unwrap(),
+            "alpine:3"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_missing_image_fails_before_setup() {
+        let dir = runner_core::test_support::TempDir::new("oci-noimage").unwrap();
+        let parent = bundle_parent(dir.path());
+        let runtime = fake_runtime(dir.path(), "img-rt");
+        let launch = ContainerLaunch {
+            image: String::new(),
+            ..test_launch(
+                Some(runtime),
+                vec!["true".to_string()],
+                std::time::Duration::from_secs(5),
+            )
+        };
+        let err = execute_container_in(&parent, launch).await.unwrap_err();
+        assert!(err.contains("--image"), "{err}");
+        assert_parent_empty(&parent);
+    }
+
+    #[test]
+    fn annotations_roundtrip_with_spec() {
+        let mut spec = OciBundleSpec::new(vec!["x".to_string()], vec![]);
+        spec.annotations
+            .insert("org.runner.image".to_string(), "ubuntu:24.04".to_string());
+        let json = spec.to_json().unwrap();
+        assert_eq!(json["annotations"]["org.runner.image"], "ubuntu:24.04");
+        let back: OciBundleSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.annotations.get("org.runner.image").unwrap(),
+            "ubuntu:24.04"
+        );
+        // Absent annotations default empty (old bundles parse).
+        let mut spec = OciBundleSpec::new(vec!["x".to_string()], vec![]);
+        spec.annotations.clear();
+        let json = spec.to_json().unwrap();
+        assert!(json.get("annotations").is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_captured_returns_separate_streams() {
+        let dir = runner_core::test_support::TempDir::new("oci-capture").unwrap();
+        let parent = bundle_parent(dir.path());
+        let shim = shim_script(dir.path(), "echo-rt", "echo OUT; echo ERR >&2; exit 3");
+        let launch = test_launch(
+            Some(shim),
+            vec!["true".to_string()],
+            std::time::Duration::from_secs(10),
+        );
+        let out = execute_container_captured_in(&parent, launch)
+            .await
+            .unwrap();
+        assert_eq!(out.code, 3);
+        assert_eq!(out.stdout, b"OUT\n");
+        assert_eq!(out.stderr, b"ERR\n");
+        assert_parent_empty(&parent);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_captured_timeout_reports_without_streams() {
+        let dir = runner_core::test_support::TempDir::new("oci-captimeout").unwrap();
+        let parent = bundle_parent(dir.path());
+        let shim = shim_script(dir.path(), "slow-rt", "sleep 30");
+        let launch = test_launch(
+            Some(shim),
+            vec!["true".to_string()],
+            std::time::Duration::from_secs(1),
+        );
+        let err = execute_container_captured_in(&parent, launch)
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
         assert_parent_empty(&parent);
     }
 

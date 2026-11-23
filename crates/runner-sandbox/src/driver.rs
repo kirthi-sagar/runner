@@ -71,7 +71,7 @@ pub struct SandboxEngine {
     firecracker_bin: PathBuf,
     strict: bool,
     network_egress_filtering: bool,
-    container: runner_core::config::SandboxContainerConfig,
+    container: crate::oci::ContainerLaunch,
 }
 
 impl SandboxEngine {
@@ -82,7 +82,7 @@ impl SandboxEngine {
             firecracker_bin: PathBuf::from("firecracker"),
             strict: false,
             network_egress_filtering: false,
-            container: runner_core::config::SandboxContainerConfig::default(),
+            container: crate::oci::ContainerLaunch::default(),
         }
     }
 
@@ -93,12 +93,11 @@ impl SandboxEngine {
         self
     }
 
-    /// Attach the OCI settings used by the [`SandboxDriver::Container`] tier.
-    pub fn with_container_config(
-        mut self,
-        config: runner_core::config::SandboxContainerConfig,
-    ) -> Self {
-        self.container = config;
+    /// Attach the launch template used by the [`SandboxDriver::Container`]
+    /// tier (CLI flags resolved over config; command/timeout fill in
+    /// per call).
+    pub fn with_container_launch(mut self, launch: crate::oci::ContainerLaunch) -> Self {
+        self.container = launch;
         self
     }
 
@@ -111,7 +110,8 @@ impl SandboxEngine {
 
     /// Enforce the outbound network boundary across the job (Process
     /// tier only; the MicroVM tier's guest traffic never traverses the
-    /// host socket path these filters govern). Guard failures abort
+    /// host socket path these filters govern, and the Container tier
+    /// reads the flag from its launch template). Guard failures abort
     /// the job instead of running unfiltered.
     pub fn with_network_egress_filtering(mut self, enabled: bool) -> Self {
         self.network_egress_filtering = enabled;
@@ -145,17 +145,12 @@ impl SandboxEngine {
             }
             SandboxDriver::MicroVm => self.execute_microvm(command, timeout).await,
             SandboxDriver::Container => {
-                // No caller-specified volumes yet (no config source;
-                // lands with the volume plumbing); the engine's egress
-                // flag governs the lifecycle boundary.
-                crate::oci::execute_container(
-                    self.container.runtime_path.as_deref(),
-                    command,
-                    timeout,
-                    &[],
-                    self.network_egress_filtering,
-                )
-                .await
+                // The launch template is authoritative (egress flag
+                // included); only command/timeout fill in per call.
+                let mut launch = self.container.clone();
+                launch.command = command.to_vec();
+                launch.timeout = timeout;
+                crate::oci::execute_container(launch).await
             }
         }
     }
@@ -340,12 +335,12 @@ mod tests {
     /// override: the probe rejects it naming the path).
     #[tokio::test]
     async fn container_tier_missing_runtime_fails_closed() {
-        let engine = SandboxEngine::new(SandboxDriver::Container).with_container_config(
-            runner_core::config::SandboxContainerConfig {
-                runtime_path: Some(PathBuf::from("/nonexistent/oci-runtime")),
-                default_image: None,
-            },
-        );
+        let launch = crate::oci::ContainerLaunch {
+            runtime_override: Some(PathBuf::from("/nonexistent/oci-runtime")),
+            image: "test:latest".to_string(),
+            ..crate::oci::ContainerLaunch::default()
+        };
+        let engine = SandboxEngine::new(SandboxDriver::Container).with_container_launch(launch);
         let err = engine
             .execute(&["true".to_string()], Duration::from_secs(5))
             .await

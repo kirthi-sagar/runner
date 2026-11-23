@@ -118,6 +118,34 @@ pub struct ExecCommandArgs {
     pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+    /// Execution tier: `process` (default) or `container`.
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// Container image (container tier; falls back to the
+    /// configured default image, fail closed when neither).
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Container tier: loopback-only networking.
+    #[serde(default)]
+    pub no_network: Option<bool>,
+    /// Container bind mounts (`host:container[:ro]`).
+    #[serde(default)]
+    pub volumes: Option<Vec<String>>,
+}
+
+/// Normalized exec request: validated driver plus container options.
+/// Raw volume specs parse at execution (the OCI parser lives in
+/// `runner-sandbox`, which this crate cannot depend on).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecRequest {
+    pub command: Vec<String>,
+    pub timeout_secs: u64,
+    pub env: Vec<(String, String)>,
+    /// Validated: `process` or `container`.
+    pub driver: String,
+    pub image: Option<String>,
+    pub no_network: bool,
+    pub volumes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,13 +176,11 @@ pub trait AgentTools: Send + Sync + std::fmt::Debug {
     /// is pre-validated to a known name). Never exposes secrets.
     async fn test_provider(&self, provider: &str) -> Result<serde_json::Value, ToolError>;
     /// Run a command under cgroup governance with captured output.
-    /// `timeout_secs` is guaranteed `>= 1`; `command` is non-empty.
-    async fn exec(
-        &self,
-        command: Vec<String>,
-        timeout_secs: u64,
-        env: Vec<(String, String)>,
-    ) -> Result<serde_json::Value, ToolError>;
+    /// The request arrives normalized: non-empty `command`,
+    /// `timeout_secs >= 1`, validated `process|container` driver.
+    /// Container-only fields are rejected for other drivers at
+    /// dispatch; malformed volume specs fail at execution.
+    async fn exec(&self, request: ExecRequest) -> Result<serde_json::Value, ToolError>;
     /// Manage daemon cloud workers (`action` pre-validated; `terminate`
     /// always carries an id). Goes through daemon IPC: the MCP server's
     /// local state never tracks cloud nodes.
@@ -213,12 +239,7 @@ impl AgentTools for StubAgentTools {
         Err(ToolError::internal("agent tools not configured"))
     }
 
-    async fn exec(
-        &self,
-        _command: Vec<String>,
-        _timeout_secs: u64,
-        _env: Vec<(String, String)>,
-    ) -> Result<serde_json::Value, ToolError> {
+    async fn exec(&self, _request: ExecRequest) -> Result<serde_json::Value, ToolError> {
         Err(ToolError::internal("agent tools not configured"))
     }
 
@@ -753,8 +774,47 @@ pub async fn execute_tool(
             if timeout_secs == 0 {
                 return Err(ToolError::invalid_params("timeout_secs must be >= 1"));
             }
+            let driver = args
+                .driver
+                .as_deref()
+                .map(str::trim)
+                .filter(|driver| !driver.is_empty())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_else(|| "process".to_string());
+            if driver != "process" && driver != "container" {
+                return Err(ToolError::invalid_params(format!(
+                    "unknown driver: '{driver}' (want process|container)"
+                )));
+            }
+            let volumes = args.volumes.unwrap_or_default();
+            if volumes.iter().any(|spec| spec.trim().is_empty()) {
+                return Err(ToolError::invalid_params("volumes must not be empty"));
+            }
+            // Container-only fields with another driver fail closed
+            // (never silently ignored).
+            let has_extras = args
+                .image
+                .as_ref()
+                .is_some_and(|image| !image.trim().is_empty())
+                || !volumes.is_empty()
+                || args.no_network == Some(true);
+            if driver != "container" && has_extras {
+                return Err(ToolError::invalid_params(
+                    "image/no_network/volumes require driver \"container\"",
+                ));
+            }
             let env: Vec<(String, String)> = args.env.unwrap_or_default().into_iter().collect();
-            ctx.agent.exec(args.command, timeout_secs, env).await
+            ctx.agent
+                .exec(ExecRequest {
+                    command: args.command,
+                    timeout_secs,
+                    env,
+                    driver,
+                    image: args.image,
+                    no_network: args.no_network.unwrap_or(false),
+                    volumes,
+                })
+                .await
         }
         TOOL_MANAGE_CLOUD_CAPACITY => {
             let args: ManageCloudCapacityArgs = parse_args(args)?;
@@ -951,6 +1011,10 @@ pub fn tool_schema(name: &str) -> serde_json::Value {
                 "command": { "type": "array", "items": { "type": "string" } },
                 "timeout_secs": { "type": "integer" },
                 "env": { "type": "object" },
+                "driver": { "type": "string", "enum": ["process", "container"] },
+                "image": { "type": "string" },
+                "no_network": { "type": "boolean" },
+                "volumes": { "type": "array", "items": { "type": "string" } },
             }),
             vec!["command"],
         ),
@@ -1334,8 +1398,8 @@ mod tests {
             .is_empty());
     }
 
-    /// One recorded `exec` call: command, timeout, env.
-    type ExecCall = (Vec<String>, u64, Vec<(String, String)>);
+    /// One recorded `exec` call.
+    type ExecCall = ExecRequest;
 
     /// Scripted agent impl: records calls, replays canned outputs.
     #[derive(Debug, Default)]
@@ -1363,16 +1427,8 @@ mod tests {
             Ok(serde_json::json!({ "provider": provider, "ok": true, "lines": [] }))
         }
 
-        async fn exec(
-            &self,
-            command: Vec<String>,
-            timeout_secs: u64,
-            env: Vec<(String, String)>,
-        ) -> Result<serde_json::Value, ToolError> {
-            self.execs
-                .lock()
-                .unwrap()
-                .push((command, timeout_secs, env));
+        async fn exec(&self, request: ExecRequest) -> Result<serde_json::Value, ToolError> {
+            self.execs.lock().unwrap().push(request);
             Ok(serde_json::json!({
                 "code": 0, "stdout": "hi\n", "stderr": "",
                 "elapsed_secs": 0.01, "timeout": false,
@@ -1489,15 +1545,29 @@ mod tests {
         {
             let calls = agent.execs.lock().unwrap();
             assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].0, vec!["echo", "hi"]);
-            assert_eq!(calls[0].1, 60);
-            assert_eq!(calls[0].2, vec![("A".to_string(), "b".to_string())]);
+            assert_eq!(calls[0].command, vec!["echo", "hi"]);
+            assert_eq!(calls[0].timeout_secs, 60);
+            assert_eq!(calls[0].env, vec![("A".to_string(), "b".to_string())]);
+            assert_eq!(calls[0].driver, "process");
+            assert_eq!(calls[0].image, None);
+            assert!(!calls[0].no_network);
+            assert!(calls[0].volumes.is_empty());
         }
 
         for bad in [
             serde_json::json!({ "command": [] }),
             serde_json::json!({ "command": ["echo", ""] }),
             serde_json::json!({ "command": ["echo"], "timeout_secs": 0 }),
+            // Unknown driver...
+            serde_json::json!({ "command": ["echo"], "driver": "gvisor" }),
+            // ...microvm is real but not MCP-runnable...
+            serde_json::json!({ "command": ["echo"], "driver": "microvm" }),
+            // ...container-only fields with another driver...
+            serde_json::json!({ "command": ["echo"], "image": "ubuntu:24.04" }),
+            serde_json::json!({ "command": ["echo"], "volumes": ["/a:/b"] }),
+            serde_json::json!({ "command": ["echo"], "no_network": true }),
+            // ...and blank volume specs even for containers.
+            serde_json::json!({ "command": ["echo"], "driver": "container", "volumes": ["  "] }),
         ] {
             let err = execute_tool(TOOL_EXEC_COMMAND, Some(&bad), &ctx)
                 .await
@@ -1505,6 +1575,44 @@ mod tests {
             assert_eq!(err.code, -32602, "{bad}");
         }
         assert_eq!(agent.execs.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exec_container_dispatch_roundtrip() {
+        let (ctx, agent) = agent_ctx();
+        let args = serde_json::json!({
+            "command": ["make", "test"],
+            "driver": "Container",
+            "image": "ubuntu:24.04",
+            "no_network": true,
+            "volumes": ["/opt/data:/data:ro"],
+            "timeout_secs": 120,
+        });
+        let out = execute_tool(TOOL_EXEC_COMMAND, Some(&args), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["code"], 0);
+        let calls = agent.execs.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].driver, "container");
+        assert_eq!(calls[0].image.as_deref(), Some("ubuntu:24.04"));
+        assert!(calls[0].no_network);
+        assert_eq!(calls[0].volumes, vec!["/opt/data:/data:ro"]);
+        assert_eq!(calls[0].timeout_secs, 120);
+    }
+
+    #[test]
+    fn exec_schema_advertises_container_fields() {
+        let schema = tool_schema(TOOL_EXEC_COMMAND);
+        let props = &schema["properties"];
+        assert_eq!(props["driver"]["enum"][1], "container");
+        assert_eq!(props["image"]["type"], "string");
+        assert_eq!(props["no_network"]["type"], "boolean");
+        assert_eq!(props["volumes"]["type"], "array");
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("command")));
     }
 
     #[tokio::test]

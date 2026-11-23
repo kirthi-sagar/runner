@@ -138,7 +138,11 @@ async fn mcp_tools_list_pins_twelve_names_and_schemas() {
             "properties": {
                 "command": { "type": "array", "items": { "type": "string" } },
                 "timeout_secs": { "type": "integer" },
-                "env": { "type": "object" }},
+                "env": { "type": "object" },
+                "driver": { "type": "string", "enum": ["process", "container"] },
+                "image": { "type": "string" },
+                "no_network": { "type": "boolean" },
+                "volumes": { "type": "array", "items": { "type": "string" } }},
             "required": ["command"]}),
     );
     expected.insert(

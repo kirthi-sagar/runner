@@ -399,6 +399,20 @@ pub struct SandboxProfile {
     pub firecracker_bin: Option<PathBuf>,
     #[serde(default)]
     pub strict: Option<bool>,
+    /// OCI tier knobs (`[sandbox.container]` in runner.toml).
+    #[serde(default)]
+    pub container: Option<SandboxContainerProfile>,
+}
+
+/// Intuitive OCI container knobs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SandboxContainerProfile {
+    #[serde(default)]
+    pub runtime_path: Option<PathBuf>,
+    #[serde(default)]
+    pub default_image: Option<String>,
+    #[serde(default)]
+    pub no_network: Option<bool>,
 }
 
 /// Intuitive security knobs.
@@ -480,6 +494,17 @@ impl RunnerProfile {
                 }
                 if let Some(strict) = sandbox.strict {
                     config.sandbox.strict = strict;
+                }
+                if let Some(container) = &sandbox.container {
+                    if let Some(path) = &container.runtime_path {
+                        config.sandbox.container.runtime_path = Some(path.clone());
+                    }
+                    if let Some(image) = &container.default_image {
+                        config.sandbox.container.default_image = Some(image.clone());
+                    }
+                    if let Some(no_network) = container.no_network {
+                        config.sandbox.container.no_network = no_network;
+                    }
                 }
             }
             None => {
@@ -836,6 +861,10 @@ pub struct SandboxContainerConfig {
     /// Default container image when the workload names none.
     #[serde(default)]
     pub default_image: Option<String>,
+    /// Isolate container networking to loopback only by default
+    /// (default false; `--no-network` also engages per run).
+    #[serde(default)]
+    pub no_network: bool,
 }
 
 fn default_sandbox_driver() -> String {
@@ -1065,7 +1094,7 @@ mod tests {
         assert_eq!(config.sandbox.container.default_image, None);
         // Full override.
         let config: RunnerConfig = toml::from_str(
-            "[sandbox.container]\nruntime_path = \"/usr/bin/crun\"\ndefault_image = \"ubuntu:24.04\"\n",
+            "[sandbox.container]\nruntime_path = \"/usr/bin/crun\"\ndefault_image = \"ubuntu:24.04\"\nno_network = true\n",
         )
         .unwrap();
         assert_eq!(
@@ -1076,6 +1105,8 @@ mod tests {
             config.sandbox.container.default_image.as_deref(),
             Some("ubuntu:24.04")
         );
+        assert!(config.sandbox.container.no_network);
+        assert!(!SandboxContainerConfig::default().no_network);
         // Profile layer accepts the container driver too.
         let mut config = RunnerConfig::default();
         let profile = RunnerProfile {
@@ -1200,6 +1231,34 @@ mod tests {
         assert_eq!(config.governor.warn_cpu_psi, 70.0);
         assert_eq!(config.governor.crit_cpu_psi, 90.0);
         assert_eq!(config.sandbox.driver, "process");
+    }
+
+    #[test]
+    fn profile_container_section_applies_with_precedence() {
+        let profile: RunnerProfile = toml::from_str(
+            "[sandbox.container]\nruntime_path = \"/usr/bin/crun\"\ndefault_image = \"ubuntu:24.04\"\nno_network = true\n",
+        )
+        .unwrap();
+        let mut config = RunnerConfig::default();
+        assert!(profile.apply_to(&mut config).is_empty());
+        assert_eq!(
+            config.sandbox.container.runtime_path,
+            Some(PathBuf::from("/usr/bin/crun"))
+        );
+        assert_eq!(
+            config.sandbox.container.default_image.as_deref(),
+            Some("ubuntu:24.04")
+        );
+        assert!(config.sandbox.container.no_network);
+        // Absent subsection leaves config.toml values alone.
+        let bare: RunnerProfile = toml::from_str("[sandbox]\ndriver = \"process\"\n").unwrap();
+        let mut config = RunnerConfig::default();
+        config.sandbox.container.default_image = Some("alpine:3".to_string());
+        assert!(bare.apply_to(&mut config).is_empty());
+        assert_eq!(
+            config.sandbox.container.default_image.as_deref(),
+            Some("alpine:3")
+        );
     }
 
     #[test]

@@ -240,6 +240,24 @@ fn check_ebpf() -> Check {
     }
 }
 
+/// OCI container runtime probe, pure over the probe outcome (the
+/// caller gathers via [`probe_oci_runtime`](runner_sandbox::oci::probe_oci_runtime)).
+fn check_container_runtime(probe: &Result<std::path::PathBuf, String>) -> Check {
+    match probe {
+        Ok(path) => {
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("runtime");
+            Check::pass("container", format!("{name} ({})", path.display()))
+        }
+        Err(_) => Check::warn(
+            "container",
+            "None detected. Install crun or runc for container sandboxing.".to_string(),
+        ),
+    }
+}
+
 async fn check_daemon() -> Check {
     check_daemon_at(&runner_core::ipc::resolve_sock_path()).await
 }
@@ -778,6 +796,9 @@ pub async fn run_all(
         check_userns(),
         check_kvm(),
         check_ebpf(),
+        check_container_runtime(&runner_sandbox::oci::probe_oci_runtime(
+            config.sandbox.container.runtime_path.as_deref(),
+        )),
         check_daemon().await,
         check_mcp(),
         check_cache(config),
@@ -1265,5 +1286,24 @@ mod tests {
         let dead = dir.path().join("absent.sock");
         let down = check_daemon_at(&dead).await;
         assert!(matches!(down.status, Status::Warn));
+    }
+
+    #[test]
+    fn container_runtime_check_formats() {
+        let found = check_container_runtime(&Ok(std::path::PathBuf::from("/usr/bin/crun")));
+        assert_eq!(found.name, "container");
+        assert!(matches!(found.status, Status::Pass));
+        assert_eq!(found.detail, "crun (/usr/bin/crun)");
+        let missing: Result<std::path::PathBuf, String> = Err("no OCI runtime found".to_string());
+        let absent = check_container_runtime(&missing);
+        assert!(matches!(absent.status, Status::Warn));
+        assert!(absent.detail.contains("None detected"), "{}", absent.detail);
+        // Renders through both surfaces.
+        let text = render_text(&[found.clone(), absent.clone()]);
+        assert!(text.contains("crun (/usr/bin/crun)"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&render_json(&[found, absent])).unwrap();
+        assert_eq!(json["checks"][0]["status"], "pass");
+        assert_eq!(json["checks"][0]["name"], "container");
+        assert_eq!(json["checks"][1]["status"], "warn");
     }
 }

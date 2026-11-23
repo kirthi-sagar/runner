@@ -149,7 +149,10 @@ guidance on credential rejection).
 
 `exec_command` — input: `command` (string array, required,
 non-empty), `timeout_secs` (integer, optional, default 60, ≥ 1),
-`env` (object, optional). Output on completion: `code`, `stdout`,
+`env` (object, optional), `driver` (`process` default |
+`container`), plus container-only `image` (string),
+`no_network` (boolean), `volumes` (string array of
+`host:container[:ro]`). Output on completion: `code`, `stdout`,
 `stderr`, `elapsed_secs`, `timeout: false`. Output on timeout:
 `timeout: true`, `elapsed_secs` (data, not an RPC error).
 

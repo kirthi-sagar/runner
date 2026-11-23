@@ -204,6 +204,15 @@ enum Commands {
         /// Fail closed instead of running unsandboxed when Tier-2 is unavailable
         #[arg(long, default_value_t = false)]
         strict: bool,
+        /// Container image (container tier; falls back to [sandbox.container] default_image)
+        #[arg(long)]
+        image: Option<String>,
+        /// Container tier: isolate networking to loopback only
+        #[arg(long, default_value_t = false)]
+        no_network: bool,
+        /// Container bind mount host:container[:ro] (repeatable; container tier)
+        #[arg(short, long)]
+        volume: Vec<String>,
     },
 }
 
@@ -1265,16 +1274,48 @@ async fn cmd_exec_microvm(
 }
 
 /// `runner exec --driver container`: route through the OCI engine.
-/// The probe fails closed before any spawn when no runtime resolves.
+/// Image resolves flag-over-config (fail closed when neither);
+/// volumes parse up front (fail closed on malformed specs); the
+/// probe fails closed before any spawn when no runtime resolves.
 async fn cmd_exec_container(
     config: &RunnerConfig,
     command: &[String],
     timeout: std::time::Duration,
+    image: Option<String>,
+    no_network: bool,
+    volumes: Vec<String>,
 ) {
     use runner_sandbox::driver::{SandboxDriver, SandboxEngine};
+    use runner_sandbox::oci::{parse_volume_spec, resolve_container_image, ContainerLaunch};
 
-    let engine = SandboxEngine::new(SandboxDriver::Container)
-        .with_container_config(config.sandbox.container.clone());
+    let image = match resolve_container_image(image.as_deref(), &config.sandbox.container) {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln!("runner exec failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut parsed_volumes = Vec::with_capacity(volumes.len());
+    for spec in &volumes {
+        match parse_volume_spec(spec) {
+            Ok(volume) => parsed_volumes.push(volume),
+            Err(e) => {
+                eprintln!("runner exec failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let launch = ContainerLaunch {
+        runtime_override: config.sandbox.container.runtime_path.clone(),
+        command: command.to_vec(),
+        timeout,
+        volumes: parsed_volumes,
+        network_egress_filtering: config.security.network_egress_filtering,
+        image,
+        no_network: no_network || config.sandbox.container.no_network,
+        env: None,
+    };
+    let engine = SandboxEngine::new(SandboxDriver::Container).with_container_launch(launch);
     match engine.execute(command, timeout).await {
         Ok(code) => std::process::exit(code),
         Err(e) => {
@@ -1700,6 +1741,9 @@ async fn main() -> Result<()> {
             timeout_mins,
             driver,
             strict,
+            image,
+            no_network,
+            volume,
         } => {
             let timeout = std::time::Duration::from_secs(timeout_mins.max(1) * 60);
             let strict = runner_core::config::is_strict(strict, &config);
@@ -1715,7 +1759,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             if tier == runner_sandbox::driver::SandboxDriver::Container {
-                cmd_exec_container(&config, &command, timeout).await;
+                cmd_exec_container(&config, &command, timeout, image, no_network, volume).await;
                 return Ok(());
             }
             match runner_providers::providers::local::execute_local_sandboxed(

@@ -67,6 +67,66 @@ impl CliAgentTools {
         }
         Ok(res["result"].clone())
     }
+
+    /// Container-tier exec: resolve image/volumes against config, run
+    /// captured. Agent env merges over the host (same contract as the
+    /// process tier's inherited-plus-override environment).
+    async fn exec_container(
+        &self,
+        request: runner_core::mcp::tools::ExecRequest,
+    ) -> Result<serde_json::Value, ToolError> {
+        use runner_sandbox::oci::{
+            execute_container_captured, parse_volume_spec, resolve_container_image, ContainerLaunch,
+        };
+
+        let mut volumes = Vec::with_capacity(request.volumes.len());
+        for spec in &request.volumes {
+            match parse_volume_spec(spec) {
+                Ok(volume) => volumes.push(volume),
+                Err(e) => return Err(ToolError::invalid_params(e)),
+            }
+        }
+        let image =
+            match resolve_container_image(request.image.as_deref(), &self.config.sandbox.container)
+            {
+                Ok(image) => image,
+                Err(e) => return Err(ToolError::invalid_params(e)),
+            };
+        let mut env: std::collections::HashMap<String, String> = std::env::vars().collect();
+        for (key, value) in request.env {
+            env.insert(key, value);
+        }
+        let launch = ContainerLaunch {
+            runtime_override: self.config.sandbox.container.runtime_path.clone(),
+            command: request.command,
+            timeout: Duration::from_secs(request.timeout_secs),
+            volumes,
+            network_egress_filtering: self.config.security.network_egress_filtering,
+            image,
+            no_network: request.no_network || self.config.sandbox.container.no_network,
+            env: Some(env.into_iter().map(|(k, v)| format!("{k}={v}")).collect()),
+        };
+        let start = Instant::now();
+        match execute_container_captured(launch).await {
+            Ok(out) => Ok(serde_json::json!({
+                "code": out.code,
+                "stdout": String::from_utf8_lossy(&out.stdout),
+                "stderr": String::from_utf8_lossy(&out.stderr),
+                "elapsed_secs": start.elapsed().as_secs_f64(),
+                "timeout": false,
+            })),
+            Err(e) => {
+                if e.contains("timed out") {
+                    Ok(serde_json::json!({
+                        "timeout": true,
+                        "elapsed_secs": start.elapsed().as_secs_f64(),
+                    }))
+                } else {
+                    Err(ToolError::internal(e))
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -96,18 +156,19 @@ impl AgentTools for CliAgentTools {
 
     async fn exec(
         &self,
-        command: Vec<String>,
-        timeout_secs: u64,
-        env: Vec<(String, String)>,
+        request: runner_core::mcp::tools::ExecRequest,
     ) -> Result<serde_json::Value, ToolError> {
+        if request.driver == "container" {
+            return self.exec_container(request).await;
+        }
         let start = Instant::now();
         // Sandbox when the kernel allows it, governed-direct otherwise —
         // the same default as `runner exec`.
         match runner_providers::providers::local::execute_captured(
-            &command,
-            &env,
+            &request.command,
+            &request.env,
             false,
-            Duration::from_secs(timeout_secs),
+            Duration::from_secs(request.timeout_secs),
         )
         .await
         {
@@ -307,5 +368,71 @@ impl AgentTools for CliAgentTools {
 
     async fn fleet_topology(&self) -> Result<serde_json::Value, ToolError> {
         self.daemon("fleet_topology", None).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use runner_core::mcp::tools::{AgentTools, ExecRequest};
+
+    fn container_request() -> ExecRequest {
+        ExecRequest {
+            command: vec!["true".to_string()],
+            timeout_secs: 10,
+            env: vec![],
+            driver: "container".to_string(),
+            image: Some("test:latest".to_string()),
+            no_network: false,
+            volumes: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_container_rejects_bad_inputs_without_spawn() {
+        let agent = CliAgentTools::new(RunnerConfig::default());
+        // Malformed volume spec.
+        let mut bad_volumes = container_request();
+        bad_volumes.volumes = vec![":::".to_string()];
+        let err = agent.exec(bad_volumes).await.unwrap_err();
+        assert_eq!(err.code, -32602);
+        // Missing image and no configured default.
+        let mut no_image = container_request();
+        no_image.image = None;
+        let err = agent.exec(no_image).await.unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("default_image"), "{}", err.message);
+        // Bogus runtime override fails at the probe (internal: the
+        // inputs parsed, the host lacks the binary).
+        let mut config = RunnerConfig::default();
+        config.sandbox.container.runtime_path =
+            Some(std::path::PathBuf::from("/nonexistent/oci-runtime"));
+        let agent = CliAgentTools::new(config);
+        let err = agent.exec(container_request()).await.unwrap_err();
+        assert_eq!(err.code, -32603);
+        assert!(
+            err.message.contains("not a runnable binary"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_container_captures_shim_output() {
+        let dir = runner_core::test_support::TempDir::new("agent-ctr").unwrap();
+        let shim = dir.path().join("echo-rt");
+        std::fs::write(&shim, "#!/bin/sh\necho OUT; echo ERR >&2; exit 3\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = RunnerConfig::default();
+        config.sandbox.container.runtime_path = Some(shim);
+        let agent = CliAgentTools::new(config);
+        let out = agent.exec(container_request()).await.unwrap();
+        assert_eq!(out["code"], 3);
+        assert_eq!(out["stdout"], "OUT\n");
+        assert_eq!(out["stderr"], "ERR\n");
+        assert_eq!(out["timeout"], false);
+        assert!(out["elapsed_secs"].as_f64().unwrap() >= 0.0);
     }
 }

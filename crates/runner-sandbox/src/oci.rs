@@ -235,10 +235,23 @@ fn default_mounts() -> Vec<OciMount> {
     ]
 }
 
+/// Caller-specified container volume (host bind).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciVolume {
+    pub source: PathBuf,
+    pub destination: String,
+    pub readonly: bool,
+}
+
 impl OciBundleSpec {
     /// Minimal runnable bundle: entrypoint argv + env, cwd `/workspace`,
     /// rootless userns mapped 1:1 to the invoker, default mounts,
     /// read-only rootfs, no resource limits (see [`with_limits`](Self::with_limits)).
+    /// Networking defaults to the host namespace (docker parity for
+    /// CI workloads; the [`EgressGuard`](crate::egress::EgressGuard)
+    /// filters host egress) — see
+    /// [`with_offline_network`](Self::with_offline_network) for
+    /// loopback-only isolation.
     pub fn new(args: Vec<String>, env: Vec<String>) -> Self {
         let (uid, gid) = invoker_ids();
         Self {
@@ -258,7 +271,7 @@ impl OciBundleSpec {
             hostname: "runner-job".to_string(),
             mounts: default_mounts(),
             linux: OciLinux {
-                namespaces: ["pid", "network", "mount", "ipc", "uts", "user"]
+                namespaces: ["pid", "mount", "ipc", "uts", "user"]
                     .into_iter()
                     .map(|ns| OciNamespace {
                         ns_type: ns.to_string(),
@@ -277,6 +290,35 @@ impl OciBundleSpec {
                 resources: None,
             },
         }
+    }
+
+    /// Loopback-only isolation: `true` confines the container to
+    /// a fresh network namespace holding only the `lo` interface (no
+    /// veth is ever provisioned, so nothing leaves the box);
+    /// `false` shares the host namespace (the default). Idempotent
+    /// in both directions; the canonical namespace order is kept.
+    /// Note: a fresh netns starts with `lo` down — workloads needing
+    /// loopback must bring it up (a prestart hook lands with the
+    /// runtime integration that needs it).
+    pub fn with_offline_network(mut self, offline: bool) -> Self {
+        self.linux.namespaces.retain(|ns| ns.ns_type != "network");
+        if offline {
+            // Canonical position: pid, network, mount, ...
+            let at = self
+                .linux
+                .namespaces
+                .iter()
+                .position(|ns| ns.ns_type == "pid")
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            self.linux.namespaces.insert(
+                at,
+                OciNamespace {
+                    ns_type: "network".to_string(),
+                },
+            );
+        }
+        self
     }
 
     /// Extra bind mount (host `source` → container `destination`).
@@ -336,6 +378,16 @@ impl OciBundleSpec {
     /// Serialize to the bundle `config.json` value.
     pub fn to_json(&self) -> Result<serde_json::Value, String> {
         serde_json::to_value(self).map_err(|e| format!("cannot encode bundle spec: {e}"))
+    }
+
+    /// Attach caller-specified volumes (each validated like
+    /// [`with_mount`](Self::with_mount): `/home` host sources fail
+    /// closed before anything is written or spawned).
+    pub fn with_volumes(mut self, volumes: &[OciVolume]) -> Result<Self, String> {
+        for volume in volumes {
+            self = self.with_mount(&volume.source, &volume.destination, volume.readonly)?;
+        }
+        Ok(self)
     }
 }
 
@@ -423,8 +475,9 @@ impl OciBundleGuard {
         }
     }
 
-    /// Force-delete the container (bounded) and scrub the bundle.
-    /// Idempotent: safe to call on every exit path.
+    /// Force-delete the container (bounded), then cryptographically
+    /// scrub the workspace and remove the bundle (same guarantee as
+    /// process-tier workspaces). Idempotent: safe on every exit path.
     async fn teardown(&mut self) {
         let Some(dir) = self.dir.take() else {
             return;
@@ -437,7 +490,7 @@ impl OciBundleGuard {
             .kill_on_drop(true)
             .status();
         let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, delete).await;
-        let _ = std::fs::remove_dir_all(&dir);
+        crate::mounts::scrub_workspace(&dir);
     }
 }
 
@@ -450,7 +503,7 @@ impl Drop for OciBundleGuard {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
-            let _ = std::fs::remove_dir_all(&dir);
+            crate::mounts::scrub_workspace(&dir);
         }
     }
 }
@@ -566,21 +619,25 @@ async fn supervise_container(
     Ok(code)
 }
 
-/// Execute one command in an ephemeral OCI container: probe, bundle,
-/// spawn, supervise, tear down. The probe runs first so a missing
-/// runtime fails closed before touching disk or spawn — in every
-/// mode (there is no tier fallback to gate, so `--strict` needs no
-/// separate branch).
+/// Execute one command in an ephemeral OCI container: guard, probe,
+/// bundle, spawn, supervise, tear down. The egress guard and the
+/// runtime probe both run before any setup so failures abort before
+/// touching disk or spawn — in every mode (there is no tier fallback
+/// to gate, so `--strict` needs no separate branch).
 pub async fn execute_container(
     runtime_override: Option<&Path>,
     command: &[String],
     timeout: std::time::Duration,
+    volumes: &[OciVolume],
+    network_egress_filtering: bool,
 ) -> Result<i32, String> {
     execute_container_in(
         &crate::mounts::job_root(),
         runtime_override,
         command,
         timeout,
+        volumes,
+        network_egress_filtering,
     )
     .await
 }
@@ -592,13 +649,20 @@ async fn execute_container_in(
     runtime_override: Option<&Path>,
     command: &[String],
     timeout: std::time::Duration,
+    volumes: &[OciVolume],
+    network_egress_filtering: bool,
 ) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command to execute".to_string());
     }
+    // Egress boundary first (mirrors the process tier): held across
+    // the whole lifecycle; acquisition failure aborts unfiltered-never.
+    let _egress_guard = crate::egress::EgressGuard::acquire(network_egress_filtering)?;
     let runtime = probe_oci_runtime(runtime_override)?;
     let id = next_container_id();
-    let spec = OciBundleSpec::new(command.to_vec(), host_env());
+    // Volumes validate before anything is written: a /home source
+    // fails closed with no bundle and no spawn.
+    let spec = OciBundleSpec::new(command.to_vec(), host_env()).with_volumes(volumes)?;
     let dir = assemble_bundle_at(bundle_parent, &id, &spec)?;
     let mut guard = OciBundleGuard::new(runtime.clone(), id.clone(), dir.clone());
     let argv = match runtime_argv(&runtime, &dir, &id) {
@@ -739,10 +803,9 @@ mod tests {
             .iter()
             .map(|ns| ns["type"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            namespaces,
-            vec!["pid", "network", "mount", "ipc", "uts", "user"]
-        );
+        // Host-networked by default (docker parity); offline mode
+        // adds the isolated namespace (see below).
+        assert_eq!(namespaces, vec!["pid", "mount", "ipc", "uts", "user"]);
         // Workspace tmpfs mount present.
         let workspace = json["mounts"]
             .as_array()
@@ -760,6 +823,42 @@ mod tests {
         // Rootless 1:1 identity mapping anchored at container 0.
         assert_eq!(json["linux"]["uidMappings"][0]["containerID"], 0);
         assert_eq!(json["linux"]["uidMappings"][0]["size"], 1);
+    }
+
+    fn namespace_types(spec: &OciBundleSpec) -> Vec<String> {
+        spec.linux
+            .namespaces
+            .iter()
+            .map(|ns| ns.ns_type.clone())
+            .collect()
+    }
+
+    #[test]
+    fn offline_mode_emits_loopback_only_namespace() {
+        let base = OciBundleSpec::new(vec!["x".to_string()], vec![]);
+        // Default shares the host network namespace...
+        assert!(!namespace_types(&base).contains(&"network".to_string()));
+        // ...offline confines to a fresh netns (lo-only: no veth is
+        // ever provisioned), in canonical position, idempotently...
+        let offline = base.clone().with_offline_network(true);
+        assert_eq!(
+            namespace_types(&offline),
+            vec!["pid", "network", "mount", "ipc", "uts", "user"]
+        );
+        let json = offline.to_json().unwrap();
+        let types: Vec<&str> = json["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ns| ns["type"].as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"network"));
+        // ...and back off restores the default.
+        let online = offline.with_offline_network(false);
+        assert_eq!(
+            namespace_types(&online),
+            vec!["pid", "mount", "ipc", "uts", "user"]
+        );
     }
 
     #[test]
@@ -823,6 +922,8 @@ mod tests {
                 Some(&shim),
                 &["true".to_string()],
                 std::time::Duration::from_secs(10),
+                &[],
+                false,
             )
             .await
             .unwrap();
@@ -850,6 +951,8 @@ mod tests {
             Some(&shim),
             &["true".to_string()],
             std::time::Duration::from_secs(1),
+            &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -874,6 +977,8 @@ mod tests {
             Some(&dir.path().join("no-such-runtime")),
             &["touch".to_string(), marker.display().to_string()],
             std::time::Duration::from_secs(5),
+            &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -891,6 +996,8 @@ mod tests {
             Some(&docker),
             &["true".to_string()],
             std::time::Duration::from_secs(5),
+            &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -915,6 +1022,8 @@ mod tests {
             Some(&garbage),
             &["true".to_string()],
             std::time::Duration::from_secs(5),
+            &[],
+            false,
         )
         .await
         .unwrap_err();
@@ -1006,5 +1115,72 @@ mod tests {
             .unwrap();
         assert_eq!(mount.mount_type.as_deref(), Some("bind"));
         assert!(mount.options.contains(&"ro".to_string()));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_home_volume_before_setup() {
+        let dir = runner_core::test_support::TempDir::new("oci-homevol").unwrap();
+        let parent = bundle_parent(dir.path());
+        // A /home host source fails closed: no bundle, no spawn. The
+        // override passes the probe but is never spawned (portable:
+        // no shell needed).
+        let volumes = vec![OciVolume {
+            source: PathBuf::from("/home/dev/data"),
+            destination: "/data".to_string(),
+            readonly: true,
+        }];
+        let runtime = fake_runtime(dir.path(), "vol-rt");
+        let err = execute_container_in(
+            &parent,
+            Some(&runtime),
+            &["true".to_string()],
+            std::time::Duration::from_secs(5),
+            &volumes,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("/home"), "{err}");
+        assert_parent_empty(&parent);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_with_egress_boundary_completes_lifecycle() {
+        // Filtering enabled: the guard acquires (canary on CI),
+        // rides the lifecycle, and releases — the run succeeds and
+        // everything tears down.
+        let dir = runner_core::test_support::TempDir::new("oci-egress").unwrap();
+        let parent = bundle_parent(dir.path());
+        let shim = shim_script(dir.path(), "guard-rt", "exit 0");
+        let code = execute_container_in(
+            &parent,
+            Some(&shim),
+            &["true".to_string()],
+            std::time::Duration::from_secs(10),
+            &[],
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_parent_empty(&parent);
+    }
+
+    #[test]
+    fn egress_guard_disabled_bypasses() {
+        use crate::egress::EgressGuard;
+        assert!(EgressGuard::acquire(false).unwrap().is_none());
+    }
+
+    // Live acquisition needs no privileges off Windows (canary
+    // validation); on Windows it opens a real WFP session.
+    #[cfg(not(windows))]
+    #[test]
+    fn egress_guard_acquire_smoke() {
+        use crate::egress::EgressGuard;
+        let guard = EgressGuard::acquire(true).unwrap();
+        assert!(guard.is_some());
+        drop(guard);
     }
 }

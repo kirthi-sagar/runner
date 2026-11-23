@@ -359,4 +359,19 @@ mod tests {
         assert_eq!(scrub_workspace(dir.path()), 2);
         assert!(!dir.path().exists());
     }
+
+    #[test]
+    fn scrub_randomizes_bytes_in_place() {
+        let dir = runner_core::test_support::TempDir::new("scrub-bytes").unwrap();
+        let secret = dir.path().join("secret.bin");
+        // 4KB of zeros: any surviving run proves a missed overwrite.
+        std::fs::write(&secret, vec![0u8; 4096]).unwrap();
+        scrub_file(&secret).unwrap();
+        let after = std::fs::read(&secret).unwrap();
+        assert_eq!(after.len(), 4096);
+        assert!(
+            after.iter().any(|b| *b != 0),
+            "scrub left all-zero bytes behind"
+        );
+    }
 }

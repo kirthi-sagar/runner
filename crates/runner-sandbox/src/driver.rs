@@ -145,10 +145,15 @@ impl SandboxEngine {
             }
             SandboxDriver::MicroVm => self.execute_microvm(command, timeout).await,
             SandboxDriver::Container => {
+                // No caller-specified volumes yet (no config source;
+                // lands with the volume plumbing); the engine's egress
+                // flag governs the lifecycle boundary.
                 crate::oci::execute_container(
                     self.container.runtime_path.as_deref(),
                     command,
                     timeout,
+                    &[],
+                    self.network_egress_filtering,
                 )
                 .await
             }

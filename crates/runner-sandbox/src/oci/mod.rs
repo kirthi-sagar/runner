@@ -1,6 +1,8 @@
-//! OCI container tier: host runtime probing and v1.0.2 bundle
-//! generation. Phase 1 ships discovery + spec emission; execution
-//! binds a probed runtime in a later phase.
+//! OCI container tier: host runtime probing, v1.0.2 bundle
+//! generation, rootless execution, and daemonless registry pulls
+//! ([`registry`] resolves references to verified layer descriptors).
+
+pub mod registry;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

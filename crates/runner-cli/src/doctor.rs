@@ -253,7 +253,7 @@ fn check_container_runtime(probe: &Result<std::path::PathBuf, String>) -> Check 
         }
         Err(_) => Check::warn(
             "container",
-            "None detected. Install crun or runc for container sandboxing.".to_string(),
+            format!("None detected. {}", runner_sandbox::oci::install_guidance()),
         ),
     }
 }
@@ -1298,6 +1298,13 @@ mod tests {
         let absent = check_container_runtime(&missing);
         assert!(matches!(absent.status, Status::Warn));
         assert!(absent.detail.contains("None detected"), "{}", absent.detail);
+        assert!(
+            absent
+                .detail
+                .contains(runner_sandbox::oci::install_guidance()),
+            "{}",
+            absent.detail
+        );
         // Renders through both surfaces.
         let text = render_text(&[found.clone(), absent.clone()]);
         assert!(text.contains("crun (/usr/bin/crun)"), "{text}");

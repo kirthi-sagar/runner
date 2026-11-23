@@ -187,6 +187,11 @@ enum Commands {
         #[command(subcommand)]
         command: CacheCommands,
     },
+    /// Pull, list, and prune OCI container images in the local layer cache
+    Image {
+        #[command(subcommand)]
+        command: ImageCommands,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -343,6 +348,23 @@ enum CacheCommands {
         #[arg(long, default_value = "text")]
         format: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ImageCommands {
+    /// Fetch an image manifest and its layers into the local cache
+    Pull {
+        /// Image reference (registry/repository:tag)
+        image: String,
+    },
+    /// List cached images, layer digests, and disk usage
+    List {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Remove unreferenced layer blobs and stale staging files
+    Prune,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1222,6 +1244,66 @@ async fn cmd_cache_clear(all: bool, older_than: Option<u64>) -> Result<()> {
     Ok(())
 }
 
+/// `runner image pull`: resolve, download, verify, and record one image.
+async fn cmd_image_pull(config: &RunnerConfig, image: &str) -> Result<()> {
+    use runner_cli::image::{open_store, pull_image};
+
+    let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
+    match pull_image(&cache, &store, image).await {
+        Ok(outcome) => {
+            println!(
+                "pulled {} ({}, {} layers, {})",
+                outcome.reference,
+                outcome.manifest_digest,
+                outcome.layers,
+                runner_cli::cache::format_bytes(outcome.bytes),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("runner image pull failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `runner image list`: cached images, layer digests, and disk usage.
+fn cmd_image_list(config: &RunnerConfig, format: &str) -> Result<()> {
+    use runner_cli::image::{list_images, open_store, render_list_json, render_list_text};
+
+    let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
+    let images = list_images(&store, &cache);
+    match format.trim().to_ascii_lowercase().as_str() {
+        "text" => print!("{}", render_list_text(&images)),
+        "json" => println!("{}", render_list_json(&images)),
+        other => anyhow::bail!("unsupported image list format {other:?}: want text|json"),
+    }
+    Ok(())
+}
+
+/// `runner image prune`: drop unreferenced blobs and stale staging files.
+fn cmd_image_prune(config: &RunnerConfig) -> Result<()> {
+    use runner_cli::image::{open_store, prune_cache, PRUNE_TMP_GRACE};
+
+    let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
+    match prune_cache(&store, &cache, PRUNE_TMP_GRACE) {
+        Ok(outcome) => {
+            println!(
+                "pruned {} blobs ({}) and {} staging files ({})",
+                outcome.blobs_removed,
+                runner_cli::cache::format_bytes(outcome.blobs_bytes),
+                outcome.tmps_removed,
+                runner_cli::cache::format_bytes(outcome.tmps_bytes),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("runner image prune failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `runner hook uninstall`: remove the managed hook, restore backup.
 fn cmd_hook_uninstall() -> Result<()> {
     use runner_cli::hook::uninstall;
@@ -1314,6 +1396,8 @@ async fn cmd_exec_container(
         image,
         no_network: no_network || config.sandbox.container.no_network,
         env: None,
+        auto_pull: config.sandbox.container.auto_pull,
+        layer_cache_dir: config.sandbox.container.cache_dir.clone(),
     };
     let engine = SandboxEngine::new(SandboxDriver::Container).with_container_launch(launch);
     match engine.execute(command, timeout).await {
@@ -1733,6 +1817,17 @@ async fn main() -> Result<()> {
             }
             CacheCommands::Peers { format } => {
                 cmd_cache_peers(&format).await?;
+            }
+        },
+        Commands::Image { command } => match command {
+            ImageCommands::Pull { image } => {
+                cmd_image_pull(&config, &image).await?;
+            }
+            ImageCommands::List { format } => {
+                cmd_image_list(&config, &format)?;
+            }
+            ImageCommands::Prune => {
+                cmd_image_prune(&config)?;
             }
         },
         Commands::Exec {

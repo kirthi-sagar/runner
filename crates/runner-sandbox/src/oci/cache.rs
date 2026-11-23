@@ -103,6 +103,154 @@ impl LayerCache {
             .map_err(|e| format!("cannot commit layer {}: {e}", path.display()))?;
         Ok(path)
     }
+
+    /// Staging files older than `grace` (crashed downloads; the grace
+    /// keeps a concurrent pull's live `.tmp` safe).
+    pub fn stale_tmps(&self, grace: std::time::Duration) -> Vec<PathBuf> {
+        let mut stale = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return stale;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_tmp = path.extension().is_some_and(|ext| ext == "tmp");
+            if !is_tmp {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified.elapsed().unwrap_or_default() > grace)
+                .unwrap_or(false);
+            if old {
+                stale.push(path);
+            }
+        }
+        stale
+    }
+}
+
+/// One cached layer entry inside a stored manifest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredLayer {
+    pub digest: String,
+    pub size: u64,
+}
+
+/// Resolved image record: which manifest a reference pulled, and the
+/// layers it needs. Written on every pull (tags are mutable, so the
+/// record always reflects the last resolution).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredManifest {
+    pub reference: String,
+    pub manifest_digest: String,
+    pub layers: Vec<StoredLayer>,
+    pub pulled_at_secs: u64,
+}
+
+/// Per-image manifest records under `<cache>/images/`, keyed by
+/// percent-escaped reference (injective: distinct refs never share
+/// a file).
+#[derive(Debug, Clone)]
+pub struct ImageStore {
+    dir: PathBuf,
+}
+
+/// Percent-escape a reference into a safe filename (unreserved bytes
+/// pass through; everything else becomes `%XX`, `%` first).
+fn escape_ref(reference: &str) -> String {
+    let mut out = String::with_capacity(reference.len());
+    for byte in reference.bytes() {
+        match byte {
+            b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+impl ImageStore {
+    pub fn new(cache_dir: &Path) -> Self {
+        Self {
+            dir: cache_dir.join("images"),
+        }
+    }
+
+    pub fn manifest_path(&self, reference: &str) -> PathBuf {
+        self.dir.join(format!("{}.json", escape_ref(reference)))
+    }
+
+    /// Read one record (`None` when missing or corrupt — caches are
+    /// disposable, so corruption self-heals on the next pull).
+    pub fn read_manifest(&self, reference: &str) -> Option<StoredManifest> {
+        let bytes = std::fs::read(self.manifest_path(reference)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    pub fn write_manifest(&self, reference: &str, manifest: &StoredManifest) -> Result<(), String> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("cannot create image store {}: {e}", self.dir.display()))?;
+        let bytes = serde_json::to_string_pretty(manifest)
+            .map_err(|e| format!("cannot encode manifest: {e}"))?;
+        std::fs::write(self.manifest_path(reference), bytes)
+            .map_err(|e| format!("cannot write manifest: {e}"))
+    }
+
+    /// All readable records (corrupt files skipped).
+    pub fn list_manifests(&self) -> Vec<(String, StoredManifest)> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Ok(manifest) = serde_json::from_slice::<StoredManifest>(&bytes) {
+                        out.push((manifest.reference.clone(), manifest));
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Layer blobs on disk that no manifest record references.
+    pub fn unreferenced_blobs(&self, cache: &LayerCache) -> Vec<PathBuf> {
+        use std::collections::HashSet;
+        let mut referenced = HashSet::new();
+        for (_, manifest) in self.list_manifests() {
+            for layer in manifest.layers {
+                referenced.insert(layer.digest);
+            }
+        }
+        let mut orphaned = Vec::new();
+        let Ok(entries) = std::fs::read_dir(cache.dir()) else {
+            return orphaned;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            // 64 lowercase hex chars with no extension: a layer blob.
+            let is_blob = name.len() == 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+                && path.extension().is_none();
+            if !is_blob {
+                continue;
+            }
+            if !referenced.contains(&format!("sha256:{name}")) {
+                orphaned.push(path);
+            }
+        }
+        orphaned.sort();
+        orphaned
+    }
 }
 
 #[cfg(test)]

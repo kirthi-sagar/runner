@@ -8,6 +8,7 @@ pub mod cloud;
 pub mod coordinator;
 pub mod doctor;
 pub mod hook;
+pub mod image;
 pub mod init;
 pub mod provider;
 pub mod service;

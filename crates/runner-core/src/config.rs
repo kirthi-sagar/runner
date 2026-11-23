@@ -851,8 +851,12 @@ pub struct SandboxConfig {
     pub container: SandboxContainerConfig,
 }
 
+fn default_auto_pull_true() -> bool {
+    true
+}
+
 /// OCI container tier settings.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxContainerConfig {
     /// Explicit OCI runtime binary override (default: probe
     /// `crun`/`runc`/`youki`/`podman`/`docker` on PATH, in order).
@@ -865,6 +869,26 @@ pub struct SandboxContainerConfig {
     /// (default false; `--no-network` also engages per run).
     #[serde(default)]
     pub no_network: bool,
+    /// Layer cache root override (default: platform cache dir).
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    /// Pull the image and unpack layers into the bundle rootfs at
+    /// launch (default true; `false` keeps the minimal rootfs for
+    /// hermetic/test environments).
+    #[serde(default = "default_auto_pull_true")]
+    pub auto_pull: bool,
+}
+
+impl Default for SandboxContainerConfig {
+    fn default() -> Self {
+        Self {
+            runtime_path: None,
+            default_image: None,
+            no_network: false,
+            cache_dir: None,
+            auto_pull: true,
+        }
+    }
 }
 
 fn default_sandbox_driver() -> String {
@@ -1087,14 +1111,20 @@ mod tests {
 
     #[test]
     fn sandbox_container_section_defaults_and_parses() {
-        // Missing section keeps defaults.
+        // Missing section keeps defaults (auto-pull on, no cache override).
         let config: RunnerConfig = toml::from_str("[sandbox]\n").unwrap();
         assert_eq!(config.sandbox.container, SandboxContainerConfig::default());
         assert_eq!(config.sandbox.container.runtime_path, None);
         assert_eq!(config.sandbox.container.default_image, None);
+        assert_eq!(config.sandbox.container.cache_dir, None);
+        assert!(config.sandbox.container.auto_pull);
+        // Explicit opt-out sticks.
+        let config: RunnerConfig =
+            toml::from_str("[sandbox.container]\nauto_pull = false\n").unwrap();
+        assert!(!config.sandbox.container.auto_pull);
         // Full override.
         let config: RunnerConfig = toml::from_str(
-            "[sandbox.container]\nruntime_path = \"/usr/bin/crun\"\ndefault_image = \"ubuntu:24.04\"\nno_network = true\n",
+            "[sandbox.container]\nruntime_path = \"/usr/bin/crun\"\ndefault_image = \"ubuntu:24.04\"\nno_network = true\ncache_dir = \"/var/cache/runner/layers\"\n",
         )
         .unwrap();
         assert_eq!(
@@ -1106,6 +1136,10 @@ mod tests {
             Some("ubuntu:24.04")
         );
         assert!(config.sandbox.container.no_network);
+        assert_eq!(
+            config.sandbox.container.cache_dir,
+            Some(PathBuf::from("/var/cache/runner/layers"))
+        );
         assert!(!SandboxContainerConfig::default().no_network);
         // Profile layer accepts the container driver too.
         let mut config = RunnerConfig::default();

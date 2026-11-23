@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod download;
+pub mod pull;
 pub mod registry;
 pub mod unpack;
 
@@ -57,11 +58,38 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
 /// Discover the OCI runtime binary: an explicit config override wins
 /// (a missing override fails closed naming the path); otherwise the
 /// first runnable candidate on PATH in [`OCI_RUNTIME_CANDIDATES`]
-/// order. Absence reports every name searched so `--strict` callers
-/// (and humans) get an actionable diagnostic; strict enforcement
-/// itself binds at execution time.
+/// order. Absence reports every name searched plus platform install
+/// guidance so `--strict` callers (and humans) get an actionable
+/// diagnostic; strict enforcement itself binds at execution time.
 pub fn probe_oci_runtime(explicit: Option<&Path>) -> Result<PathBuf, String> {
     probe_oci_runtime_with(explicit, &|name| find_on_path(name))
+}
+
+/// True on Windows Subsystem for Linux (either generation).
+fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/version")
+        .map(|version| version.to_ascii_lowercase().contains("microsoft"))
+        .unwrap_or(false)
+}
+
+/// Install guidance for the detected host platform (pure over
+/// injected facts for unit tests).
+fn install_guidance_for(os: &str, wsl: bool) -> &'static str {
+    if wsl {
+        return "install crun inside WSL2 (sudo apt install crun) or use podman";
+    }
+    match os {
+        "windows" => {
+            "install WSL2 (wsl --install) or Podman for Windows, or use --driver process (pure Windows NT)"
+        }
+        "macos" => "run brew install podman && podman machine start, or use --driver process (native Seatbelt)",
+        _ => "install crun or runc via apt, dnf, or pacman",
+    }
+}
+
+/// Install guidance for this host.
+pub fn install_guidance() -> &'static str {
+    install_guidance_for(std::env::consts::OS, is_wsl())
 }
 
 fn probe_oci_runtime_with(
@@ -84,8 +112,9 @@ fn probe_oci_runtime_with(
         }
     }
     Err(format!(
-        "no OCI runtime found on PATH (looked for {}); install one or set [sandbox.container] runtime_path",
-        OCI_RUNTIME_CANDIDATES.join(", ")
+        "no OCI runtime found on PATH (looked for {}); {} or set [sandbox.container] runtime_path",
+        OCI_RUNTIME_CANDIDATES.join(", "),
+        install_guidance()
     ))
 }
 
@@ -506,7 +535,7 @@ fn runtime_argv(runtime: &Path, bundle: &Path, id: &str) -> Result<Vec<String>, 
     if let Some(stem) = runtime.file_stem().and_then(|stem| stem.to_str()) {
         if stem == "podman" || stem == "docker" {
             return Err(format!(
-                "OCI runtime '{stem}' is a container engine: engine-backed execution needs image flows (later phase); override [sandbox.container] runtime_path with crun/runc/youki"
+                "OCI runtime '{stem}' is a container engine: engines manage their own image storage and are not dispatched yet; override [sandbox.container] runtime_path with crun/runc/youki"
             ));
         }
     }
@@ -671,6 +700,13 @@ pub struct ContainerLaunch {
     pub no_network: bool,
     /// Container environment (`None` inherits the host).
     pub env: Option<Vec<String>>,
+    /// Pull the image and unpack layers into the bundle rootfs
+    /// (`false` keeps the minimal rootfs: hermetic tests and the
+    /// config opt-out; production resolves this from config,
+    /// default true).
+    pub auto_pull: bool,
+    /// Layer cache root override (`None` uses the default dir).
+    pub layer_cache_dir: Option<PathBuf>,
 }
 
 impl Default for ContainerLaunch {
@@ -684,6 +720,8 @@ impl Default for ContainerLaunch {
             image: String::new(),
             no_network: false,
             env: None,
+            auto_pull: false,
+            layer_cache_dir: None,
         }
     }
 }
@@ -839,18 +877,48 @@ async fn launch_container(
                 .to_string(),
         );
     }
-    let runtime = probe_oci_runtime(launch.runtime_override.as_deref())?;
-    let id = next_container_id();
+    // Pure validations before any side effect: volumes validate here
+    // so a /home source fails closed with no bundle and no spawn.
     let env = launch.env.clone().unwrap_or_else(host_env);
-    // Volumes validate before anything is written: a /home source
-    // fails closed with no bundle and no spawn.
     let mut spec = OciBundleSpec::new(launch.command.clone(), env)
         .with_volumes(&launch.volumes)?
         .with_offline_network(launch.no_network);
     spec.annotations
         .insert("org.runner.image".to_string(), launch.image.clone());
+    let runtime = probe_oci_runtime(launch.runtime_override.as_deref())?;
+    let id = next_container_id();
+    // Auto-pull populates the bundle rootfs from cached layers (fresh
+    // pulls resolve + download first); without it the minimal rootfs
+    // stands (hermetic tests, config opt-out).
+    let pulled: Option<Vec<PathBuf>> = if launch.auto_pull {
+        let reference = registry::OciReference::parse(&launch.image)?;
+        let cache = cache::LayerCache::new(
+            launch
+                .layer_cache_dir
+                .clone()
+                .unwrap_or_else(cache::LayerCache::default_dir),
+        );
+        let store = cache::ImageStore::new(cache.dir());
+        let client = registry::RegistryClient::new();
+        let resolved = pull::ensure_image(&client, &cache, &store, &reference).await?;
+        Some(
+            resolved
+                .layers
+                .iter()
+                .map(|layer| cache.path_for(&layer.digest))
+                .collect::<Result<_, _>>()?,
+        )
+    } else {
+        None
+    };
     let dir = assemble_bundle_at(bundle_parent, &id, &spec)?;
     let mut guard = OciBundleGuard::new(runtime.clone(), id.clone(), dir.clone());
+    if let Some(layers) = &pulled {
+        if let Err(e) = unpack::unpack_layers(layers, &dir.join("rootfs")) {
+            guard.teardown().await;
+            return Err(e);
+        }
+    }
     let argv = match runtime_argv(&runtime, &dir, &id) {
         Ok(argv) => argv,
         Err(e) => {
@@ -1015,6 +1083,31 @@ mod tests {
             assert!(err.contains(candidate), "{err}");
         }
         assert!(err.contains("runtime_path"), "{err}");
+        assert!(err.contains(install_guidance()), "{err}");
+    }
+
+    #[test]
+    fn install_guidance_covers_every_platform() {
+        // Native Linux: distro package managers.
+        let linux = install_guidance_for("linux", false);
+        assert!(linux.contains("crun"), "{linux}");
+        assert!(linux.contains("apt"), "{linux}");
+        // WSL2 wins over the linux branch.
+        let wsl = install_guidance_for("linux", true);
+        assert!(wsl.contains("WSL2"), "{wsl}");
+        assert!(wsl.contains("sudo apt install crun"), "{wsl}");
+        // Native Windows: WSL2 or Podman, or the process tier.
+        let windows = install_guidance_for("windows", false);
+        assert!(windows.contains("wsl --install"), "{windows}");
+        assert!(windows.contains("Podman for Windows"), "{windows}");
+        assert!(windows.contains("--driver process"), "{windows}");
+        // macOS: podman machine or the Seatbelt tier.
+        let macos = install_guidance_for("macos", false);
+        assert!(macos.contains("brew install podman"), "{macos}");
+        assert!(macos.contains("podman machine start"), "{macos}");
+        assert!(macos.contains("Seatbelt"), "{macos}");
+        // Unknown unix falls back to the package-manager line.
+        assert!(install_guidance_for("freebsd", false).contains("crun"));
     }
 
     fn spec() -> OciBundleSpec {

@@ -128,6 +128,21 @@ impl OciReference {
         self.tag.clone().unwrap_or_else(|| DEFAULT_TAG.to_string())
     }
 
+    /// Canonical display/key form: `registry/repo:tag` or
+    /// `registry/repo@digest`.
+    pub fn normalized(&self) -> String {
+        if let Some(digest) = &self.digest {
+            format!("{}/{}@{}", self.registry, self.repository, digest)
+        } else {
+            format!(
+                "{}/{}:{}",
+                self.registry,
+                self.repository,
+                self.tag.clone().unwrap_or_else(|| DEFAULT_TAG.to_string())
+            )
+        }
+    }
+
     /// `http` for loopback registries (tests), `https` elsewhere —
     /// the same localhost exception docker itself honors.
     pub fn scheme(&self) -> &'static str {

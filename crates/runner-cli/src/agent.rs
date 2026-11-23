@@ -105,6 +105,8 @@ impl CliAgentTools {
             image,
             no_network: request.no_network || self.config.sandbox.container.no_network,
             env: Some(env.into_iter().map(|(k, v)| format!("{k}={v}")).collect()),
+            auto_pull: self.config.sandbox.container.auto_pull,
+            layer_cache_dir: self.config.sandbox.container.cache_dir.clone(),
         };
         let start = Instant::now();
         match execute_container_captured(launch).await {
@@ -390,7 +392,10 @@ mod tests {
 
     #[tokio::test]
     async fn exec_container_rejects_bad_inputs_without_spawn() {
-        let agent = CliAgentTools::new(RunnerConfig::default());
+        // Hermetic: no registry traffic (config defaults auto_pull on).
+        let mut hermetic = RunnerConfig::default();
+        hermetic.sandbox.container.auto_pull = false;
+        let agent = CliAgentTools::new(hermetic);
         // Malformed volume spec.
         let mut bad_volumes = container_request();
         bad_volumes.volumes = vec![":::".to_string()];
@@ -405,6 +410,7 @@ mod tests {
         // Bogus runtime override fails at the probe (internal: the
         // inputs parsed, the host lacks the binary).
         let mut config = RunnerConfig::default();
+        config.sandbox.container.auto_pull = false;
         config.sandbox.container.runtime_path =
             Some(std::path::PathBuf::from("/nonexistent/oci-runtime"));
         let agent = CliAgentTools::new(config);
@@ -426,6 +432,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut config = RunnerConfig::default();
+        config.sandbox.container.auto_pull = false;
         config.sandbox.container.runtime_path = Some(shim);
         let agent = CliAgentTools::new(config);
         let out = agent.exec(container_request()).await.unwrap();

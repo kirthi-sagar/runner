@@ -71,6 +71,7 @@ pub struct SandboxEngine {
     firecracker_bin: PathBuf,
     strict: bool,
     network_egress_filtering: bool,
+    container: runner_core::config::SandboxContainerConfig,
 }
 
 impl SandboxEngine {
@@ -81,6 +82,7 @@ impl SandboxEngine {
             firecracker_bin: PathBuf::from("firecracker"),
             strict: false,
             network_egress_filtering: false,
+            container: runner_core::config::SandboxContainerConfig::default(),
         }
     }
 
@@ -88,6 +90,15 @@ impl SandboxEngine {
     pub fn with_microvm(mut self, config: MicroVmConfig, firecracker_bin: PathBuf) -> Self {
         self.microvm = Some(config);
         self.firecracker_bin = firecracker_bin;
+        self
+    }
+
+    /// Attach the OCI settings used by the [`SandboxDriver::Container`] tier.
+    pub fn with_container_config(
+        mut self,
+        config: runner_core::config::SandboxContainerConfig,
+    ) -> Self {
+        self.container = config;
         self
     }
 
@@ -117,7 +128,9 @@ impl SandboxEngine {
     /// spawn where namespaces are unavailable), stdio inherited, timeout
     /// kills the child. MicroVM tier: boots the guest, dispatches the
     /// command over vsock to the in-guest agent, streams its stdio, and
-    /// tears the VM down.
+    /// tears the VM down. Container tier: probes the OCI runtime,
+    /// assembles an ephemeral bundle, streams stdio with timeout
+    /// escalation, and tears everything down.
     pub async fn execute(&self, command: &[String], timeout: Duration) -> Result<i32, String> {
         match self.driver {
             SandboxDriver::Process => {
@@ -131,12 +144,14 @@ impl SandboxEngine {
                 .await
             }
             SandboxDriver::MicroVm => self.execute_microvm(command, timeout).await,
-            // Phase 1 ships probing, config, and bundle generation;
-            // execution binds the runtime in a later phase. Fail
-            // closed (never fall through to another tier).
-            SandboxDriver::Container => Err("container tier execution is not implemented yet \
-                 (probing/config/bundle only)"
-                .to_string()),
+            SandboxDriver::Container => {
+                crate::oci::execute_container(
+                    self.container.runtime_path.as_deref(),
+                    command,
+                    timeout,
+                )
+                .await
+            }
         }
     }
 
@@ -316,16 +331,21 @@ mod tests {
         assert_eq!(SandboxDriver::Container.name(), "container");
     }
 
-    /// Phase 1 ships probing/config/bundle only: execution fails
-    /// closed (never falls through to another tier).
+    /// Missing runtime fails closed before any spawn (bogus
+    /// override: the probe rejects it naming the path).
     #[tokio::test]
-    async fn container_tier_execution_fails_closed() {
-        let engine = SandboxEngine::new(SandboxDriver::Container);
+    async fn container_tier_missing_runtime_fails_closed() {
+        let engine = SandboxEngine::new(SandboxDriver::Container).with_container_config(
+            runner_core::config::SandboxContainerConfig {
+                runtime_path: Some(PathBuf::from("/nonexistent/oci-runtime")),
+                default_image: None,
+            },
+        );
         let err = engine
             .execute(&["true".to_string()], Duration::from_secs(5))
             .await
             .unwrap_err();
-        assert!(err.contains("not implemented"), "{err}");
+        assert!(err.contains("not a runnable binary"), "{err}");
     }
 
     /// Exit-0 / exit-nonzero argv per platform (`true`/`false` don't

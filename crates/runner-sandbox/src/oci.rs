@@ -339,6 +339,297 @@ impl OciBundleSpec {
     }
 }
 
+/// Ring capacity for container stdio capture (tail only; the live
+/// streams always go to our own stdout/stderr).
+const RING_CAP_BYTES: usize = 32 * 1024;
+/// Grace drain between SIGTERM and SIGKILL on timeout.
+const TIMEOUT_GRACE: std::time::Duration = std::time::Duration::from_secs(4);
+/// Bound on the force-delete step so a wedged runtime cannot hang teardown.
+const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+type OutputRing = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u8>>>;
+
+/// Unique container id (`oci-<pid>-<n>`: runc-safe charset).
+fn next_container_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "oci-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+/// Host environment as `K=V` pairs (lossy: containers take bytes).
+fn host_env() -> Vec<String> {
+    std::env::vars_os()
+        .map(|(key, value)| format!("{}={}", key.to_string_lossy(), value.to_string_lossy()))
+        .collect()
+}
+
+/// Runtime CLI argv for one bundle: standalone runtimes share the
+/// `run --bundle <dir> <id>` shape (unknown override binaries are
+/// assumed compatible); engine CLIs (`podman`/`docker`) manage their
+/// own storage and fail closed with a deferral diagnostic.
+fn runtime_argv(runtime: &Path, bundle: &Path, id: &str) -> Result<Vec<String>, String> {
+    if let Some(stem) = runtime.file_stem().and_then(|stem| stem.to_str()) {
+        if stem == "podman" || stem == "docker" {
+            return Err(format!(
+                "OCI runtime '{stem}' is a container engine: engine-backed execution needs image flows (later phase); override [sandbox.container] runtime_path with crun/runc/youki"
+            ));
+        }
+    }
+    Ok(vec![
+        runtime.display().to_string(),
+        "run".to_string(),
+        "--bundle".to_string(),
+        bundle.display().to_string(),
+        id.to_string(),
+    ])
+}
+
+/// Assemble one ephemeral bundle: `<parent>/<id>/` with `config.json`
+/// plus a minimal `rootfs/` directory (image population lands with
+/// the engine flows; Phase 2 verifies lifecycle, not payloads).
+fn assemble_bundle_at(parent: &Path, id: &str, spec: &OciBundleSpec) -> Result<PathBuf, String> {
+    let dir = parent.join(id);
+    validate_no_home_mount(&[&dir])?;
+    std::fs::create_dir_all(dir.join("rootfs"))
+        .map_err(|e| format!("cannot stage container bundle {}: {e}", dir.display()))?;
+    let config = spec
+        .to_json()
+        .and_then(|json| serde_json::to_string_pretty(&json).map_err(|e| e.to_string()))
+        .map_err(|e| format!("cannot encode bundle spec: {e}"))?;
+    std::fs::write(dir.join("config.json"), config)
+        .map_err(|e| format!("cannot write bundle config {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// RAII bundle guard: explicit async teardown runs on every normal
+/// exit path; `Drop` is the panic/early-return backstop (sync,
+/// fire-and-forget — never waits, never panics).
+struct OciBundleGuard {
+    runtime: PathBuf,
+    id: String,
+    dir: Option<PathBuf>,
+}
+
+impl OciBundleGuard {
+    fn new(runtime: PathBuf, id: String, dir: PathBuf) -> Self {
+        Self {
+            runtime,
+            id,
+            dir: Some(dir),
+        }
+    }
+
+    /// Force-delete the container (bounded) and scrub the bundle.
+    /// Idempotent: safe to call on every exit path.
+    async fn teardown(&mut self) {
+        let Some(dir) = self.dir.take() else {
+            return;
+        };
+        let delete = tokio::process::Command::new(&self.runtime)
+            .args(["delete", "--force", self.id.as_str()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status();
+        let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, delete).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+impl Drop for OciBundleGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            let _ = std::process::Command::new(&self.runtime)
+                .args(["delete", "--force", self.id.as_str()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// Pump one pipe to our own stdio plus the shared tail ring.
+async fn pump_pipe<R, W>(mut reader: R, mut sink: W, ring: OutputRing)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = sink.write_all(&buf[..n]).await;
+                if let Ok(mut ring) = ring.lock() {
+                    ring.extend(buf[..n].iter().copied());
+                    while ring.len() > RING_CAP_BYTES {
+                        ring.pop_front();
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Timeout escalation: polite SIGTERM + grace drain, then a
+/// runtime-level `kill KILL` plus group SIGKILL and a direct child
+/// kill (best-effort at every step; Windows has no SIGTERM so it
+/// kills directly). Unix signals target the child's process group
+/// (fresh per spawn, so only our tree): orphaned grandchildren die
+/// with it instead of wedging the stdio pumps on held pipes.
+async fn escalate_timeout(child: &mut tokio::process::Child, runtime: &Path, id: &str) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // Recheck liveness first: never signal a possibly
+            // recycled pid when the child already reaped.
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            // Negative pid = process group (fresh group per spawn).
+            let group = nix::unistd::Pid::from_raw(-(pid as i32));
+            let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGTERM);
+            if tokio::time::timeout(TIMEOUT_GRACE, child.wait())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            let kill = tokio::process::Command::new(runtime)
+                .args(["kill", id, "KILL"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .status();
+            let _ = tokio::time::timeout(TIMEOUT_GRACE, kill).await;
+            let _ = nix::sys::signal::kill(group, nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (runtime, id);
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// Supervise one running container: stream stdio, enforce the
+/// timeout, propagate the exit code. Pumps always join before
+/// returning so no output or task is orphaned.
+async fn supervise_container(
+    child: &mut tokio::process::Child,
+    runtime: &Path,
+    id: &str,
+    timeout: std::time::Duration,
+) -> Result<i32, String> {
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err("container stdio pipes unavailable".to_string());
+    };
+    let ring: OutputRing = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+    let out_pump = tokio::spawn(pump_pipe(out, tokio::io::stdout(), ring.clone()));
+    let err_pump = tokio::spawn(pump_pipe(err, tokio::io::stderr(), ring.clone()));
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            let _ = tokio::join!(out_pump, err_pump);
+            return Err(format!("container wait failed: {e}"));
+        }
+        Err(_) => {
+            escalate_timeout(child, runtime, id).await;
+            let _ = tokio::join!(out_pump, err_pump);
+            return Err(format!("container timed out after {}s", timeout.as_secs()));
+        }
+    };
+    let _ = tokio::join!(out_pump, err_pump);
+    let code = status.code().unwrap_or(1);
+    if code != 0 {
+        if let Ok(ring) = ring.lock() {
+            if !ring.is_empty() {
+                let tail: Vec<u8> = ring.iter().copied().collect();
+                eprintln!(
+                    "runner: container exited {code}; last output:\n{}",
+                    String::from_utf8_lossy(&tail)
+                );
+            }
+        }
+    }
+    Ok(code)
+}
+
+/// Execute one command in an ephemeral OCI container: probe, bundle,
+/// spawn, supervise, tear down. The probe runs first so a missing
+/// runtime fails closed before touching disk or spawn — in every
+/// mode (there is no tier fallback to gate, so `--strict` needs no
+/// separate branch).
+pub async fn execute_container(
+    runtime_override: Option<&Path>,
+    command: &[String],
+    timeout: std::time::Duration,
+) -> Result<i32, String> {
+    execute_container_in(
+        &crate::mounts::job_root(),
+        runtime_override,
+        command,
+        timeout,
+    )
+    .await
+}
+
+/// [`execute_container`] with an explicit bundle parent (tests pin a
+/// temp dir; production always passes [`job_root`](crate::mounts::job_root)).
+async fn execute_container_in(
+    bundle_parent: &Path,
+    runtime_override: Option<&Path>,
+    command: &[String],
+    timeout: std::time::Duration,
+) -> Result<i32, String> {
+    if command.is_empty() {
+        return Err("no command to execute".to_string());
+    }
+    let runtime = probe_oci_runtime(runtime_override)?;
+    let id = next_container_id();
+    let spec = OciBundleSpec::new(command.to_vec(), host_env());
+    let dir = assemble_bundle_at(bundle_parent, &id, &spec)?;
+    let mut guard = OciBundleGuard::new(runtime.clone(), id.clone(), dir.clone());
+    let argv = match runtime_argv(&runtime, &dir, &id) {
+        Ok(argv) => argv,
+        Err(e) => {
+            guard.teardown().await;
+            return Err(e);
+        }
+    };
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    // Fresh process group per spawn: timeout escalation signals the
+    // whole tree (unix; no-op elsewhere).
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            guard.teardown().await;
+            return Err(format!("failed to spawn OCI runtime: {e}"));
+        }
+    };
+    let outcome = supervise_container(&mut child, &runtime, &id, timeout).await;
+    guard.teardown().await;
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +769,213 @@ mod tests {
         assert!(base.clone().with_limits(10001, 1024).is_err());
         assert!(base.clone().with_limits(100, 0).is_err());
         assert!(base.with_limits(100, 1024).is_ok());
+    }
+
+    #[test]
+    fn runtime_argv_dispatches_standalone_and_defers_engines() {
+        let bundle = PathBuf::from("/tmp/b");
+        // Standalone runtimes share the run --bundle shape.
+        for name in ["crun", "runc", "youki"] {
+            let argv = runtime_argv(Path::new(name), &bundle, "oci-1").unwrap();
+            assert_eq!(argv[1..4], ["run", "--bundle", "/tmp/b"]);
+            assert_eq!(argv[4], "oci-1");
+        }
+        // Unknown overrides are assumed runc-compatible.
+        let argv = runtime_argv(Path::new("/opt/my-runtime"), &bundle, "oci-1").unwrap();
+        assert_eq!(argv[0], "/opt/my-runtime");
+        // Engines manage their own storage: clean deferral.
+        for name in ["podman", "docker"] {
+            let err = runtime_argv(Path::new(name), &bundle, "oci-1").unwrap_err();
+            assert!(err.contains("engine"), "{err}");
+        }
+    }
+
+    /// Fake runtime shim script (unix: real shell execution).
+    #[cfg(unix)]
+    fn shim_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn bundle_parent(dir: &Path) -> PathBuf {
+        let parent = dir.join("bundles");
+        std::fs::create_dir_all(&parent).unwrap();
+        parent
+    }
+
+    fn assert_parent_empty(parent: &Path) {
+        let leftovers: Vec<_> = std::fs::read_dir(parent).unwrap().collect();
+        assert!(leftovers.is_empty(), "orphaned bundles: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_propagates_shim_exit_codes() {
+        let dir = runner_core::test_support::TempDir::new("oci-exit").unwrap();
+        let parent = bundle_parent(dir.path());
+        for (code, body) in [(0, "exit 0"), (42, "exit 42"), (1, "exit 1")] {
+            let shim = shim_script(dir.path(), &format!("rt-{code}"), body);
+            let got = execute_container_in(
+                &parent,
+                Some(&shim),
+                &["true".to_string()],
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .unwrap();
+            assert_eq!(got, code);
+        }
+        assert_parent_empty(&parent);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn execute_timeout_escalates_and_cleans() {
+        let dir = runner_core::test_support::TempDir::new("oci-timeout").unwrap();
+        let parent = bundle_parent(dir.path());
+        // Ignores SIGTERM: forces the full ladder (TERM → grace →
+        // runtime kill → direct SIGKILL). Management subcommands
+        // succeed instantly like a real runtime.
+        let shim = shim_script(
+            dir.path(),
+            "slow-rt",
+            "if [ \"$1\" = kill ] || [ \"$1\" = delete ]; then exit 0; fi\ntrap '' TERM; sleep 30",
+        );
+        let start = std::time::Instant::now();
+        let err = execute_container_in(
+            &parent,
+            Some(&shim),
+            &["true".to_string()],
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(err.contains("timed out"), "{err}");
+        // Waited the full timeout (never instant-failed), escalated
+        // well before the shim's 30s sleep could elapse (~5s typical).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(900),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(15), "{elapsed:?}");
+        assert_parent_empty(&parent);
+    }
+
+    #[tokio::test]
+    async fn execute_missing_runtime_spawns_nothing() {
+        let dir = runner_core::test_support::TempDir::new("oci-nospawn").unwrap();
+        let marker = dir.path().join("RAN");
+        // If any child spawned, this command would create the marker.
+        let err = execute_container(
+            Some(&dir.path().join("no-such-runtime")),
+            &["touch".to_string(), marker.display().to_string()],
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not a runnable binary"), "{err}");
+        assert!(!marker.exists(), "a child process ran on the host");
+    }
+
+    #[tokio::test]
+    async fn execute_engine_runtime_defers_and_cleans() {
+        let dir = runner_core::test_support::TempDir::new("oci-engine").unwrap();
+        let parent = bundle_parent(dir.path());
+        let docker = fake_runtime(dir.path(), "docker");
+        let err = execute_container_in(
+            &parent,
+            Some(&docker),
+            &["true".to_string()],
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("engine"), "{err}");
+        assert_parent_empty(&parent);
+    }
+
+    #[tokio::test]
+    async fn execute_spawn_failure_cleans_bundle() {
+        let dir = runner_core::test_support::TempDir::new("oci-spawnfail").unwrap();
+        let parent = bundle_parent(dir.path());
+        // Runnable bit, unexecutable bytes: passes the probe, fails spawn.
+        let garbage = dir.path().join("garbage-rt");
+        std::fs::write(&garbage, b"\xff\xfe not a program \x00\x01").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let err = execute_container_in(
+            &parent,
+            Some(&garbage),
+            &["true".to_string()],
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("failed to spawn"), "{err}");
+        assert_parent_empty(&parent);
+    }
+
+    #[tokio::test]
+    async fn guard_teardown_is_idempotent_and_drop_backstops() {
+        // Explicit teardown twice: second is a no-op.
+        let dir = runner_core::test_support::TempDir::new("oci-guard").unwrap();
+        let bundle = dir.path().join("oci-x");
+        std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        let mut guard = OciBundleGuard::new(
+            PathBuf::from("/nonexistent/rt"),
+            "oci-x".to_string(),
+            bundle.clone(),
+        );
+        guard.teardown().await;
+        assert!(!bundle.exists());
+        guard.teardown().await;
+        // Drop without teardown still scrubs (panic backstop).
+        let bundle = dir.path().join("oci-y");
+        std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
+        drop(OciBundleGuard::new(
+            PathBuf::from("/nonexistent/rt"),
+            "oci-y".to_string(),
+            bundle.clone(),
+        ));
+        assert!(!bundle.exists());
+    }
+
+    #[tokio::test]
+    async fn pump_pipe_roundtrips_and_caps_ring() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Small payload: exact roundtrip + exact ring.
+        let (mut in_client, in_server) = tokio::io::duplex(4096);
+        let (out_server, mut out_client) = tokio::io::duplex(4096);
+        let ring: OutputRing = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+        let pump = tokio::spawn(pump_pipe(in_server, out_server, ring.clone()));
+        in_client.write_all(b"hello").await.unwrap();
+        drop(in_client);
+        pump.await.unwrap();
+        let mut got = Vec::new();
+        out_client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"hello");
+        let ring_bytes: Vec<u8> = ring.lock().unwrap().iter().copied().collect();
+        assert_eq!(ring_bytes, b"hello");
+        // 40KB through a 32KB ring: capped tail only.
+        let (mut in_client, in_server) = tokio::io::duplex(65536);
+        let (out_server, mut out_client) = tokio::io::duplex(65536);
+        let ring: OutputRing = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+        let pump = tokio::spawn(pump_pipe(in_server, out_server, ring.clone()));
+        let big = vec![7u8; 40 * 1024];
+        in_client.write_all(&big).await.unwrap();
+        drop(in_client);
+        pump.await.unwrap();
+        let mut got = Vec::new();
+        out_client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, big);
+        assert_eq!(ring.lock().unwrap().len(), 32 * 1024);
     }
 
     #[test]

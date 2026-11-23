@@ -198,7 +198,7 @@ enum Commands {
         /// Maximum execution timeout in minutes
         #[arg(long, default_value_t = 60)]
         timeout_mins: u64,
-        /// Isolation tier: process (community namespaces), microvm (enterprise Firecracker), or container (OCI runtime; probing/config/bundle only)
+        /// Isolation tier: process (community namespaces), microvm (enterprise Firecracker), or container (OCI runtime tier)
         #[arg(long, default_value = "process")]
         driver: String,
         /// Fail closed instead of running unsandboxed when Tier-2 is unavailable
@@ -1264,6 +1264,26 @@ async fn cmd_exec_microvm(
     }
 }
 
+/// `runner exec --driver container`: route through the OCI engine.
+/// The probe fails closed before any spawn when no runtime resolves.
+async fn cmd_exec_container(
+    config: &RunnerConfig,
+    command: &[String],
+    timeout: std::time::Duration,
+) {
+    use runner_sandbox::driver::{SandboxDriver, SandboxEngine};
+
+    let engine = SandboxEngine::new(SandboxDriver::Container)
+        .with_container_config(config.sandbox.container.clone());
+    match engine.execute(command, timeout).await {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("runner exec failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load ~/.config/runner/env first so every subcommand sees configured
@@ -1694,13 +1714,9 @@ async fn main() -> Result<()> {
                 cmd_exec_microvm(&config, &command, timeout, strict).await;
                 return Ok(());
             }
-            // Fail closed: never run a container job on another tier.
             if tier == runner_sandbox::driver::SandboxDriver::Container {
-                eprintln!(
-                    "runner exec failed: container tier execution is not implemented yet \
-                     (probing/config/bundle only)"
-                );
-                std::process::exit(1);
+                cmd_exec_container(&config, &command, timeout).await;
+                return Ok(());
             }
             match runner_providers::providers::local::execute_local_sandboxed(
                 &command, no_sandbox, timeout, strict,

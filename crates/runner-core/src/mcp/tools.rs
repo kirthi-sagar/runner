@@ -31,9 +31,11 @@ pub const TOOL_TEST_PROVIDER: &str = "test_provider";
 pub const TOOL_EXEC_COMMAND: &str = "exec_command";
 pub const TOOL_MANAGE_CLOUD_CAPACITY: &str = "manage_cloud_capacity";
 pub const TOOL_GET_CACHE_STATS: &str = "get_cache_stats";
+pub const TOOL_REGISTER_SWARM_AGENT: &str = "register_swarm_agent";
+pub const TOOL_LEAVE_SWARM: &str = "leave_swarm";
 
 /// All tool names, in contract order.
-pub const ALL_TOOLS: [&str; 12] = [
+pub const ALL_TOOLS: [&str; 14] = [
     TOOL_GET_CI_STATUS,
     TOOL_GET_FLEET_TOPOLOGY,
     TOOL_RESERVE_HOST_RESOURCES,
@@ -46,6 +48,8 @@ pub const ALL_TOOLS: [&str; 12] = [
     TOOL_EXEC_COMMAND,
     TOOL_MANAGE_CLOUD_CAPACITY,
     TOOL_GET_CACHE_STATS,
+    TOOL_REGISTER_SWARM_AGENT,
+    TOOL_LEAVE_SWARM,
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,6 +158,22 @@ pub struct ManageCloudCapacityArgs {
     pub action: String,
     #[serde(default)]
     pub instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegisterSwarmAgentArgs {
+    pub swarm_id: String,
+    pub agent_id: String,
+    pub role: String,
+    /// Intra-swarm rank (default 0; higher preempts lower).
+    #[serde(default)]
+    pub priority: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LeaveSwarmArgs {
+    pub swarm_id: String,
+    pub agent_id: String,
 }
 
 /// Agent-native capabilities, implemented outside `runner-core`.
@@ -832,6 +852,16 @@ pub async fn execute_tool(
                 ))),
             }
         }
+        TOOL_REGISTER_SWARM_AGENT => {
+            let args: RegisterSwarmAgentArgs = parse_args(args)?;
+            // Local state only: no daemon swarm arm exists yet (Phase
+            // 1 protocol; daemon convergence lands with dispatch).
+            register_swarm_agent(&args, ctx).await
+        }
+        TOOL_LEAVE_SWARM => {
+            let args: LeaveSwarmArgs = parse_args(args)?;
+            leave_swarm(&args, ctx).await
+        }
         _ => Err(ToolError {
             code: -32601,
             message: format!("unknown tool: {name}"),
@@ -880,6 +910,54 @@ async fn release_host_resources(
             args.reservation_id
         )))
     }
+}
+
+fn swarm_error(e: super::swarm::SwarmError) -> ToolError {
+    use super::swarm::SwarmError;
+    match e {
+        SwarmError::Invalid(message) => ToolError::invalid_params(message),
+        full @ (SwarmError::Full(_) | SwarmError::Internal(_)) => {
+            ToolError::internal(full.to_string())
+        }
+    }
+}
+
+async fn register_swarm_agent(
+    args: &RegisterSwarmAgentArgs,
+    ctx: &ToolContext,
+) -> Result<serde_json::Value, ToolError> {
+    let mut guard = ctx.state.write().await;
+    let lease = super::swarm::register_agent(
+        guard.swarms_mut(),
+        &args.swarm_id,
+        &args.agent_id,
+        &args.role,
+        args.priority.unwrap_or(0),
+        Instant::now(),
+    )
+    .map_err(swarm_error)?;
+    serde_json::to_value(&lease).map_err(|e| ToolError::internal(e.to_string()))
+}
+
+async fn leave_swarm(
+    args: &LeaveSwarmArgs,
+    ctx: &ToolContext,
+) -> Result<serde_json::Value, ToolError> {
+    let mut guard = ctx.state.write().await;
+    let lease = super::swarm::leave_swarm(
+        guard.swarms_mut(),
+        &args.swarm_id,
+        &args.agent_id,
+        Instant::now(),
+    )
+    .map_err(swarm_error)?;
+    let mut value = serde_json::to_value(&lease).map_err(|e| ToolError::internal(e.to_string()))?;
+    // The lease shape reports the pool after release; mark the
+    // mutation explicitly for agent parsing.
+    if let Some(map) = value.as_object_mut() {
+        map.insert("left".to_string(), serde_json::Value::from(true));
+    }
+    Ok(value)
 }
 
 async fn throttle_runner(
@@ -1025,6 +1103,22 @@ pub fn tool_schema(name: &str) -> serde_json::Value {
             }),
             vec!["action"],
         ),
+        TOOL_REGISTER_SWARM_AGENT => (
+            serde_json::json!({
+                "swarm_id": { "type": "string" },
+                "agent_id": { "type": "string" },
+                "role": { "type": "string" },
+                "priority": { "type": "integer" },
+            }),
+            vec!["swarm_id", "agent_id", "role"],
+        ),
+        TOOL_LEAVE_SWARM => (
+            serde_json::json!({
+                "swarm_id": { "type": "string" },
+                "agent_id": { "type": "string" },
+            }),
+            vec!["swarm_id", "agent_id"],
+        ),
         _ => (serde_json::json!({}), vec![]),
     };
     serde_json::json!({ "type": "object", "properties": props, "required": required })
@@ -1045,6 +1139,8 @@ pub fn tool_description(name: &str) -> &'static str {
         TOOL_EXEC_COMMAND => "Run a command under zero-freeze governance; capture output.",
         TOOL_MANAGE_CLOUD_CAPACITY => "List, terminate, or purge daemon cloud burst workers.",
         TOOL_GET_CACHE_STATS => "LAN cache entries, size, hits, misses, and bandwidth saved.",
+        TOOL_REGISTER_SWARM_AGENT => "Join an agent swarm; draw a headroom slice under a lease.",
+        TOOL_LEAVE_SWARM => "Leave an agent swarm; return the headroom slice.",
         _ => "Unknown tool.",
     }
 }
@@ -1240,6 +1336,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn swarm_register_leave_roundtrip_reports_pool() {
+        use crate::mcp::swarm::{SWARM_AGENT_CORES, SWARM_AGENT_MEM_MB};
+        let ctx = ctx();
+        let args = serde_json::json!({
+            "swarm_id": "alpha", "agent_id": "builder-1", "role": "builder",
+        });
+        // Priority defaults to 0 when omitted.
+        let lease = execute_tool(TOOL_REGISTER_SWARM_AGENT, Some(&args), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(lease["swarm_id"], "alpha");
+        assert_eq!(lease["agent_id"], "builder-1");
+        assert_eq!(lease["role"], "builder");
+        assert_eq!(lease["priority"], 0);
+        assert_eq!(lease["lease_secs"], 1800);
+        assert_eq!(lease["cpu_weight_allocated"], SWARM_AGENT_CORES);
+        assert_eq!(lease["memory_allocated_mb"], SWARM_AGENT_MEM_MB);
+        assert_eq!(lease["active_members"], 1);
+        assert!(lease["cpu_weight_max"].as_f64().unwrap() > 0.0);
+        // Duplicate registration rejects without double-draw.
+        let err = execute_tool(TOOL_REGISTER_SWARM_AGENT, Some(&args), &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message.contains("already registered"),
+            "{}",
+            err.message
+        );
+        // Leave restores the slice and marks the mutation.
+        let left = execute_tool(
+            TOOL_LEAVE_SWARM,
+            Some(&serde_json::json!({"swarm_id": "alpha", "agent_id": "builder-1"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(left["left"], true);
+        assert_eq!(left["active_members"], 0);
+        assert_eq!(left["cpu_weight_allocated"], 0.0);
+        assert_eq!(left["memory_allocated_mb"], 0);
+        // Leaving twice fails closed (mirrors reservation release).
+        let err = execute_tool(
+            TOOL_LEAVE_SWARM,
+            Some(&serde_json::json!({"swarm_id": "alpha", "agent_id": "builder-1"})),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("not registered"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn swarm_blank_fields_reject_without_dispatch() {
+        let ctx = ctx();
+        for args in [
+            serde_json::json!({"swarm_id": "  ", "agent_id": "a", "role": "builder"}),
+            serde_json::json!({"swarm_id": "s", "agent_id": "", "role": "builder"}),
+            serde_json::json!({"swarm_id": "s", "agent_id": "a", "role": ""}),
+        ] {
+            let err = execute_tool(TOOL_REGISTER_SWARM_AGENT, Some(&args), &ctx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, -32602, "{args}");
+        }
+        let err = execute_tool(
+            TOOL_LEAVE_SWARM,
+            Some(&serde_json::json!({"swarm_id": "ghost", "agent_id": "a"})),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("unknown swarm_id"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn swarm_concurrent_registrations_account_exactly() {
+        use crate::mcp::swarm::{host_capacity, SWARM_AGENT_CORES, SWARM_AGENT_MEM_MB};
+        // Sized to fit every CI host (floor of host capacity, at
+        // least one): all must grant, with no lost draws.
+        let (host_cores, host_mem) = host_capacity().unwrap();
+        let count = ((host_cores / SWARM_AGENT_CORES).floor() as usize)
+            .min((host_mem / SWARM_AGENT_MEM_MB) as usize)
+            .clamp(1, 8);
+        let ctx = ctx();
+        let mut tasks = Vec::with_capacity(count);
+        for i in 0..count {
+            let ctx = ctx.clone();
+            tasks.push(tokio::spawn(async move {
+                execute_tool(
+                    TOOL_REGISTER_SWARM_AGENT,
+                    Some(&serde_json::json!({
+                        "swarm_id": "race", "agent_id": format!("agent-{i}"),
+                        "role": "builder",
+                    })),
+                    &ctx,
+                )
+                .await
+            }));
+        }
+        let mut granted = 0;
+        let mut peak_allocated = 0.0f64;
+        for task in tasks {
+            let lease = task.await.unwrap().unwrap();
+            granted += 1;
+            peak_allocated = peak_allocated.max(lease["cpu_weight_allocated"].as_f64().unwrap());
+        }
+        assert_eq!(granted, count);
+        // Every draw landed exactly once (a lost update would show a
+        // lower peak).
+        assert_eq!(peak_allocated, count as f64 * SWARM_AGENT_CORES);
+    }
+
+    #[tokio::test]
     async fn reserve_full_table_denies_retryable() {
         let ctx = ctx();
         let args = serde_json::json!({
@@ -1381,8 +1593,8 @@ mod tests {
     }
 
     #[test]
-    fn all_twelve_tools_have_schemas_and_descriptions() {
-        assert_eq!(ALL_TOOLS.len(), 12);
+    fn all_fourteen_tools_have_schemas_and_descriptions() {
+        assert_eq!(ALL_TOOLS.len(), 14);
         for name in ALL_TOOLS {
             let schema = tool_schema(name);
             assert_eq!(schema["type"], "object", "{name}");

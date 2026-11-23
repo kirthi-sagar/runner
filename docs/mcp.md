@@ -41,7 +41,7 @@ below and `tests/test_schema_freeze.rs`).
 ## What agents can do
 
 The server speaks newline-delimited JSON-RPC on stdio
-(`initialize`, `tools/list`, `tools/call`). Twelve tools are exposed:
+(`initialize`, `tools/list`, `tools/call`). Fourteen tools are exposed:
 
 | Tool | Purpose |
 |---|---|
@@ -57,6 +57,8 @@ The server speaks newline-delimited JSON-RPC on stdio
 | `exec_command` | Run a command under zero-freeze governance; capture output |
 | `manage_cloud_capacity` | List, terminate, or purge daemon cloud burst workers |
 | `get_cache_stats` | LAN cache entries, size, hits, misses, bandwidth saved |
+| `register_swarm_agent` | Join an agent swarm; draw a headroom slice under a lease |
+| `leave_swarm` | Leave an agent swarm; return the headroom slice |
 
 Example — check status, then throttle a noisy neighbor during a demo:
 
@@ -168,3 +170,20 @@ running daemon.
 `hit_ratio`, `bytes_served`, `bytes_uploaded`, `remote_hits`,
 `remote_bytes_imported`, `remote_bytes_served`. Output otherwise:
 `enabled: false`. Requires a running daemon.
+
+`register_swarm_agent` — input: `swarm_id` (string, required,
+non-empty; created on first use with host ceilings), `agent_id`
+(string, required, non-empty), `role` (string, required,
+non-empty), `priority` (integer, optional, default 0; higher
+preempts lower within the swarm). Output: the `SwarmLease`
+(`swarm_id`, `agent_id`, `role`, `priority`, `lease_secs`,
+`cpu_weight_allocated`/`cpu_weight_max`, `memory_allocated_mb`/
+`memory_max_mb`, `active_members`). Each member draws one fixed
+slice (1.5 cores, 2048 MiB); duplicate ids, closed swarms, and
+blank fields deny with `-32602`, exhausted session or host
+capacity with `-32603` (retryable). Local state only (no daemon
+arm yet).
+
+`leave_swarm` — input: `swarm_id` (string, required), `agent_id`
+(string, required). Output: the pool-after-release lease shape
+plus `left: true`. Unknown swarm or id → `-32602`.

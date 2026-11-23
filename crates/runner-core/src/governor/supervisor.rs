@@ -131,6 +131,7 @@ pub struct SupervisorState {
     reservations: HashMap<String, Reservation>,
     reservation_hooks: Option<Arc<dyn crate::mcp::reservation::ReservationHooks>>,
     reservation_limits: crate::config::ReservationLimits,
+    swarms: HashMap<String, crate::mcp::swarm::SwarmSession>,
     throttle: Option<ThrottleOverride>,
     drained: HashMap<String, String>,
     peers: HashMap<String, PeerRecord>,
@@ -182,6 +183,7 @@ impl SupervisorState {
             reservations: HashMap::new(),
             reservation_hooks: None,
             reservation_limits: crate::config::ReservationLimits::default(),
+            swarms: HashMap::new(),
             throttle: None,
             drained: HashMap::new(),
             peers: HashMap::new(),
@@ -420,6 +422,12 @@ impl SupervisorState {
 
     pub fn reservations(&self) -> Vec<Reservation> {
         self.reservations.values().cloned().collect()
+    }
+
+    /// Mutable swarm table for the membership protocol (the caller
+    /// holds the write lock, so registration is atomic).
+    pub fn swarms_mut(&mut self) -> &mut HashMap<String, crate::mcp::swarm::SwarmSession> {
+        &mut self.swarms
     }
 
     /// Live reservation count (callers prune first).

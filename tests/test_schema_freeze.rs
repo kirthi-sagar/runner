@@ -33,7 +33,7 @@ fn assert_key_set(value: &serde_json::Value, required: &[&str], optional: &[&str
 }
 
 #[tokio::test]
-async fn mcp_tools_list_pins_twelve_names_and_schemas() {
+async fn mcp_tools_list_pins_fourteen_names_and_schemas() {
     let server = McpServer::new(ToolContext::new(
         new_shared_state(),
         RunnerConfig::default(),
@@ -62,6 +62,8 @@ async fn mcp_tools_list_pins_twelve_names_and_schemas() {
             "exec_command",
             "manage_cloud_capacity",
             "get_cache_stats",
+            "register_swarm_agent",
+            "leave_swarm",
         ]
     );
     // Exact served input schemas: any drift breaks the freeze.
@@ -152,6 +154,24 @@ async fn mcp_tools_list_pins_twelve_names_and_schemas() {
                 "action": { "type": "string", "enum": ["list", "terminate", "purge"] },
                 "instance_id": { "type": "string" }},
             "required": ["action"]}),
+    );
+    expected.insert(
+        "register_swarm_agent",
+        serde_json::json!({"type": "object",
+            "properties": {
+                "swarm_id": { "type": "string" },
+                "agent_id": { "type": "string" },
+                "role": { "type": "string" },
+                "priority": { "type": "integer" }},
+            "required": ["swarm_id", "agent_id", "role"]}),
+    );
+    expected.insert(
+        "leave_swarm",
+        serde_json::json!({"type": "object",
+            "properties": {
+                "swarm_id": { "type": "string" },
+                "agent_id": { "type": "string" }},
+            "required": ["swarm_id", "agent_id"]}),
     );
     for tool in tools {
         let name = tool["name"].as_str().unwrap();

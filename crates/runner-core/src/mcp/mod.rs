@@ -3,4 +3,5 @@
 pub mod install;
 pub mod reservation;
 pub mod server;
+pub mod swarm;
 pub mod tools;

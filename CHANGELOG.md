@@ -6,6 +6,25 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## v2.10.0 — 2026-11-23
+
+- Phase 1: Tier-3 OCI container sandbox (`SandboxDriver::Container`):
+  host runtime auto-detection (`crun`, `runc`, `youki`, `podman`,
+  `docker`, in order), `[sandbox.container]` config, and typed
+  v1.0.2 bundle generation with cgroup v2 limits.
+- Phase 2: Rootless container lifecycle: ephemeral bundle assembly,
+  runtime invocation, async stdio streaming with a 32KB tail ring,
+  timeout escalation (SIGTERM → grace → `kill KILL` → SIGKILL over
+  a fresh process group), and RAII teardown (`delete --force` +
+  bundle scrub on every path).
+- Phase 3: Mount boundaries (`/home` host sources fail closed) and
+  network egress integration (`EgressGuard` across the lifecycle,
+  loopback-only offline mode, cryptographic workspace scrubbing).
+- Phase 4: CLI wire-up (`--image`, `--no-network`, repeatable `-v`),
+  `runner doctor` runtime probe, `[sandbox.container]` profile
+  layering, and `exec_command` MCP expansion (driver/image/
+  no_network/volumes with captured execution).
+
 ## v2.9.0 — 2026-11-23
 
 - Phase 1: Continuous background mDNS peer table

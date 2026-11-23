@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.9.0 and prior)
+## Shipped (v2.10.0 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -45,17 +45,28 @@ services or heavyweight frameworks.
 - LAN mesh cache federation & peer streaming: background peer
   table, scatter-gather queries, verified chunk streaming, donor
   governance + `cache peers` CLI (v2.9.0).
+- Container runtime isolation tier: OCI probing, rootless
+  lifecycle, egress/offline boundaries, CLI/doctor/MCP wire-up
+  (v2.10.0, Candidate D delivered).
 
-## Current: v2.9.0 (LAN Mesh Cache Federation & Peer Streaming)
+## Current: v2.10.0 (Container Runtime Isolation Tier)
+
+- Standalone-runtime execution (crun/runc/youki) with RAII teardown.
+- Egress-guarded, offline-capable, scrubbed container jobs.
+- Full CLI, doctor, config-profile, and MCP surfaces.
+
+## Next: v2.11.0 candidates (all lettered candidates shipped)
+
+- Container engine flows: registry image pull, rootfs population,
+  podman/docker execution (the explicit Phase 2 deferral).
+- Loopback prestart hook for offline containers needing `lo` up.
+- Config-file volume declarations for container jobs.
+
+## Shipped in v2.9.0: LAN Mesh Cache Federation & Peer Streaming
 
 - Continuous mDNS peer table with 0ms miss-path snapshots.
 - Scatter-gather first-responder streaming with cancellation.
 - Digest-verified imports + donor concurrency governance.
-
-## Next: Candidate D — Container Runtime Isolation Tier
-
-- Container runtime isolation tier for OCI workloads.
-- No further roadmap candidates staged.
 
 ## Shipped in v2.8.0: Network Boundary Hardening Follow-Through & Resource Governance
 

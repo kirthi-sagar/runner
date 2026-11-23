@@ -6,6 +6,15 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## [2.11.1] - 2026-11-23
+
+### Fixed
+
+- Fixed container-absolute symlink resolution on native Windows
+  (`resolve_link_target`) by inspecting raw layer bytes instead
+  of host-specific path traits, ensuring clean unpack across
+  Windows-MSVC and Windows-GNU targets.
+
 ## v2.11.0 — 2026-11-23
 
 - Phase 1: Pure-Rust HTTPS registry client: `OciReference`

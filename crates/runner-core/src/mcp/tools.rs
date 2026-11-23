@@ -915,7 +915,9 @@ async fn release_host_resources(
 fn swarm_error(e: super::swarm::SwarmError) -> ToolError {
     use super::swarm::SwarmError;
     match e {
-        SwarmError::Invalid(message) => ToolError::invalid_params(message),
+        SwarmError::Invalid(message) | SwarmError::BudgetExceeded(message) => {
+            ToolError::invalid_params(message)
+        }
         full @ (SwarmError::Full(_) | SwarmError::Internal(_)) => {
             ToolError::internal(full.to_string())
         }
@@ -927,12 +929,17 @@ async fn register_swarm_agent(
     ctx: &ToolContext,
 ) -> Result<serde_json::Value, ToolError> {
     let mut guard = ctx.state.write().await;
-    let lease = super::swarm::register_agent(
+    let policy = super::swarm::BudgetPolicy {
+        cap_usd: guard.swarm_spend_cap_usd(),
+        rate_usd_per_core_hour: guard.swarm_rate_usd(),
+    };
+    let lease = super::swarm::register_agent_with_budget(
         guard.swarms_mut(),
         &args.swarm_id,
         &args.agent_id,
         &args.role,
         args.priority.unwrap_or(0),
+        policy,
         Instant::now(),
     )
     .map_err(swarm_error)?;
@@ -1449,6 +1456,45 @@ mod tests {
         // Every draw landed exactly once (a lost update would show a
         // lower peak).
         assert_eq!(peak_allocated, count as f64 * SWARM_AGENT_CORES);
+    }
+
+    #[tokio::test]
+    async fn swarm_register_reports_slice_and_configured_budget() {
+        let mut config = RunnerConfig::default();
+        config.swarm.monthly_spend_cap_usd = 25.0;
+        config.swarm.rate_usd_per_core_hour = Some(0.12);
+        let state = new_shared_state();
+        state.write().await.seed_from_config(&config);
+        let seeded = ToolContext::new(state, config);
+        let lease = execute_tool(
+            TOOL_REGISTER_SWARM_AGENT,
+            Some(&serde_json::json!({
+                "swarm_id": "beta", "agent_id": "a1", "role": "builder",
+            })),
+            &seeded,
+        )
+        .await
+        .unwrap();
+        assert_eq!(lease["holds_slice"], true);
+        assert_eq!(lease["spend_cap_usd"], 25.0);
+        assert_eq!(lease["spent_usd"], 0.0);
+        // Defaults: unenforced cap, nominal rate. The rate surfaces
+        // on first accrual, so assert the seed directly.
+        let plain = ctx();
+        let lease = execute_tool(
+            TOOL_REGISTER_SWARM_AGENT,
+            Some(&serde_json::json!({
+                "swarm_id": "gamma", "agent_id": "a1", "role": "builder",
+            })),
+            &plain,
+        )
+        .await
+        .unwrap();
+        assert_eq!(lease["spend_cap_usd"], 0.0);
+        assert_eq!(
+            plain.state.read().await.swarm_rate_usd(),
+            crate::config::DEFAULT_HOST_CORE_HOUR_USD
+        );
     }
 
     #[tokio::test]

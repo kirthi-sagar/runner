@@ -580,6 +580,8 @@ pub struct RunnerConfig {
     pub power: PowerConfig,
     #[serde(default)]
     pub reservations: ReservationsConfig,
+    #[serde(default)]
+    pub swarm: SwarmConfig,
 }
 
 /// Nominal internal transfer rate, USD per core-hour, applied when
@@ -667,6 +669,28 @@ impl ReservationsConfig {
                 max_active: limits.max_active.unwrap_or(defaults.max_active),
             },
         }
+    }
+}
+
+/// Agent swarm budget policy.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct SwarmConfig {
+    /// Maximum swarm spend in USD (nominal internal transfer
+    /// pricing, not cloud money). 0 means UNENFORCED, mirroring
+    /// reservations: budgeting is opt-in restriction.
+    #[serde(default)]
+    pub monthly_spend_cap_usd: f64,
+    /// Transfer rate override, USD per core-hour (`None` keeps the
+    /// nominal [`DEFAULT_HOST_CORE_HOUR_USD`]).
+    #[serde(default)]
+    pub rate_usd_per_core_hour: Option<f64>,
+}
+
+impl SwarmConfig {
+    /// Effective transfer rate: configured override or nominal default.
+    pub fn effective_rate(&self) -> f64 {
+        self.rate_usd_per_core_hour
+            .unwrap_or(DEFAULT_HOST_CORE_HOUR_USD)
     }
 }
 
@@ -1188,6 +1212,19 @@ mod tests {
             ..ReservationsConfig::default()
         };
         assert_eq!(config.effective_rate(), 0.12);
+    }
+
+    #[test]
+    fn swarm_budget_defaults_unenforced_and_parses() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.swarm.monthly_spend_cap_usd, 0.0);
+        assert_eq!(config.swarm.effective_rate(), DEFAULT_HOST_CORE_HOUR_USD);
+        let config: RunnerConfig = toml::from_str(
+            "[swarm]\nmonthly_spend_cap_usd = 25.0\nrate_usd_per_core_hour = 0.12\n",
+        )
+        .unwrap();
+        assert_eq!(config.swarm.monthly_spend_cap_usd, 25.0);
+        assert_eq!(config.swarm.effective_rate(), 0.12);
     }
 
     #[test]

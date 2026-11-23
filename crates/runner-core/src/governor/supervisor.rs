@@ -132,6 +132,10 @@ pub struct SupervisorState {
     reservation_hooks: Option<Arc<dyn crate::mcp::reservation::ReservationHooks>>,
     reservation_limits: crate::config::ReservationLimits,
     swarms: HashMap<String, crate::mcp::swarm::SwarmSession>,
+    /// Swarm spend cap seed for new sessions (`[swarm]`, 0 = unenforced).
+    swarm_spend_cap_usd: f64,
+    /// Swarm transfer rate seed for new sessions, USD per core-hour.
+    swarm_rate_usd: f64,
     throttle: Option<ThrottleOverride>,
     drained: HashMap<String, String>,
     peers: HashMap<String, PeerRecord>,
@@ -184,6 +188,8 @@ impl SupervisorState {
             reservation_hooks: None,
             reservation_limits: crate::config::ReservationLimits::default(),
             swarms: HashMap::new(),
+            swarm_spend_cap_usd: 0.0,
+            swarm_rate_usd: crate::config::DEFAULT_HOST_CORE_HOUR_USD,
             throttle: None,
             drained: HashMap::new(),
             peers: HashMap::new(),
@@ -292,6 +298,8 @@ impl SupervisorState {
         self.afk_idle_secs = config.governor.afk_idle_seconds;
         self.prevent_sleep_on_ac = config.power.prevent_sleep_on_ac;
         self.reservation_limits = config.reservations.effective_limits();
+        self.swarm_spend_cap_usd = config.swarm.monthly_spend_cap_usd;
+        self.swarm_rate_usd = config.swarm.effective_rate();
     }
 
     /// Evaluate AFK boost for this tick. Always/Never modes bypass the
@@ -428,6 +436,16 @@ impl SupervisorState {
     /// holds the write lock, so registration is atomic).
     pub fn swarms_mut(&mut self) -> &mut HashMap<String, crate::mcp::swarm::SwarmSession> {
         &mut self.swarms
+    }
+
+    /// Spend cap seed for new swarm sessions (0 = unenforced).
+    pub fn swarm_spend_cap_usd(&self) -> f64 {
+        self.swarm_spend_cap_usd
+    }
+
+    /// Transfer rate seed for new swarm sessions, USD per core-hour.
+    pub fn swarm_rate_usd(&self) -> f64 {
+        self.swarm_rate_usd
     }
 
     /// Live reservation count (callers prune first).

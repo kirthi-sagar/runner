@@ -40,6 +40,11 @@ pub struct CacheEntryMeta {
     pub created_unix_secs: u64,
     pub accessed_unix_secs: u64,
     pub hits: u64,
+    /// Hex SHA-256 of the committed bytes, hashed at commit time.
+    /// `None` for rows committed before digest recording (old
+    /// indexes keep parsing; old peers simply skip verification).
+    #[serde(default)]
+    pub sha256: Option<String>,
 }
 
 /// Aggregate counters (persisted with the index). New fields must
@@ -136,6 +141,22 @@ fn now_unix_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Hex SHA-256 of a file's bytes (single streaming pass).
+fn hash_file_hex(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Content stem for a (scope, version, key) triple.
@@ -371,6 +392,19 @@ impl CacheStore {
             .unwrap_or(false)
     }
 
+    /// Staging path for a pending upload (`None` unless reserved).
+    /// Lets the sequential peer-stream pump write with async buffered
+    /// I/O while the store mutex stays out of the hot loop; the
+    /// reservation guarantees exclusive ownership of the path.
+    /// (Out-of-order worker chunks keep using [`write_chunk`](Self::write_chunk).)
+    pub fn stage_path(&self, id: u64) -> Option<PathBuf> {
+        let inner = self.inner.lock().ok()?;
+        inner
+            .pending
+            .contains_key(&id)
+            .then(|| self.dir.join(format!("{id}.tmp")))
+    }
+
     /// Staged byte count for a pending upload (None when not pending).
     pub fn staged_len(&self, id: u64) -> Option<u64> {
         if !self.has_pending(id) {
@@ -426,6 +460,15 @@ impl CacheStore {
                 max: self.max_bytes,
             });
         }
+        // Digest what we install: unreadable staging fails closed
+        // rather than committing unverifiable bytes.
+        let sha256 = match hash_file_hex(&tmp) {
+            Ok(digest) => digest,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(StoreError::Io(format!("cannot hash upload {id}: {e}")));
+            }
+        };
         let file = entry_filename(&scope, &version, &key);
         std::fs::rename(&tmp, self.dir.join(&file))
             .map_err(|e| StoreError::Io(format!("cannot commit upload {id}: {e}")))?;
@@ -460,6 +503,7 @@ impl CacheStore {
                 created_unix_secs: now,
                 accessed_unix_secs: now,
                 hits: 0,
+                sha256: Some(sha256),
             },
         );
         inner.stats.bytes_uploaded += size;
@@ -1080,5 +1124,85 @@ mod tests {
         assert!(reopened
             .lookup("acme/web", "v", &["k".to_string()])
             .is_some());
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    #[test]
+    fn commit_records_sha256_and_survives_reload() {
+        let (dir, store) = store(1 << 30);
+        commit_bytes(&store, GLOBAL_SCOPE, "k", "v", b"digest-me");
+        let entry = store.lookup(GLOBAL_SCOPE, "v", &["k".to_string()]).unwrap();
+        assert_eq!(entry.sha256.as_deref(), Some(hex_of(b"digest-me").as_str()));
+        drop(store);
+        let reopened = CacheStore::open(&dir.path().join("cache"), 1 << 30).unwrap();
+        let entry = reopened
+            .lookup(GLOBAL_SCOPE, "v", &["k".to_string()])
+            .unwrap();
+        assert_eq!(entry.sha256.as_deref(), Some(hex_of(b"digest-me").as_str()));
+    }
+
+    #[test]
+    fn stage_path_tracks_reservation_lifecycle() {
+        let (_dir, store) = store(1 << 30);
+        // Unknown id: no path.
+        assert!(store.stage_path(999).is_none());
+        let id = match store.reserve(GLOBAL_SCOPE, "k", "v").unwrap() {
+            ReserveOutcome::Created(id) => id,
+            ReserveOutcome::Exists(id) => panic!("unexpected exists: {id}"),
+        };
+        let path = store.stage_path(id).expect("reserved id stages");
+        assert!(path.ends_with(format!("{id}.tmp")));
+        // Abort releases the path; commit consumes the reservation.
+        store.abort_upload(id);
+        assert!(store.stage_path(id).is_none());
+        let id = match store.reserve(GLOBAL_SCOPE, "k", "v").unwrap() {
+            ReserveOutcome::Created(id) => id,
+            ReserveOutcome::Exists(id) => panic!("unexpected exists: {id}"),
+        };
+        store.write_chunk(id, 0, b"x").unwrap();
+        store.commit(id, 1).unwrap();
+        assert!(store.stage_path(id).is_none());
+    }
+
+    #[test]
+    fn legacy_index_without_digest_loads_with_none() {
+        let dir = TempDir::new("legacy-index").unwrap();
+        // Hand-written pre-digest index: no sha256 key anywhere.
+        std::fs::write(dir.path().join("blobfile"), b"legacy-bytes").unwrap();
+        std::fs::write(
+            dir.path().join("index.json"),
+            serde_json::json!({
+                "version": 1,
+                "next_id": 2,
+                "entries": [{
+                    "id": 1,
+                    "scope": "global",
+                    "key": "k",
+                    "version": "v",
+                    "file": "blobfile",
+                    "size": 12,
+                    "created_unix_secs": 1,
+                    "accessed_unix_secs": 1,
+                    "hits": 0
+                }],
+                "stats": {
+                    "hits": 0,
+                    "misses": 0,
+                    "bytes_served": 0,
+                    "bytes_uploaded": 0
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = CacheStore::open(dir.path(), 1 << 30).unwrap();
+        let entry = store.lookup(GLOBAL_SCOPE, "v", &["k".to_string()]).unwrap();
+        assert_eq!(entry.sha256, None);
     }
 }

@@ -14,6 +14,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::store::{CacheStore, ReserveOutcome, StoreError, GLOBAL_SCOPE};
 
@@ -209,6 +210,14 @@ pub fn cache_peer_from_node(node: &crate::mesh::discovery::DiscoveredNode) -> Op
 pub const MAX_FEDERATION_PEERS: usize = 8;
 /// Per-peer lookup timeout: federation must never stall a lookup.
 pub const PEER_LOOKUP_TIMEOUT_MS: u64 = 150;
+/// Stream idle watchdog: no chunk bytes for 15s aborts the peer
+/// transfer (stalled donors must not pin runner threads).
+pub const PEER_STREAM_CHUNK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Overall transfer ceiling: 60s base + 1s per 10MB declared (~80
+/// Mbps floor — generous on gigabit LAN, fatal to trickles).
+pub fn peer_stream_total_timeout(expected: u64) -> Duration {
+    Duration::from_secs(60 + expected / 10_000_000)
+}
 
 fn base64_url_no_pad(bytes: &[u8]) -> String {
     use base64::Engine;
@@ -332,6 +341,9 @@ fn lookup_hit(
             "{}/_apis/artifactcache/artifacts/{}?token={}",
             state.public_base, entry.id, token
         ),
+        // Hex SHA-256 when recorded (null for pre-digest rows and
+        // legacy peers, which skip verification but keep length checks).
+        "digest": entry.sha256,
     }))
     .into_response()
 }
@@ -390,6 +402,9 @@ fn peer_lookup_url(peer: &CachePeer, scope: &str) -> String {
 struct ProbeHit {
     key: String,
     location: String,
+    /// Advertised hex SHA-256 (`None` for legacy peers, which skip
+    /// digest verification but keep strict length checks).
+    digest: Option<String>,
 }
 
 /// Metadata probe against one peer: hit coordinates on 200-with-JSON,
@@ -412,14 +427,18 @@ async fn probe_peer(
     Some(ProbeHit {
         key: hit.get("cacheKey")?.as_str()?.to_string(),
         location: hit.get("archiveLocation")?.as_str()?.to_string(),
+        digest: hit
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
 /// Stream the winner's archive into the local store with the usual
 /// integrity guards (exact content-length, running disk bound,
-/// commit verification). Any failure aborts the partial upload and
-/// resolves to `None`: the losers were already cancelled, so there
-/// is no second attempt.
+/// in-flight digest, commit verification). Any failure aborts the
+/// partial upload and resolves to `None`: the losers were already
+/// cancelled, so there is no second attempt.
 async fn stream_probe_hit(
     state: &CacheServerState,
     scope: &str,
@@ -427,7 +446,7 @@ async fn stream_probe_hit(
     hit: ProbeHit,
 ) -> Option<String> {
     let key = hit.key;
-    let mut download = state.http.get(&hit.location).send().await.ok()?;
+    let download = state.http.get(&hit.location).send().await.ok()?;
     if !download.status().is_success() {
         return None;
     }
@@ -449,27 +468,38 @@ async fn stream_probe_hit(
         state.store.abort_upload(id);
         return None;
     }
-    let mut offset = 0u64;
-    loop {
-        match download.chunk().await {
-            Ok(Some(bytes)) => {
-                // Running guard: a lying Content-Length must not fill disk.
-                if offset + bytes.len() as u64 > state.store.max_bytes() {
-                    state.store.abort_upload(id);
-                    return None;
-                }
-                if state.store.write_chunk(id, offset, &bytes).is_err() {
-                    state.store.abort_upload(id);
-                    return None;
-                }
-                offset += bytes.len() as u64;
-            }
-            Ok(None) => break,
-            Err(_) => {
-                state.store.abort_upload(id);
-                return None;
-            }
+    let stage = match state.store.stage_path(id) {
+        Some(path) => path,
+        None => {
+            state.store.abort_upload(id);
+            return None;
         }
+    };
+    let max_bytes = state.store.max_bytes();
+    let source = ResponseChunks { response: download };
+    let pumped = pump_to_staging(
+        source,
+        &stage,
+        expected,
+        max_bytes,
+        hit.digest.as_deref(),
+        PEER_STREAM_CHUNK_TIMEOUT,
+        peer_stream_total_timeout(expected),
+    )
+    .await;
+    let (staged, _) = match pumped {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            state.store.abort_upload(id);
+            return None;
+        }
+    };
+    // Strict length parity across the file boundary: the counted
+    // bytes and the staged file must both equal the declaration
+    // (commit re-verifies once more before installing).
+    if staged != expected || state.store.staged_len(id) != Some(expected) {
+        state.store.abort_upload(id);
+        return None;
     }
     match state.store.commit(id, expected) {
         Ok(entry) => {
@@ -480,6 +510,127 @@ async fn stream_probe_hit(
             state.store.abort_upload(id);
             None
         }
+    }
+}
+
+/// Sequential pump failure: every arm aborts the upload upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PumpError {
+    /// No chunk bytes within the idle watchdog.
+    IdleTimeout,
+    /// Transfer exceeded the overall ceiling.
+    TotalTimeout,
+    /// Stream passed the declared length (trailing garbage).
+    Overrun,
+    /// Stream passed the store budget.
+    TooLarge,
+    /// Chunk fetch failed (truncated socket, reset).
+    Chunk(String),
+    /// Staging write failed.
+    Write(String),
+    /// In-flight digest disagrees with the advertised one.
+    DigestMismatch { expected: String, actual: String },
+}
+
+/// One sequential chunk supplier for the staging pump: the live
+/// adapter wraps a peer download, scripted fakes drive unit tests.
+/// Boxed future keeps the trait object-safe without async-trait.
+/// Boxed next-chunk future (keeps [`ChunkSource`] object-safe
+/// without async-trait).
+type ChunkFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Option<Result<bytes::Bytes, String>>> + Send + 'a>,
+>;
+
+trait ChunkSource {
+    fn next_chunk(&mut self) -> ChunkFuture<'_>;
+}
+
+/// Live adapter: pull response chunks off the winning download.
+struct ResponseChunks {
+    response: reqwest::Response,
+}
+
+impl ChunkSource for ResponseChunks {
+    fn next_chunk(&mut self) -> ChunkFuture<'_> {
+        Box::pin(async move {
+            match self.response.chunk().await {
+                Ok(Some(bytes)) => Some(Ok(bytes)),
+                Ok(None) => None,
+                Err(e) => Some(Err(e.to_string())),
+            }
+        })
+    }
+}
+
+/// Pump a chunk source sequentially into a staging file with async
+/// buffered I/O: per-chunk idle watchdog plus an overall transfer
+/// ceiling, running overrun/budget guards, and a running SHA-256
+/// verified against the peer-advertised digest (`None` for legacy
+/// peers skips the comparison). Returns staged bytes + hex digest.
+/// Never touches the store mutex: reservation and commit bracket it.
+#[allow(clippy::too_many_arguments)]
+async fn pump_to_staging<C: ChunkSource>(
+    mut source: C,
+    stage_path: &std::path::Path,
+    expected: u64,
+    max_bytes: u64,
+    expected_digest: Option<&str>,
+    chunk_timeout: Duration,
+    total_timeout: Duration,
+) -> Result<(u64, String), PumpError> {
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+    // Exclusive reservation: truncate any stale file, never append.
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(stage_path)
+        .await
+        .map_err(|e| PumpError::Write(e.to_string()))?;
+    let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, file);
+    let mut hasher = sha2::Sha256::new();
+    let mut staged = 0u64;
+    let body = async {
+        loop {
+            let chunk = match tokio::time::timeout(chunk_timeout, source.next_chunk()).await {
+                Ok(Some(Ok(bytes))) => bytes,
+                Ok(Some(Err(e))) => return Err(PumpError::Chunk(e)),
+                Ok(None) => break,
+                Err(_) => return Err(PumpError::IdleTimeout),
+            };
+            let end = staged.saturating_add(chunk.len() as u64);
+            if end > expected {
+                return Err(PumpError::Overrun);
+            }
+            if end > max_bytes {
+                return Err(PumpError::TooLarge);
+            }
+            hasher.update(&chunk);
+            writer
+                .write_all(&chunk)
+                .await
+                .map_err(|e| PumpError::Write(e.to_string()))?;
+            staged = end;
+        }
+        writer
+            .flush()
+            .await
+            .map_err(|e| PumpError::Write(e.to_string()))?;
+        let actual = format!("{:x}", hasher.finalize());
+        if let Some(want) = expected_digest {
+            if actual != want {
+                return Err(PumpError::DigestMismatch {
+                    expected: want.to_string(),
+                    actual,
+                });
+            }
+        }
+        Ok((staged, actual))
+    };
+    match tokio::time::timeout(total_timeout, body).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(PumpError::TotalTimeout),
     }
 }
 
@@ -1123,13 +1274,42 @@ mod tests {
         lookup_status: u16,
         lookup_body: serde_json::Value,
         download_bytes: Vec<u8>,
+        /// Advertised digest (`None` omits the field: legacy peer).
+        digest_override: Option<String>,
+        /// Declared download length when the download must stall
+        /// mid-body after the prefix bytes (`None` serves whole).
+        stall_declared_len: Option<u64>,
     }
 
-    fn hit_body(key: &str, base: &str) -> serde_json::Value {
-        serde_json::json!({
+    fn hit_body(key: &str, base: &str, digest: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
             "cacheKey": key,
             "archiveLocation": format!("{base}/download"),
-        })
+        });
+        if let Some(digest) = digest {
+            body["digest"] = serde_json::Value::String(digest.to_string());
+        }
+        body
+    }
+
+    /// Download stream that emits one prefix chunk, then stalls
+    /// forever (the test runtime drops it on completion).
+    struct StallStream {
+        prefix: Option<bytes::Bytes>,
+    }
+
+    impl futures_util::Stream for StallStream {
+        type Item = Result<bytes::Bytes, std::io::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            match self.prefix.take() {
+                Some(bytes) => std::task::Poll::Ready(Some(Ok(bytes))),
+                None => std::task::Poll::Pending,
+            }
+        }
     }
 
     async fn spawn_script_peer(key: &str, config: ScriptPeerConfig) -> ScriptPeer {
@@ -1140,7 +1320,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let body = if config.lookup_body.is_null() {
-            hit_body(key, &base)
+            hit_body(key, &base, config.digest_override.as_deref())
         } else {
             config.lookup_body.clone()
         };
@@ -1168,11 +1348,26 @@ mod tests {
                 get({
                     let downloads = downloads.clone();
                     let bytes = config.download_bytes.clone();
+                    let stall = config.stall_declared_len;
                     move || {
                         let downloads = downloads.clone();
                         async move {
+                            use axum::response::IntoResponse;
                             downloads.fetch_add(1, Ordering::SeqCst);
-                            bytes.clone()
+                            match stall {
+                                None => bytes.clone().into_response(),
+                                // Explicit length + prefix chunk, then
+                                // silence (production download_artifact
+                                // proves hyper honors declared lengths
+                                // on streams).
+                                Some(declared) => (
+                                    [("content-length".to_string(), declared.to_string())],
+                                    axum::body::Body::from_stream(StallStream {
+                                        prefix: Some(bytes::Bytes::copy_from_slice(&bytes)),
+                                    }),
+                                )
+                                    .into_response(),
+                            }
                         }
                     }
                 }),
@@ -1191,7 +1386,16 @@ mod tests {
             lookup_status: 200,
             lookup_body: serde_json::Value::Null,
             download_bytes: bytes.to_vec(),
+            digest_override: None,
+            stall_declared_len: None,
         }
+    }
+
+    fn hex_digest(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
     }
 
     struct StaticPeers {
@@ -1275,6 +1479,8 @@ mod tests {
                 lookup_status: 404,
                 lookup_body: serde_json::json!({"error": "nope"}),
                 download_bytes: vec![],
+                digest_override: None,
+                stall_declared_len: None,
             },
         )
         .await;
@@ -1285,6 +1491,8 @@ mod tests {
                 lookup_status: 204,
                 lookup_body: serde_json::json!({}),
                 download_bytes: vec![],
+                digest_override: None,
+                stall_declared_len: None,
             },
         )
         .await;
@@ -1297,6 +1505,8 @@ mod tests {
                 lookup_status: 200,
                 lookup_body: serde_json::json!({}),
                 download_bytes: vec![],
+                digest_override: None,
+                stall_declared_len: None,
             },
         )
         .await;
@@ -1334,6 +1544,8 @@ mod tests {
                 lookup_status: 500,
                 lookup_body: serde_json::json!({"error": "boom"}),
                 download_bytes: vec![],
+                digest_override: None,
+                stall_declared_len: None,
             },
         )
         .await;
@@ -1345,6 +1557,8 @@ mod tests {
                 lookup_status: 200,
                 lookup_body: serde_json::json!("just-a-string"),
                 download_bytes: vec![],
+                digest_override: None,
+                stall_declared_len: None,
             },
         )
         .await;
@@ -1447,6 +1661,352 @@ mod tests {
             state.store.reserve(GLOBAL_SCOPE, "cut-blob", "v1"),
             Ok(crate::cache::store::ReserveOutcome::Created(_))
         ));
+    }
+
+    /// Scripted chunk supplier for pump unit tests (no HTTP).
+    enum PumpScript {
+        Emit(bytes::Bytes),
+        EmitAfter(Duration, bytes::Bytes),
+        Fail(String),
+        StallForever,
+    }
+
+    struct ScriptSource {
+        steps: std::collections::VecDeque<PumpScript>,
+    }
+
+    impl ScriptSource {
+        fn new(steps: Vec<PumpScript>) -> Self {
+            Self {
+                steps: steps.into(),
+            }
+        }
+    }
+
+    impl super::ChunkSource for ScriptSource {
+        fn next_chunk(&mut self) -> super::ChunkFuture<'_> {
+            Box::pin(async move {
+                match self.steps.pop_front() {
+                    Some(PumpScript::Emit(bytes)) => Some(Ok(bytes)),
+                    Some(PumpScript::EmitAfter(delay, bytes)) => {
+                        tokio::time::sleep(delay).await;
+                        Some(Ok(bytes))
+                    }
+                    Some(PumpScript::Fail(e)) => Some(Err(e)),
+                    Some(PumpScript::StallForever) => std::future::pending().await,
+                    None => None,
+                }
+            })
+        }
+    }
+
+    /// Pump into a scratch path (no store needed).
+    fn pump_scratch() -> (crate::test_support::TempDir, std::path::PathBuf) {
+        let dir = crate::test_support::TempDir::new("pump").unwrap();
+        let path = dir.path().join("stage.tmp");
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn pump_exact_pass_through_writes_and_digests() {
+        let (_dir, path) = pump_scratch();
+        let source = ScriptSource::new(vec![
+            PumpScript::Emit(bytes::Bytes::from_static(b"0123")),
+            PumpScript::Emit(bytes::Bytes::from_static(b"4567")),
+        ]);
+        let (staged, hex) = pump_to_staging(
+            source,
+            &path,
+            8,
+            1 << 20,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(staged, 8);
+        assert_eq!(hex, hex_digest(b"01234567"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"01234567");
+    }
+
+    #[tokio::test]
+    async fn pump_overrun_and_budget_guard() {
+        // Trailing garbage past the declaration.
+        let (_dir, path) = pump_scratch();
+        let source = ScriptSource::new(vec![
+            PumpScript::Emit(bytes::Bytes::from_static(b"01234567")),
+            PumpScript::Emit(bytes::Bytes::from_static(b"EXTRA")),
+        ]);
+        assert_eq!(
+            pump_to_staging(
+                source,
+                &path,
+                8,
+                1 << 20,
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(5)
+            )
+            .await,
+            Err(PumpError::Overrun)
+        );
+        // Budget breach before the declaration (16 bytes vs 15).
+        let (_dir, path) = pump_scratch();
+        let source = ScriptSource::new(vec![PumpScript::Emit(bytes::Bytes::from_static(
+            b"0123456789abcdef",
+        ))]);
+        assert_eq!(
+            pump_to_staging(
+                source,
+                &path,
+                100,
+                15,
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(5)
+            )
+            .await,
+            Err(PumpError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_idle_timeout_fires_on_silence() {
+        let (_dir, path) = pump_scratch();
+        let source = ScriptSource::new(vec![
+            PumpScript::Emit(bytes::Bytes::from_static(b"0123")),
+            PumpScript::StallForever,
+        ]);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            pump_to_staging(
+                source,
+                &path,
+                1024,
+                1 << 20,
+                None,
+                Duration::from_millis(50),
+                Duration::from_secs(5)
+            )
+            .await,
+            Err(PumpError::IdleTimeout)
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // No flush on the failure path: staging cleanup is the
+        // caller's abort (proven at the federate level below).
+    }
+
+    #[tokio::test]
+    async fn pump_total_timeout_fires_on_trickle() {
+        let (_dir, path) = pump_scratch();
+        // 1 byte per 40ms against a 100ms ceiling: the idle watchdog
+        // (5s) never fires, the overall ceiling does.
+        let source = ScriptSource::new(
+            (0..10)
+                .map(|_| {
+                    PumpScript::EmitAfter(
+                        Duration::from_millis(40),
+                        bytes::Bytes::from_static(b"x"),
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(
+            pump_to_staging(
+                source,
+                &path,
+                10,
+                1 << 20,
+                None,
+                Duration::from_secs(5),
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(PumpError::TotalTimeout)
+        );
+    }
+
+    #[tokio::test]
+    async fn pump_chunk_error_and_digest_verdicts() {
+        let (_dir, path) = pump_scratch();
+        let source = ScriptSource::new(vec![
+            PumpScript::Emit(bytes::Bytes::from_static(b"0123")),
+            PumpScript::Fail("reset".to_string()),
+        ]);
+        assert_eq!(
+            pump_to_staging(
+                source,
+                &path,
+                8,
+                1 << 20,
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(5)
+            )
+            .await,
+            Err(PumpError::Chunk("reset".to_string()))
+        );
+        // Wrong advertised digest.
+        let (_dir, path) = pump_scratch();
+        let source = ScriptSource::new(vec![PumpScript::Emit(bytes::Bytes::from_static(
+            b"01234567",
+        ))]);
+        let wrong = "0".repeat(64);
+        assert_eq!(
+            pump_to_staging(
+                source,
+                &path,
+                8,
+                1 << 20,
+                Some(&wrong),
+                Duration::from_secs(5),
+                Duration::from_secs(5)
+            )
+            .await,
+            Err(PumpError::DigestMismatch {
+                expected: wrong,
+                actual: hex_digest(b"01234567"),
+            })
+        );
+        // Correct digest passes.
+        let (_dir, path) = pump_scratch();
+        let source = ScriptSource::new(vec![PumpScript::Emit(bytes::Bytes::from_static(
+            b"01234567",
+        ))]);
+        let right = hex_digest(b"01234567");
+        let (staged, hex) = pump_to_staging(
+            source,
+            &path,
+            8,
+            1 << 20,
+            Some(&right),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!((staged, hex), (8, right));
+    }
+
+    #[test]
+    fn stream_total_timeout_scales_with_size() {
+        assert_eq!(peer_stream_total_timeout(0), Duration::from_secs(60));
+        assert_eq!(
+            peer_stream_total_timeout(10_000_000),
+            Duration::from_secs(61)
+        );
+        assert_eq!(
+            peer_stream_total_timeout(100_000_000),
+            Duration::from_secs(70)
+        );
+    }
+
+    #[tokio::test]
+    async fn federate_stalled_winner_stream_aborts() {
+        // Declares 1024 bytes, emits 8, then stalls past the 15s
+        // production idle watchdog (spec-literal timing).
+        let stalled = spawn_script_peer(
+            "stall-blob",
+            ScriptPeerConfig {
+                lookup_delay: Duration::ZERO,
+                lookup_status: 200,
+                lookup_body: serde_json::Value::Null,
+                download_bytes: b"01234567".to_vec(),
+                digest_override: None,
+                stall_declared_len: Some(1024),
+            },
+        )
+        .await;
+        let (state, dir) = requesting_state(vec![peer_for(&stalled, "stalled")], 1 << 20);
+        let keys = vec!["k".to_string()];
+        let start = std::time::Instant::now();
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        let elapsed = start.elapsed();
+        assert_eq!(won, None);
+        // Waited out the watchdog (early refusal would return in ms).
+        assert!(elapsed >= Duration::from_secs(10), "took {elapsed:?}");
+        assert_eq!(stalled.downloads.load(Ordering::SeqCst), 1);
+        // Staging swept: no .tmp survives the abort.
+        let tmps: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(tmps.is_empty(), "stale staging: {tmps:?}");
+        assert!(state.store.lookup(GLOBAL_SCOPE, "v1", &keys).is_none());
+        assert!(matches!(
+            state.store.reserve(GLOBAL_SCOPE, "stall-blob", "v1"),
+            Ok(crate::cache::store::ReserveOutcome::Created(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn federate_large_archive_streams_intact_with_digest() {
+        // 8 MiB deterministic payload with a correct digest: proves
+        // multi-megabyte buffered throughput plus verify-pass.
+        let bytes: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let digest = hex_digest(&bytes);
+        let big = spawn_script_peer(
+            "big-blob",
+            ScriptPeerConfig {
+                lookup_delay: Duration::ZERO,
+                lookup_status: 200,
+                lookup_body: serde_json::Value::Null,
+                download_bytes: bytes.clone(),
+                digest_override: Some(digest.clone()),
+                stall_declared_len: None,
+            },
+        )
+        .await;
+        let (state, _dir) = requesting_state(vec![peer_for(&big, "big")], 1 << 30);
+        let keys = vec!["big-blob".to_string()];
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        assert_eq!(won.as_deref(), Some("big-blob"));
+        let entry = state.store.lookup(GLOBAL_SCOPE, "v1", &keys).unwrap();
+        assert_eq!(entry.size, bytes.len() as u64);
+        assert_eq!(entry.sha256.as_deref(), Some(digest.as_str()));
+    }
+
+    #[tokio::test]
+    async fn federate_wrong_digest_aborts() {
+        let liar = spawn_script_peer(
+            "liar-blob",
+            ScriptPeerConfig {
+                lookup_delay: Duration::ZERO,
+                lookup_status: 200,
+                lookup_body: serde_json::Value::Null,
+                download_bytes: b"actual-bytes".to_vec(),
+                digest_override: Some("f".repeat(64)),
+                stall_declared_len: None,
+            },
+        )
+        .await;
+        let (state, _dir) = requesting_state(vec![peer_for(&liar, "liar")], 1 << 20);
+        let keys = vec!["k".to_string()];
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        assert_eq!(won, None);
+        assert!(state.store.lookup(GLOBAL_SCOPE, "v1", &keys).is_none());
+        assert!(matches!(
+            state.store.reserve(GLOBAL_SCOPE, "liar-blob", "v1"),
+            Ok(crate::cache::store::ReserveOutcome::Created(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn federate_legacy_peer_without_digest_streams() {
+        // No digest field at all: length checks still apply, digest
+        // verification skips (pins the backward-compat contract).
+        let legacy = spawn_script_peer("legacy-blob", hit_config(Duration::ZERO, b"LEGACY")).await;
+        let (state, _dir) = requesting_state(vec![peer_for(&legacy, "legacy")], 1 << 20);
+        let keys = vec!["legacy-blob".to_string()];
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        assert_eq!(won.as_deref(), Some("legacy-blob"));
+        let entry = state.store.lookup(GLOBAL_SCOPE, "v1", &keys).unwrap();
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some(hex_digest(b"LEGACY").as_str())
+        );
     }
 
     #[tokio::test]

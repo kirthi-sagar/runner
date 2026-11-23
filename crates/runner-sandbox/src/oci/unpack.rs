@@ -84,7 +84,11 @@ fn resolve_link_target(link_parent_rel: &Path, target: &Path) -> Result<PathBuf,
     let escape = || format!("link target escapes rootfs: {}", target.display());
     // Absolute targets resolve from the container root, relative
     // ones from the link's (clean) parent directory.
-    let absolute = target.is_absolute();
+    // Container-absolute means a leading `/` in the layer bytes:
+    // `Path::is_absolute` is host-defined (on Windows a rooted
+    // `/x` with no drive prefix is NOT absolute), so layer
+    // semantics must not consult it.
+    let absolute = target.as_os_str().as_encoded_bytes().starts_with(b"/");
     let mut stack: Vec<std::ffi::OsString> = if absolute {
         Vec::new()
     } else {

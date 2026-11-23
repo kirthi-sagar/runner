@@ -5,6 +5,7 @@
 pub mod cache;
 pub mod download;
 pub mod registry;
+pub mod unpack;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

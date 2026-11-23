@@ -328,6 +328,12 @@ enum CacheCommands {
         #[arg(long)]
         older_than: Option<u64>,
     },
+    /// List live LAN cache peers from the daemon's peer table
+    Peers {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1175,6 +1181,20 @@ async fn cmd_cache_stats(format: &str) -> Result<()> {
     Ok(())
 }
 
+/// `runner cache peers`: live LAN cache peers from the daemon's table.
+async fn cmd_cache_peers(format: &str) -> Result<()> {
+    use runner_cli::cache::{parse_peers, render_peers_json, render_peers_text};
+
+    let result = daemon_call("cache_peers", None).await?;
+    let peers = parse_peers(&result);
+    match format.trim().to_ascii_lowercase().as_str() {
+        "text" => print!("{}", render_peers_text(&peers)),
+        "json" => println!("{}", render_peers_json(&peers)),
+        other => anyhow::bail!("unsupported cache peers format {other:?}: want text|json"),
+    }
+    Ok(())
+}
+
 /// `runner cache clear`: purge archives (all or idle longer than N days).
 async fn cmd_cache_clear(all: bool, older_than: Option<u64>) -> Result<()> {
     if !all && older_than.is_none() {
@@ -1339,7 +1359,11 @@ async fn main() -> Result<()> {
                             // background browse starts below when LAN-bound.
                             let peer_table =
                                 runner_core::mesh::discovery::MdnsCachePeerTable::new();
-                            let mut server_state = CacheServerState::new(store, base.clone());
+                            let mut server_state = CacheServerState::with_federation(
+                                store,
+                                base.clone(),
+                                config.cache.federation.clone(),
+                            );
                             server_state.peers = std::sync::Arc::new(
                                 runner_core::cache::server::MdnsPeerResolver::with_table(
                                     peer_table.clone(),
@@ -1645,6 +1669,9 @@ async fn main() -> Result<()> {
             }
             CacheCommands::Clear { all, older_than } => {
                 cmd_cache_clear(all, older_than).await?;
+            }
+            CacheCommands::Peers { format } => {
+                cmd_cache_peers(&format).await?;
             }
         },
         Commands::Exec {

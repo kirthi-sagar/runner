@@ -521,6 +521,12 @@ impl SupervisorState {
         self.cache.as_ref().map(|s| s.token.clone())
     }
 
+    /// Live LAN peer-table rows for `cache peers` inspection
+    /// (None when the proxy never bound).
+    pub fn cache_peer_snapshot(&self) -> Option<Vec<crate::cache::server::CachePeerSnapshot>> {
+        self.cache.as_ref().map(|s| s.peers.peer_snapshot())
+    }
+
     pub fn cloud_spend_cap(&self) -> f64 {
         self.cloud_spend_cap
     }
@@ -1247,6 +1253,8 @@ mod tests {
             download_secret: [7u8; 32],
             http: reqwest::Client::new(),
             peers: std::sync::Arc::new(MdnsPeerResolver::new()),
+            federation: crate::config::CacheFederationConfig::default(),
+            donor_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         });
         assert!(flush_cache_index(&state).await);
         let index = std::fs::read_dir(dir.path())

@@ -94,6 +94,10 @@ pub struct CacheServerState {
     pub http: reqwest::Client,
     /// Peer discovery (mDNS in production, static in tests).
     pub peers: std::sync::Arc<dyn PeerResolver>,
+    /// Donor governance for serving LAN peers.
+    pub federation: crate::config::CacheFederationConfig,
+    /// Donor stream permits (loopback never draws from this).
+    pub donor_permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for CacheServerState {
@@ -110,11 +114,25 @@ impl std::fmt::Debug for CacheServerState {
 impl CacheServerState {
     /// Build state with fresh per-boot credentials from the OS RNG.
     pub fn new(store: CacheStore, public_base: String) -> Self {
+        Self::with_federation(
+            store,
+            public_base,
+            crate::config::CacheFederationConfig::default(),
+        )
+    }
+
+    /// Build state with explicit donor governance (daemon boot).
+    pub fn with_federation(
+        store: CacheStore,
+        public_base: String,
+        federation: crate::config::CacheFederationConfig,
+    ) -> Self {
         use rand::RngCore;
         let mut secret = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut secret);
         let mut token_bytes = [0u8; 24];
         rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        let permits = federation.max_concurrent_peer_streams.max(1);
         Self {
             store,
             public_base,
@@ -122,6 +140,8 @@ impl CacheServerState {
             download_secret: secret,
             http: reqwest::Client::new(),
             peers: std::sync::Arc::new(MdnsPeerResolver::new()),
+            federation,
+            donor_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(permits)),
         }
     }
 }
@@ -138,6 +158,40 @@ pub struct CachePeer {
 #[async_trait::async_trait]
 pub trait PeerResolver: Send + Sync {
     async fn cache_peers(&self) -> Vec<CachePeer>;
+    /// Live peer-table rows for inspection (default: none tracked).
+    fn peer_snapshot(&self) -> Vec<CachePeerSnapshot> {
+        Vec::new()
+    }
+}
+
+/// One peer-table row for `cache peers` inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachePeerSnapshot {
+    pub node_id: String,
+    /// Resolved endpoint (empty when the node advertises no usable
+    /// cache address).
+    pub base_url: String,
+    /// Advertised cache port (None for legacy/pre-federation rows).
+    pub port: Option<u16>,
+    pub cache_enabled: bool,
+    pub last_seen_secs: u64,
+}
+
+/// Project one table row to its inspection shape (pure).
+pub fn snapshot_row(
+    node: &crate::mesh::discovery::DiscoveredNode,
+    age: Duration,
+) -> CachePeerSnapshot {
+    let metrics = node.metrics.as_ref();
+    CachePeerSnapshot {
+        node_id: crate::mesh::discovery::MdnsCachePeerTable::node_key(node).to_string(),
+        base_url: cache_peer_from_node(node)
+            .map(|peer| peer.base_url)
+            .unwrap_or_default(),
+        port: metrics.and_then(|m| m.cache_port),
+        cache_enabled: metrics.is_some_and(|m| m.cache_enabled),
+        last_seen_secs: age.as_secs(),
+    }
 }
 
 /// Production resolver: instant snapshot of the continuous
@@ -175,6 +229,14 @@ impl PeerResolver for MdnsPeerResolver {
             .iter()
             .filter_map(cache_peer_from_node)
             .take(MAX_FEDERATION_PEERS)
+            .collect()
+    }
+
+    fn peer_snapshot(&self) -> Vec<CachePeerSnapshot> {
+        self.table
+            .snapshot_with_seen(std::time::Instant::now())
+            .iter()
+            .map(|(node, age)| snapshot_row(node, *age))
             .collect()
     }
 }
@@ -914,6 +976,62 @@ fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
 /// `GET artifacts/{id}`: full, HEAD, or single-range download.
 /// Deliberately unauthenticated: the client's downloader sends no
 /// credentials (verified against `downloadUtils.ts`).
+/// Donor admission verdict for one download request.
+enum DonorGate {
+    /// Loopback worker: serve, no permit drawn.
+    Local,
+    /// LAN peer admitted: the permit guards the stream below.
+    Admitted(tokio::sync::OwnedSemaphorePermit),
+    /// Peer serving disabled entirely.
+    Disabled,
+    /// All donor stream permits in use.
+    Saturated,
+}
+
+/// Pure donor admission: loopback always serves; LAN peers need
+/// serving enabled plus a free stream permit (never queued — excess
+/// donors fail fast with 429). Unit-tested directly; the socket
+/// wiring (`is_loopback` from `ConnectInfo`) is one line below.
+fn donor_gate(
+    federation: &crate::config::CacheFederationConfig,
+    permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    is_loopback: bool,
+) -> DonorGate {
+    if is_loopback {
+        return DonorGate::Local;
+    }
+    if !federation.enable_peer_serving {
+        return DonorGate::Disabled;
+    }
+    match permits.clone().try_acquire_owned() {
+        Ok(permit) => DonorGate::Admitted(permit),
+        Err(_) => DonorGate::Saturated,
+    }
+}
+
+/// Stream wrapper holding a donor permit until the body ends or
+/// drops: completion, client disconnect, and abort all release via
+/// RAII (the permit is a field, so every drop path frees it).
+struct PermitStream<S> {
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    inner: S,
+}
+
+impl<S> futures_util::Stream for PermitStream<S>
+where
+    S: futures_util::Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.inner).poll_next(cx)
+    }
+}
+
 async fn download_artifact(
     State(state): State<CacheServerState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -931,6 +1049,30 @@ async fn download_artifact(
     if !authed {
         return unauthorized();
     }
+    // Donor governance (LAN peers only; loopback never draws).
+    // HEAD draws momentarily and releases on return.
+    let donor_permit = match donor_gate(
+        &state.federation,
+        &state.donor_permits,
+        peer.ip().is_loopback(),
+    ) {
+        DonorGate::Local => None,
+        DonorGate::Admitted(permit) => Some(permit),
+        DonorGate::Disabled => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "peer serving disabled" })),
+            )
+                .into_response();
+        }
+        DonorGate::Saturated => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "donor peer stream limit reached" })),
+            )
+                .into_response();
+        }
+    };
     if method == Method::HEAD {
         return match state.store.entry_size(id) {
             Some(total) => (
@@ -979,7 +1121,12 @@ async fn download_artifact(
     if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let stream = tokio_util::io::ReaderStream::new(file.take(len));
+    // The donor permit (if any) rides the body: released when the
+    // stream completes, the client disconnects, or the body drops.
+    let stream = PermitStream {
+        _permit: donor_permit,
+        inner: tokio_util::io::ReaderStream::new(file.take(len)),
+    };
     state.store.record_served(id, len);
     // Non-loopback downloads are LAN peers, not local workers.
     if !peer.ip().is_loopback() {
@@ -2006,6 +2153,196 @@ mod tests {
         assert_eq!(
             entry.sha256.as_deref(),
             Some(hex_digest(b"LEGACY").as_str())
+        );
+    }
+
+    fn federation(max_streams: usize, serving: bool) -> crate::config::CacheFederationConfig {
+        crate::config::CacheFederationConfig {
+            max_concurrent_peer_streams: max_streams,
+            enable_peer_serving: serving,
+        }
+    }
+
+    #[test]
+    fn donor_gate_admission_matrix() {
+        use std::sync::Arc;
+        // Loopback always serves, drawing nothing (even disabled).
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = permits.clone().try_acquire_owned().unwrap();
+        assert!(matches!(
+            donor_gate(&federation(1, false), &permits, true),
+            DonorGate::Local
+        ));
+        assert_eq!(permits.available_permits(), 0);
+        drop(held);
+        // Disabled donor rejects LAN peers.
+        let permits = Arc::new(tokio::sync::Semaphore::new(4));
+        assert!(matches!(
+            donor_gate(&federation(4, false), &permits, false),
+            DonorGate::Disabled
+        ));
+        // Saturated donor rejects; released permits re-admit.
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = permits.clone().try_acquire_owned().unwrap();
+        assert!(matches!(
+            donor_gate(&federation(1, true), &permits, false),
+            DonorGate::Saturated
+        ));
+        drop(held);
+        assert!(matches!(
+            donor_gate(&federation(1, true), &permits, false),
+            DonorGate::Admitted(_)
+        ));
+    }
+
+    /// Donor with one committed archive; returns (state, dir-guard, id).
+    fn seeded_donor(
+        max_streams: usize,
+        serving: bool,
+    ) -> (CacheServerState, crate::test_support::TempDir, u64) {
+        let dir = crate::test_support::TempDir::new("donor").unwrap();
+        let store = crate::cache::store::CacheStore::open(dir.path(), 1 << 20).unwrap();
+        let id = match store.reserve(GLOBAL_SCOPE, "k", "v").unwrap() {
+            crate::cache::store::ReserveOutcome::Created(id) => id,
+            crate::cache::store::ReserveOutcome::Exists(id) => panic!("exists: {id}"),
+        };
+        store.write_chunk(id, 0, b"DONOR-PAYLOAD").unwrap();
+        store.commit(id, 13).unwrap();
+        let state = CacheServerState::with_federation(
+            store,
+            "http://127.0.0.1:8787".to_string(),
+            federation(max_streams, serving),
+        );
+        (state, dir, id)
+    }
+
+    fn signed_params(state: &CacheServerState, id: u64) -> HashMap<String, String> {
+        let mut params = HashMap::new();
+        params.insert(
+            "token".to_string(),
+            sign_download_token(&state.download_secret, id).unwrap(),
+        );
+        params
+    }
+
+    async fn get_download(
+        state: &CacheServerState,
+        peer: &str,
+        id: u64,
+    ) -> axum::response::Response {
+        use axum::extract::{ConnectInfo, Path, Query};
+        download_artifact(
+            axum::extract::State(state.clone()),
+            ConnectInfo(peer.parse().unwrap()),
+            Path(id),
+            Method::GET,
+            HeaderMap::new(),
+            Query(signed_params(state, id)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn download_rejects_disabled_donor_with_403() {
+        let (state, _dir, id) = seeded_donor(4, false);
+        let response = get_download(&state, "10.0.0.5:1234", id).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "peer serving disabled");
+    }
+
+    #[tokio::test]
+    async fn download_loopback_bypasses_disabled_donor() {
+        let (state, _dir, id) = seeded_donor(4, false);
+        let response = get_download(&state, "127.0.0.1:1234", id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"DONOR-PAYLOAD");
+        // Loopback drew no permit.
+        assert_eq!(state.donor_permits.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn download_saturated_donor_returns_429_then_recovers() {
+        let (state, _dir, id) = seeded_donor(4, true);
+        // Exhaust every permit: the 5th donor attempt fails fast.
+        let holds: Vec<_> = (0..4)
+            .map(|_| state.donor_permits.clone().try_acquire_owned().unwrap())
+            .collect();
+        let response = get_download(&state, "10.0.0.5:1234", id).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "donor peer stream limit reached");
+        // One release re-admits immediately (no queue, no delay).
+        drop(holds);
+        let response = get_download(&state, "10.0.0.5:1234", id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn download_permit_rides_stream_lifecycle() {
+        let (state, _dir, id) = seeded_donor(4, true);
+        let response = get_download(&state, "10.0.0.5:1234", id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // Permit held while the body is alive...
+        assert_eq!(state.donor_permits.available_permits(), 3);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"DONOR-PAYLOAD");
+        drop(body);
+        // ...released when the stream completes and drops.
+        assert_eq!(state.donor_permits.available_permits(), 4);
+    }
+
+    #[test]
+    fn donor_permits_clamp_zero_to_one() {
+        let dir = crate::test_support::TempDir::new("donor-zero").unwrap();
+        let store = crate::cache::store::CacheStore::open(dir.path(), 1 << 20).unwrap();
+        let state = CacheServerState::with_federation(
+            store,
+            "http://127.0.0.1:8787".to_string(),
+            federation(0, true),
+        );
+        assert_eq!(state.donor_permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn snapshot_row_projects_active_and_legacy() {
+        let row = snapshot_row(&active_node("node-a", "10.0.0.2"), Duration::from_secs(42));
+        assert_eq!(
+            row,
+            CachePeerSnapshot {
+                node_id: "node-a".to_string(),
+                base_url: "http://10.0.0.2:8787".to_string(),
+                port: Some(8787),
+                cache_enabled: true,
+                last_seen_secs: 42,
+            }
+        );
+        // Legacy row without metrics: unresolvable but still listed.
+        let mut legacy = active_node("", "10.0.0.3");
+        legacy.instance = "legacy._runner._tcp.local.".to_string();
+        legacy.metrics = None;
+        legacy.addrs.clear();
+        let row = snapshot_row(&legacy, Duration::from_secs(7));
+        assert_eq!(
+            row,
+            CachePeerSnapshot {
+                node_id: "legacy._runner._tcp.local.".to_string(),
+                base_url: String::new(),
+                port: None,
+                cache_enabled: false,
+                last_seen_secs: 7,
+            }
         );
     }
 

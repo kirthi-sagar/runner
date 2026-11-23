@@ -208,6 +208,30 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                     "error": { "code": -32603, "message": "cache proxy not running" } }),
             }
         }
+        "cache_peers" => {
+            let guard = state.read().await;
+            match guard.cache_peer_snapshot() {
+                Some(peers) => {
+                    let rows: Vec<Value> = peers
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "node_id": p.node_id,
+                                "base_url": p.base_url,
+                                "port": p.port,
+                                "cache_enabled": p.cache_enabled,
+                                "last_seen_secs": p.last_seen_secs,
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                        "peers": rows,
+                    } })
+                }
+                None => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": "cache proxy not running" } }),
+            }
+        }
         "cloud_terminate" => {
             let instance_id = value
                 .get("params")
@@ -795,6 +819,69 @@ mod tests {
         )
         .await;
         assert_eq!(res["result"]["removed"], 0);
+    }
+
+    #[tokio::test]
+    async fn cache_peers_reports_table_snapshot() {
+        use crate::cache::server::{CacheServerState, MdnsPeerResolver};
+        use crate::mesh::discovery::{DiscoveredNode, LanMetrics, MdnsCachePeerTable};
+        use std::time::Instant;
+
+        let state = new_shared_state();
+        // No cache attached: honest error, not an empty list.
+        let res = handle_ipc_request(cloud_req("cache_peers", serde_json::json!({})), &state).await;
+        assert_eq!(res["error"]["code"], -32603);
+
+        let dir = crate::test_support::TempDir::new("ipc-peers").unwrap();
+        let store = crate::cache::store::CacheStore::open(&dir.path().join("c"), 1 << 30).unwrap();
+        let table = MdnsCachePeerTable::new();
+        table.register_heartbeat(
+            DiscoveredNode {
+                instance: "node-a._runner._tcp.local.".to_string(),
+                host: "node-a.local".to_string(),
+                port: 9535,
+                addrs: vec!["10.0.0.2".parse().unwrap()],
+                metrics: Some(LanMetrics {
+                    cores: 8,
+                    ram_mb: 16384,
+                    slots: 4,
+                    cache_port: Some(8787),
+                    cache_enabled: true,
+                    node_id: "node-a".to_string(),
+                    cache_token: "tok".to_string(),
+                }),
+            },
+            Instant::now(),
+        );
+        // Legacy row: listed with blanks, not dropped.
+        table.register_heartbeat(
+            DiscoveredNode {
+                instance: "legacy._runner._tcp.local.".to_string(),
+                host: "legacy.local".to_string(),
+                port: 9535,
+                addrs: vec![],
+                metrics: None,
+            },
+            Instant::now(),
+        );
+        let mut server_state = CacheServerState::new(store, "http://127.0.0.1:8787".to_string());
+        server_state.peers = std::sync::Arc::new(MdnsPeerResolver::with_table(table));
+        state.write().await.set_cache(server_state);
+        let res = handle_ipc_request(cloud_req("cache_peers", serde_json::json!({})), &state).await;
+        let peers = res["result"]["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 2);
+        let active = peers.iter().find(|p| p["node_id"] == "node-a").unwrap();
+        assert_eq!(active["base_url"], "http://10.0.0.2:8787");
+        assert_eq!(active["port"], 8787);
+        assert_eq!(active["cache_enabled"], true);
+        assert!(active["last_seen_secs"].as_u64().unwrap() < 5);
+        let legacy = peers
+            .iter()
+            .find(|p| p["node_id"] == "legacy._runner._tcp.local.")
+            .unwrap();
+        assert_eq!(legacy["base_url"], "");
+        assert!(legacy["port"].is_null());
+        assert_eq!(legacy["cache_enabled"], false);
     }
 
     #[tokio::test]

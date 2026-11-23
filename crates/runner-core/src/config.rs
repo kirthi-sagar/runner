@@ -673,6 +673,40 @@ pub struct CacheConfig {
     /// clamped to a 60s floor).
     #[serde(default = "default_cache_sweep_secs")]
     pub sweep_secs: u64,
+    /// LAN federation donor policy (`[cache.federation]`).
+    #[serde(default)]
+    pub federation: CacheFederationConfig,
+}
+
+/// Donor governance for serving archives to LAN peers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheFederationConfig {
+    /// Max simultaneous archive streams to non-loopback peers
+    /// (default 4; excess donors get 429; 0 clamps to 1 — use
+    /// `enable_peer_serving = false` to serve none).
+    #[serde(default = "default_max_concurrent_peer_streams")]
+    pub max_concurrent_peer_streams: usize,
+    /// Serve archives to LAN peers at all (default true; false 403s
+    /// every non-loopback download while loopback keeps working).
+    #[serde(default = "default_enable_peer_serving")]
+    pub enable_peer_serving: bool,
+}
+
+fn default_max_concurrent_peer_streams() -> usize {
+    4
+}
+
+fn default_enable_peer_serving() -> bool {
+    true
+}
+
+impl Default for CacheFederationConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_peer_streams: default_max_concurrent_peer_streams(),
+            enable_peer_serving: default_enable_peer_serving(),
+        }
+    }
 }
 
 fn default_cache_listen() -> String {
@@ -699,6 +733,7 @@ impl Default for CacheConfig {
             max_size_gb: default_cache_max_size_gb(),
             ttl_secs: default_cache_ttl_secs(),
             sweep_secs: default_cache_sweep_secs(),
+            federation: CacheFederationConfig::default(),
         }
     }
 }
@@ -1002,6 +1037,28 @@ mod tests {
             limits.max_duration_secs,
             ReservationLimits::default().max_duration_secs
         );
+    }
+
+    #[test]
+    fn cache_federation_defaults_and_parses() {
+        let defaults = CacheFederationConfig::default();
+        assert_eq!(defaults.max_concurrent_peer_streams, 4);
+        assert!(defaults.enable_peer_serving);
+        // Missing section keeps defaults.
+        let config: RunnerConfig = toml::from_str("[cache]\n").unwrap();
+        assert_eq!(config.cache.federation, defaults);
+        // Partial override keeps the rest.
+        let config: RunnerConfig =
+            toml::from_str("[cache.federation]\nmax_concurrent_peer_streams = 2\n").unwrap();
+        assert_eq!(config.cache.federation.max_concurrent_peer_streams, 2);
+        assert!(config.cache.federation.enable_peer_serving);
+        // Full override.
+        let config: RunnerConfig = toml::from_str(
+            "[cache.federation]\nmax_concurrent_peer_streams = 8\nenable_peer_serving = false\n",
+        )
+        .unwrap();
+        assert_eq!(config.cache.federation.max_concurrent_peer_streams, 8);
+        assert!(!config.cache.federation.enable_peer_serving);
     }
 
     #[test]

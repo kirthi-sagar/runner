@@ -253,6 +253,15 @@ impl MdnsCachePeerTable {
     /// rows are filtered here even between sweeps, so the TTL is a
     /// hard visibility bound, not a sweep-schedule artifact.
     pub fn snapshot(&self, now: Instant) -> Vec<DiscoveredNode> {
+        self.snapshot_with_seen(now)
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect()
+    }
+
+    /// Snapshot plus per-row heartbeat age (for CLI inspection).
+    /// Same live/non-self filter as [`snapshot`](Self::snapshot).
+    pub fn snapshot_with_seen(&self, now: Instant) -> Vec<(DiscoveredNode, Duration)> {
         let Ok(inner) = self.inner.read() else {
             return Vec::new();
         };
@@ -260,12 +269,11 @@ impl MdnsCachePeerTable {
             .peers
             .values()
             .filter(|entry| now.duration_since(entry.last_seen) <= PEER_HEARTBEAT_TTL)
-            .map(|entry| &entry.node)
-            .filter(|node| match &inner.own_node_id {
-                Some(own) => Self::node_key(node) != own,
+            .filter(|entry| match &inner.own_node_id {
+                Some(own) => Self::node_key(&entry.node) != own,
                 None => true,
             })
-            .cloned()
+            .map(|entry| (entry.node.clone(), now.duration_since(entry.last_seen)))
             .collect()
     }
 
@@ -682,6 +690,33 @@ mod tests {
         let snap = table.snapshot(now);
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].instance, "b._runner._tcp.local.");
+    }
+
+    #[test]
+    fn snapshot_with_seen_reports_heartbeat_ages() {
+        let table = MdnsCachePeerTable::new();
+        let now = Instant::now();
+        table.register_heartbeat(
+            table_node("a._runner._tcp.local.", "node-a", "10.0.0.2"),
+            now,
+        );
+        table.register_heartbeat(
+            table_node("b._runner._tcp.local.", "node-b", "10.0.0.3"),
+            now + Duration::from_secs(20),
+        );
+        let snap = table.snapshot_with_seen(now + Duration::from_secs(30));
+        assert_eq!(snap.len(), 2);
+        for (node, age) in &snap {
+            if node.instance == "a._runner._tcp.local." {
+                assert_eq!(*age, Duration::from_secs(30));
+            } else {
+                assert_eq!(*age, Duration::from_secs(10));
+            }
+        }
+        // Expired rows stay out of the aged snapshot too (past the
+        // later heartbeat's TTL).
+        let stale = now + Duration::from_secs(20) + PEER_HEARTBEAT_TTL + Duration::from_secs(1);
+        assert!(table.snapshot_with_seen(stale).is_empty());
     }
 
     #[test]

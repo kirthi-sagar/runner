@@ -89,6 +89,104 @@ pub fn render_stats_json(stats: &CacheStats) -> String {
     .unwrap_or_else(|_| "{}".to_string())
 }
 
+/// One inspected LAN cache peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachePeerInfo {
+    pub node_id: String,
+    pub base_url: String,
+    pub port: Option<u16>,
+    pub cache_enabled: bool,
+    pub last_seen_secs: u64,
+}
+
+/// Parse the `result` object of a `cache_peers` IPC response.
+pub fn parse_peers(result: &serde_json::Value) -> Vec<CachePeerInfo> {
+    result["peers"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| CachePeerInfo {
+                    node_id: row["node_id"].as_str().unwrap_or("").to_string(),
+                    base_url: row["base_url"].as_str().unwrap_or("").to_string(),
+                    port: row["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+                    cache_enabled: row["cache_enabled"].as_bool().unwrap_or(false),
+                    last_seen_secs: row["last_seen_secs"].as_u64().unwrap_or(0),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Human heartbeat age: `3s`, `2m`, `1h`.
+pub fn format_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
+}
+
+/// Render `cache peers` text output (aligned table, `-` for blanks).
+pub fn render_peers_text(peers: &[CachePeerInfo]) -> String {
+    if peers.is_empty() {
+        return "no LAN cache peers discovered\n".to_string();
+    }
+    let mut out = format!(
+        "{:<24} {:<28} {:<6} {:<7} {:<6}\n",
+        "NODE ID", "BASE URL", "PORT", "CACHE", "SEEN"
+    );
+    for peer in peers {
+        out.push_str(&format!(
+            "{:<24} {:<28} {:<6} {:<7} {:<6}\n",
+            truncate(&peer.node_id, 24),
+            truncate(display_or_dash(&peer.base_url), 28),
+            peer.port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            if peer.cache_enabled { "yes" } else { "no" },
+            format_age(peer.last_seen_secs),
+        ));
+    }
+    out
+}
+
+fn display_or_dash(value: &str) -> &str {
+    if value.is_empty() {
+        "-"
+    } else {
+        value
+    }
+}
+
+fn truncate(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        value.to_string()
+    } else {
+        // Char-boundary safe: peer names arrive over unauthenticated mDNS.
+        let head: String = value.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+/// Render `cache peers` JSON output.
+pub fn render_peers_json(peers: &[CachePeerInfo]) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "peers": peers
+            .iter()
+            .map(|p| serde_json::json!({
+                "node_id": p.node_id,
+                "base_url": p.base_url,
+                "port": p.port,
+                "cache_enabled": p.cache_enabled,
+                "last_seen_secs": p.last_seen_secs,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+    .unwrap_or_else(|_| "{\"peers\":[]}".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +227,66 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+
+    #[test]
+    fn peers_parse_render_roundtrip() {
+        let peers = parse_peers(&serde_json::json!({
+            "peers": [
+                {
+                    "node_id": "node-a",
+                    "base_url": "http://10.0.0.2:8787",
+                    "port": 8787,
+                    "cache_enabled": true,
+                    "last_seen_secs": 3,
+                },
+                {
+                    "node_id": "legacy._runner._tcp.local.",
+                    "base_url": "",
+                    "port": null,
+                    "cache_enabled": false,
+                    "last_seen_secs": 125,
+                },
+            ],
+        }));
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].port, Some(8787));
+        assert_eq!(peers[1].port, None);
+        let text = render_peers_text(&peers);
+        assert!(text.contains("NODE ID"), "got: {text}");
+        assert!(text.contains("node-a"), "got: {text}");
+        assert!(text.contains("http://10.0.0.2:8787"), "got: {text}");
+        assert!(text.contains("yes"), "got: {text}");
+        assert!(text.contains("3s"), "got: {text}");
+        assert!(text.contains("2m"), "got: {text}");
+        assert!(text.contains("no"), "got: {text}");
+        let json: serde_json::Value = serde_json::from_str(&render_peers_json(&peers)).unwrap();
+        assert_eq!(json["peers"][0]["node_id"], "node-a");
+        assert_eq!(json["peers"][0]["port"], 8787);
+        assert!(json["peers"][1]["port"].is_null());
+        // Missing keys default to an empty list; empty renders kindly.
+        assert!(parse_peers(&serde_json::json!({})).is_empty());
+        assert!(render_peers_text(&[]).contains("no LAN cache peers"));
+        let json: serde_json::Value = serde_json::from_str(&render_peers_json(&[])).unwrap();
+        assert_eq!(json["peers"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn peers_text_truncates_safely() {
+        // Overlong + non-ASCII names truncate on char boundaries (never panic).
+        let peers = vec![CachePeerInfo {
+            node_id: "node-".to_string() + &"é".repeat(40),
+            base_url: "http://10.0.0.2:8787/".to_string() + &"x".repeat(60),
+            port: Some(8787),
+            cache_enabled: true,
+            last_seen_secs: 3700,
+        }];
+        let text = render_peers_text(&peers);
+        assert!(text.contains("…"), "got: {text}");
+        assert!(text.contains("1h"), "got: {text}");
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(59), "59s");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(3600), "1h");
     }
 }

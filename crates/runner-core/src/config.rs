@@ -461,7 +461,7 @@ impl RunnerProfile {
             Some(sandbox) => {
                 if let Some(driver) = &sandbox.driver {
                     match driver.trim().to_ascii_lowercase().as_str() {
-                        "process" | "microvm" => {
+                        "process" | "microvm" | "container" => {
                             config.sandbox.driver = driver.trim().to_ascii_lowercase();
                         }
                         other => warnings.push(format!(
@@ -804,7 +804,8 @@ impl Default for GovernorConfig {
 /// Sandbox tier selection + Tier-1 microVM images.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxConfig {
-    /// `process` (community namespaces) or `microvm` (enterprise Firecracker).
+    /// `process` (community namespaces), `microvm` (enterprise
+    /// Firecracker), or `container` (OCI runtime tier).
     #[serde(default = "default_sandbox_driver")]
     pub driver: String,
     /// Guest kernel (`vmlinux`) for the microVM tier.
@@ -820,6 +821,21 @@ pub struct SandboxConfig {
     /// unavailable (see [`is_strict`]).
     #[serde(default)]
     pub strict: bool,
+    /// OCI container tier settings (`[sandbox.container]`).
+    #[serde(default)]
+    pub container: SandboxContainerConfig,
+}
+
+/// OCI container tier settings.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SandboxContainerConfig {
+    /// Explicit OCI runtime binary override (default: probe
+    /// `crun`/`runc`/`youki`/`podman`/`docker` on PATH, in order).
+    #[serde(default)]
+    pub runtime_path: Option<PathBuf>,
+    /// Default container image when the workload names none.
+    #[serde(default)]
+    pub default_image: Option<String>,
 }
 
 fn default_sandbox_driver() -> String {
@@ -834,6 +850,7 @@ impl Default for SandboxConfig {
             rootfs_path: None,
             firecracker_bin: None,
             strict: false,
+            container: SandboxContainerConfig::default(),
         }
     }
 }
@@ -1037,6 +1054,40 @@ mod tests {
             limits.max_duration_secs,
             ReservationLimits::default().max_duration_secs
         );
+    }
+
+    #[test]
+    fn sandbox_container_section_defaults_and_parses() {
+        // Missing section keeps defaults.
+        let config: RunnerConfig = toml::from_str("[sandbox]\n").unwrap();
+        assert_eq!(config.sandbox.container, SandboxContainerConfig::default());
+        assert_eq!(config.sandbox.container.runtime_path, None);
+        assert_eq!(config.sandbox.container.default_image, None);
+        // Full override.
+        let config: RunnerConfig = toml::from_str(
+            "[sandbox.container]\nruntime_path = \"/usr/bin/crun\"\ndefault_image = \"ubuntu:24.04\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.sandbox.container.runtime_path,
+            Some(PathBuf::from("/usr/bin/crun"))
+        );
+        assert_eq!(
+            config.sandbox.container.default_image.as_deref(),
+            Some("ubuntu:24.04")
+        );
+        // Profile layer accepts the container driver too.
+        let mut config = RunnerConfig::default();
+        let profile = RunnerProfile {
+            sandbox: Some(SandboxProfile {
+                driver: Some("container".to_string()),
+                ..SandboxProfile::default()
+            }),
+            ..RunnerProfile::default()
+        };
+        let warnings = profile.apply_to(&mut config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.sandbox.driver, "container");
     }
 
     #[test]

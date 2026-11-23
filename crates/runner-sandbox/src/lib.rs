@@ -1,5 +1,5 @@
 //! Ephemeral execution environment: wrapped official worker,
-//! mount isolation, network boundary, and the dual-tier [`driver`] engine.
+//! mount isolation, network boundary, and the multi-tier [`driver`] engine.
 
 pub mod driver;
 pub mod ebpf;
@@ -7,6 +7,7 @@ pub mod egress;
 pub mod microvm;
 pub mod mounts;
 pub mod network;
+pub mod oci;
 pub mod seatbelt;
 pub mod vsock;
 pub mod wfp;

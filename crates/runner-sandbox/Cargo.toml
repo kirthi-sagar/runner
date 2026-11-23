@@ -7,6 +7,7 @@ description = "Pluggable isolation: process namespaces (community) and microVMs 
 
 [dependencies]
 tokio.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 libc.workspace = true

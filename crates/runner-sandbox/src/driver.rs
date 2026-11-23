@@ -1,6 +1,6 @@
-//! Dual-tier sandbox engine: instant switching between lightweight
-//! process isolation (community) and hardware-isolated microVMs
-//! (enterprise) behind one [`SandboxEngine`] interface.
+//! Multi-tier sandbox engine: instant switching between lightweight
+//! process isolation (community), hardware-isolated microVMs
+//! (enterprise), and OCI containers behind one [`SandboxEngine`] interface.
 //!
 //! * [`SandboxDriver::Process`] — unprivileged user + mount namespaces with
 //!   an ephemeral tmpfs workspace (falls back to a plain governed spawn
@@ -10,6 +10,10 @@
 //!   in-guest agent, streams its stdio, and tears the VM down. It fails
 //!   closed (clean errors, never silent host execution) without KVM,
 //!   the Firecracker binary, or kernel/rootfs images.
+//! * [`SandboxDriver::Container`] — OCI container via a probed host
+//!   runtime (`crun`, `runc`, `youki`, `podman`, `docker`), executing
+//!   against a generated v1.0.2 bundle. Fails closed without a
+//!   runtime; execution itself lands after Phase 1.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -32,16 +36,20 @@ pub enum SandboxDriver {
     Process,
     /// Enterprise tier: Firecracker microVM.
     MicroVm,
+    /// OCI container tier: probed host runtime + generated bundle.
+    Container,
 }
 
 impl SandboxDriver {
-    /// Parse a driver name (`process` / `microvm`, case-insensitive).
+    /// Parse a driver name (`process` / `microvm` / `container`,
+    /// case-insensitive).
     pub fn from_name(name: &str) -> Result<Self, String> {
         match name.trim().to_ascii_lowercase().as_str() {
             "process" => Ok(Self::Process),
             "microvm" | "micro-vm" | "firecracker" => Ok(Self::MicroVm),
+            "container" | "oci" => Ok(Self::Container),
             other => Err(format!(
-                "unknown sandbox driver: '{other}' (want process|microvm)"
+                "unknown sandbox driver: '{other}' (want process|microvm|container)"
             )),
         }
     }
@@ -50,6 +58,7 @@ impl SandboxDriver {
         match self {
             Self::Process => "process",
             Self::MicroVm => "microvm",
+            Self::Container => "container",
         }
     }
 }
@@ -122,6 +131,12 @@ impl SandboxEngine {
                 .await
             }
             SandboxDriver::MicroVm => self.execute_microvm(command, timeout).await,
+            // Phase 1 ships probing, config, and bundle generation;
+            // execution binds the runtime in a later phase. Fail
+            // closed (never fall through to another tier).
+            SandboxDriver::Container => Err("container tier execution is not implemented yet \
+                 (probing/config/bundle only)"
+                .to_string()),
         }
     }
 
@@ -287,9 +302,30 @@ mod tests {
             SandboxDriver::from_name("firecracker").unwrap(),
             SandboxDriver::MicroVm
         );
+        assert_eq!(
+            SandboxDriver::from_name("container").unwrap(),
+            SandboxDriver::Container
+        );
+        assert_eq!(
+            SandboxDriver::from_name("OCI").unwrap(),
+            SandboxDriver::Container
+        );
         assert!(SandboxDriver::from_name("gvisor").is_err());
         assert_eq!(SandboxDriver::default(), SandboxDriver::Process);
         assert_eq!(SandboxDriver::MicroVm.name(), "microvm");
+        assert_eq!(SandboxDriver::Container.name(), "container");
+    }
+
+    /// Phase 1 ships probing/config/bundle only: execution fails
+    /// closed (never falls through to another tier).
+    #[tokio::test]
+    async fn container_tier_execution_fails_closed() {
+        let engine = SandboxEngine::new(SandboxDriver::Container);
+        let err = engine
+            .execute(&["true".to_string()], Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not implemented"), "{err}");
     }
 
     /// Exit-0 / exit-nonzero argv per platform (`true`/`false` don't

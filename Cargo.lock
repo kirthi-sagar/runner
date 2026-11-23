@@ -1473,6 +1473,7 @@ dependencies = [
  "reqwest",
  "runner-core",
  "runner-guest-agent",
+ "serde",
  "serde_json",
  "tar",
  "tokio",

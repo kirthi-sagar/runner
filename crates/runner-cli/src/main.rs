@@ -198,7 +198,7 @@ enum Commands {
         /// Maximum execution timeout in minutes
         #[arg(long, default_value_t = 60)]
         timeout_mins: u64,
-        /// Isolation tier: process (community namespaces) or microvm (enterprise Firecracker)
+        /// Isolation tier: process (community namespaces), microvm (enterprise Firecracker), or container (OCI runtime; probing/config/bundle only)
         #[arg(long, default_value = "process")]
         driver: String,
         /// Fail closed instead of running unsandboxed when Tier-2 is unavailable
@@ -1693,6 +1693,14 @@ async fn main() -> Result<()> {
             if tier == runner_sandbox::driver::SandboxDriver::MicroVm {
                 cmd_exec_microvm(&config, &command, timeout, strict).await;
                 return Ok(());
+            }
+            // Fail closed: never run a container job on another tier.
+            if tier == runner_sandbox::driver::SandboxDriver::Container {
+                eprintln!(
+                    "runner exec failed: container tier execution is not implemented yet \
+                     (probing/config/bundle only)"
+                );
+                std::process::exit(1);
             }
             match runner_providers::providers::local::execute_local_sandboxed(
                 &command, no_sandbox, timeout, strict,

@@ -336,20 +336,40 @@ fn lookup_hit(
     .into_response()
 }
 
-/// LAN fallback for a local miss: query discovered cache peers in
-/// order, streaming the first hit into the local store. Every failure
+/// LAN fallback for a local miss: scatter metadata probes to every
+/// candidate peer at once, stream the archive from the first
+/// responder holding the blob, and cancel the losers. Every failure
 /// mode (timeout, HTTP error, short stream, commit mismatch) falls
-/// through to the next peer and finally to a local 204. Returns the
-/// imported entry's key on success.
+/// through to a local 204. Returns the imported entry's key on
+/// success.
+///
+/// Timing: probes run concurrently, each bounded by
+/// `PEER_LOOKUP_TIMEOUT_MS`, so an all-miss resolves within one
+/// probe budget — never the sum. A failed winner stream resolves to
+/// `None` (losers were already cancelled, so there is no second
+/// attempt); the store aborts the partial upload first.
 async fn federate_lookup(
     state: &CacheServerState,
     scope: &str,
     version: &str,
     keys: &[String],
 ) -> Option<String> {
+    let mut scatter = tokio::task::JoinSet::new();
     for peer in state.peers.cache_peers().await {
-        if let Some(key) = fetch_from_peer(state, &peer, scope, version, keys).await {
-            return Some(key);
+        let client = state.http.clone();
+        let scope = scope.to_string();
+        let version = version.to_string();
+        let keys = keys.to_vec();
+        scatter.spawn(async move { probe_peer(&client, &peer, &scope, &version, &keys).await });
+    }
+    while let Some(outcome) = scatter.join_next().await {
+        // Miss, error, timeout, or a panicked probe: a later
+        // finisher may still hold the blob.
+        if let Ok(Some(hit)) = outcome {
+            // First responder wins: cancel every slower probe
+            // before streaming a byte from anyone else.
+            scatter.abort_all();
+            return stream_probe_hit(state, scope, version, hit).await;
         }
     }
     None
@@ -366,26 +386,48 @@ fn peer_lookup_url(peer: &CachePeer, scope: &str) -> String {
     }
 }
 
-async fn fetch_from_peer(
-    state: &CacheServerState,
+/// Winning probe: the first responder's stream coordinates.
+struct ProbeHit {
+    key: String,
+    location: String,
+}
+
+/// Metadata probe against one peer: hit coordinates on 200-with-JSON,
+/// `None` on miss, error, timeout, or malformed body. Bounded by
+/// `PEER_LOOKUP_TIMEOUT_MS`; never streams archive bytes.
+async fn probe_peer(
+    client: &reqwest::Client,
     peer: &CachePeer,
     scope: &str,
     version: &str,
     keys: &[String],
-) -> Option<String> {
+) -> Option<ProbeHit> {
     let lookup_url = peer_lookup_url(peer, scope);
-    let mut request = state
-        .http
+    let mut request = client
         .get(&lookup_url)
         .header("authorization", format!("Bearer {}", peer.token))
         .timeout(std::time::Duration::from_millis(PEER_LOOKUP_TIMEOUT_MS));
     request = request.query(&[("keys", keys.join(",")), ("version", version.to_string())]);
     let hit: serde_json::Value = request.send().await.ok()?.json().await.ok()?;
-    let (key, location) = (
-        hit.get("cacheKey")?.as_str()?.to_string(),
-        hit.get("archiveLocation")?.as_str()?.to_string(),
-    );
-    let mut download = state.http.get(&location).send().await.ok()?;
+    Some(ProbeHit {
+        key: hit.get("cacheKey")?.as_str()?.to_string(),
+        location: hit.get("archiveLocation")?.as_str()?.to_string(),
+    })
+}
+
+/// Stream the winner's archive into the local store with the usual
+/// integrity guards (exact content-length, running disk bound,
+/// commit verification). Any failure aborts the partial upload and
+/// resolves to `None`: the losers were already cancelled, so there
+/// is no second attempt.
+async fn stream_probe_hit(
+    state: &CacheServerState,
+    scope: &str,
+    version: &str,
+    hit: ProbeHit,
+) -> Option<String> {
+    let key = hit.key;
+    let mut download = state.http.get(&hit.location).send().await.ok()?;
     if !download.status().is_success() {
         return None;
     }
@@ -1060,6 +1102,351 @@ mod tests {
             node.addrs = addrs;
             assert!(cache_peer_from_node(&node).is_none());
         }
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Scripted fake peer: programmable lookup latency/status/body plus
+    /// a download endpoint, with hit counters proving scatter (every
+    /// peer probed) and winner-take-all (only the winner streams).
+    struct ScriptPeer {
+        base: String,
+        lookups: Arc<AtomicUsize>,
+        downloads: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct ScriptPeerConfig {
+        lookup_delay: Duration,
+        lookup_status: u16,
+        lookup_body: serde_json::Value,
+        download_bytes: Vec<u8>,
+    }
+
+    fn hit_body(key: &str, base: &str) -> serde_json::Value {
+        serde_json::json!({
+            "cacheKey": key,
+            "archiveLocation": format!("{base}/download"),
+        })
+    }
+
+    async fn spawn_script_peer(key: &str, config: ScriptPeerConfig) -> ScriptPeer {
+        use axum::{routing::get, Json, Router};
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let downloads = Arc::new(AtomicUsize::new(0));
+        // Bind first so the hit body can advertise the real download URL.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let body = if config.lookup_body.is_null() {
+            hit_body(key, &base)
+        } else {
+            config.lookup_body.clone()
+        };
+        let app = Router::new()
+            .route(
+                "/_apis/artifactcache/cache",
+                get({
+                    let lookups = lookups.clone();
+                    let config = config.clone();
+                    move || {
+                        let lookups = lookups.clone();
+                        async move {
+                            lookups.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(config.lookup_delay).await;
+                            (
+                                axum::http::StatusCode::from_u16(config.lookup_status).unwrap(),
+                                Json(body.clone()),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/download",
+                get({
+                    let downloads = downloads.clone();
+                    let bytes = config.download_bytes.clone();
+                    move || {
+                        let downloads = downloads.clone();
+                        async move {
+                            downloads.fetch_add(1, Ordering::SeqCst);
+                            bytes.clone()
+                        }
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        ScriptPeer {
+            base,
+            lookups,
+            downloads,
+        }
+    }
+
+    fn hit_config(delay: Duration, bytes: &[u8]) -> ScriptPeerConfig {
+        ScriptPeerConfig {
+            lookup_delay: delay,
+            lookup_status: 200,
+            lookup_body: serde_json::Value::Null,
+            download_bytes: bytes.to_vec(),
+        }
+    }
+
+    struct StaticPeers {
+        peers: Vec<CachePeer>,
+    }
+
+    #[async_trait::async_trait]
+    impl PeerResolver for StaticPeers {
+        async fn cache_peers(&self) -> Vec<CachePeer> {
+            self.peers.clone()
+        }
+    }
+
+    fn peer_for(script: &ScriptPeer, node_id: &str) -> CachePeer {
+        CachePeer {
+            node_id: node_id.to_string(),
+            base_url: script.base.clone(),
+            token: "t".to_string(),
+        }
+    }
+
+    fn requesting_state(
+        peers: Vec<CachePeer>,
+        max_bytes: u64,
+    ) -> (CacheServerState, crate::test_support::TempDir) {
+        let dir = crate::test_support::TempDir::new("federate-scatter").unwrap();
+        let store = crate::cache::store::CacheStore::open(dir.path(), max_bytes).unwrap();
+        let mut state = CacheServerState::new(store, "http://127.0.0.1:8787".to_string());
+        state.peers = Arc::new(StaticPeers { peers });
+        (state, dir)
+    }
+
+    /// Wait (bounded) for a counter to reach a value; loopback
+    /// delivery has no strict happens-before with the assertion.
+    async fn await_count(counter: &AtomicUsize, want: usize) {
+        for _ in 0..200 {
+            if counter.load(Ordering::SeqCst) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), want);
+    }
+
+    #[tokio::test]
+    async fn federate_first_hit_wins_and_losers_never_stream() {
+        // Slow peer FIRST with a valid hit: sequential code would take
+        // its answer and never reach the fast peer, so a fast win
+        // proves the probes overlapped — no wall-clock assertion needed.
+        let slow =
+            spawn_script_peer("slow-blob", hit_config(Duration::from_millis(50), b"SLOW")).await;
+        let fast = spawn_script_peer(
+            "fast-blob",
+            hit_config(Duration::from_millis(10), b"FAST-PAYLOAD"),
+        )
+        .await;
+        let (state, _dir) = requesting_state(
+            vec![peer_for(&slow, "slow"), peer_for(&fast, "fast")],
+            1 << 20,
+        );
+        // Exact primary key (lookup is exact-match; scripts ignore keys).
+        let keys = vec!["fast-blob".to_string()];
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        assert_eq!(won.as_deref(), Some("fast-blob"));
+        // Scattered (slow was probed) but winner-take-all (slow
+        // never streamed, even after its answer lands).
+        await_count(&slow.lookups, 1).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(slow.downloads.load(Ordering::SeqCst), 0);
+        assert_eq!(fast.downloads.load(Ordering::SeqCst), 1);
+        // Imported locally under the winning key.
+        assert!(state.store.lookup(GLOBAL_SCOPE, "v1", &keys).is_some());
+    }
+
+    #[tokio::test]
+    async fn federate_all_miss_resolves_none_within_bound() {
+        let gone = spawn_script_peer(
+            "",
+            ScriptPeerConfig {
+                lookup_delay: Duration::ZERO,
+                lookup_status: 404,
+                lookup_body: serde_json::json!({"error": "nope"}),
+                download_bytes: vec![],
+            },
+        )
+        .await;
+        let empty = spawn_script_peer(
+            "",
+            ScriptPeerConfig {
+                lookup_delay: Duration::ZERO,
+                lookup_status: 204,
+                lookup_body: serde_json::json!({}),
+                download_bytes: vec![],
+            },
+        )
+        .await;
+        // Hanging peer FIRST: exercises the probe timeout arm without
+        // stalling the verdict past one probe budget.
+        let hang = spawn_script_peer(
+            "",
+            ScriptPeerConfig {
+                lookup_delay: Duration::from_secs(30),
+                lookup_status: 200,
+                lookup_body: serde_json::json!({}),
+                download_bytes: vec![],
+            },
+        )
+        .await;
+        let (state, _dir) = requesting_state(
+            vec![
+                peer_for(&hang, "hang"),
+                peer_for(&gone, "gone"),
+                peer_for(&empty, "empty"),
+            ],
+            1 << 20,
+        );
+        let keys = vec!["k".to_string()];
+        let start = std::time::Instant::now();
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        let elapsed = start.elapsed();
+        assert_eq!(won, None);
+        // One probe budget (150ms), never the sum — 2s is 10x headroom.
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        // No short-circuit on early misses: everyone was probed, and
+        // with no winner nothing streamed.
+        for peer in [&hang, &gone, &empty] {
+            await_count(&peer.lookups, 1).await;
+            assert_eq!(peer.downloads.load(Ordering::SeqCst), 0);
+        }
+        assert!(state.store.lookup(GLOBAL_SCOPE, "v1", &keys).is_none());
+    }
+
+    #[tokio::test]
+    async fn federate_tolerates_peer_errors() {
+        // 500 with a JSON body (parses, but carries no hit).
+        let broken = spawn_script_peer(
+            "",
+            ScriptPeerConfig {
+                lookup_delay: Duration::ZERO,
+                lookup_status: 500,
+                lookup_body: serde_json::json!({"error": "boom"}),
+                download_bytes: vec![],
+            },
+        )
+        .await;
+        // 200 with a shape that is not a hit at all.
+        let weird = spawn_script_peer(
+            "",
+            ScriptPeerConfig {
+                lookup_delay: Duration::ZERO,
+                lookup_status: 200,
+                lookup_body: serde_json::json!("just-a-string"),
+                download_bytes: vec![],
+            },
+        )
+        .await;
+        let good =
+            spawn_script_peer("good-blob", hit_config(Duration::from_millis(20), b"GOOD")).await;
+        let (state, _dir) = requesting_state(
+            vec![
+                peer_for(&broken, "broken"),
+                peer_for(&weird, "weird"),
+                peer_for(&good, "good"),
+            ],
+            1 << 20,
+        );
+        let keys = vec!["good-blob".to_string()];
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        assert_eq!(won.as_deref(), Some("good-blob"));
+        assert_eq!(good.downloads.load(Ordering::SeqCst), 1);
+        assert!(state.store.lookup(GLOBAL_SCOPE, "v1", &keys).is_some());
+    }
+
+    #[tokio::test]
+    async fn federate_oversize_winner_aborts_and_releases() {
+        // Winner declares 32 bytes; the requester's store caps at 16.
+        let big = spawn_script_peer("big-blob", hit_config(Duration::ZERO, &[7u8; 32])).await;
+        let (state, _dir) = requesting_state(vec![peer_for(&big, "big")], 16);
+        let keys = vec!["k".to_string()];
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        assert_eq!(won, None);
+        assert_eq!(big.downloads.load(Ordering::SeqCst), 1);
+        // Nothing committed, and the aborted upload released its
+        // pending slot (a fresh reserve starts clean).
+        assert!(state.store.lookup(GLOBAL_SCOPE, "v1", &keys).is_none());
+        assert!(matches!(
+            state.store.reserve(GLOBAL_SCOPE, "big-blob", "v1"),
+            Ok(crate::cache::store::ReserveOutcome::Created(_))
+        ));
+    }
+
+    /// Raw-socket peer: honest lookup, lying download — declares 64
+    /// bytes, sends 8, hangs up. axum cannot emit this shape (it
+    /// always frames honestly), so the truncation arm needs raw TCP.
+    async fn spawn_truncating_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let hit = serde_json::json!({
+            "cacheKey": "cut-blob",
+            "archiveLocation": format!("{base}/download"),
+        })
+        .to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while head.len() < 8192 {
+                    match sock.read(&mut byte).await {
+                        Ok(1) => {
+                            head.push(byte[0]);
+                            if head.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let is_lookup = String::from_utf8_lossy(&head).contains("/_apis/artifactcache/");
+                if is_lookup {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{hit}",
+                        hit.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                } else {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\nconnection: close\r\n\r\n01234567")
+                        .await;
+                }
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn federate_truncated_winner_stream_aborts() {
+        let base = spawn_truncating_peer().await;
+        let peer = CachePeer {
+            node_id: "cut".to_string(),
+            base_url: base,
+            token: "t".to_string(),
+        };
+        let (state, _dir) = requesting_state(vec![peer], 1 << 20);
+        let keys = vec!["k".to_string()];
+        let won = federate_lookup(&state, GLOBAL_SCOPE, "v1", &keys).await;
+        assert_eq!(won, None);
+        assert!(state.store.lookup(GLOBAL_SCOPE, "v1", &keys).is_none());
+        assert!(matches!(
+            state.store.reserve(GLOBAL_SCOPE, "cut-blob", "v1"),
+            Ok(crate::cache::store::ReserveOutcome::Created(_))
+        ));
     }
 
     #[tokio::test]

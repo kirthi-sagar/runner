@@ -16,21 +16,21 @@ pub const OCI_RUNTIME_CANDIDATES: [&str; 5] = ["crun", "runc", "youki", "podman"
 /// True when `path` names a runnable binary: a regular file, on unix
 /// with at least one execute bit set.
 fn is_runnable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && has_exec_bit(&meta))
+        .unwrap_or(false)
+}
+
+/// Unix execute-bit check (non-unix filesystems report no mode bits).
+#[cfg(unix)]
+fn has_exec_bit(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn has_exec_bit(_meta: &std::fs::Metadata) -> bool {
+    true
 }
 
 fn find_in_dirs(name: &str, dirs: impl Iterator<Item = PathBuf>) -> Option<PathBuf> {
@@ -466,7 +466,9 @@ pub fn resolve_container_image(
 /// Ring capacity for container stdio capture (tail only; the live
 /// streams always go to our own stdout/stderr).
 const RING_CAP_BYTES: usize = 32 * 1024;
-/// Grace drain between SIGTERM and SIGKILL on timeout.
+/// Grace drain between SIGTERM and SIGKILL on timeout (unix
+/// escalation only; Windows kills directly).
+#[cfg(unix)]
 const TIMEOUT_GRACE: std::time::Duration = std::time::Duration::from_secs(4);
 /// Bound on the force-delete step so a wedged runtime cannot hang teardown.
 const TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);

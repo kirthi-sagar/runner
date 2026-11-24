@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod fs;
 pub mod governor;
 pub mod ipc;
 pub mod mcp;

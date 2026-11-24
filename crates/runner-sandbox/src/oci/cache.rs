@@ -4,6 +4,40 @@
 
 use std::path::{Path, PathBuf};
 
+/// Safety signpost planted at the cache root: reassures humans (and
+/// disk cleaners) that the directory is disposable cache.
+pub const CACHE_SIGNPOST_NAME: &str = "README_SAFE_TO_DELETE.txt";
+
+/// Signpost body: what lives here, why deletion is safe, and how
+/// runner self-heals afterwards.
+pub const CACHE_SIGNPOST_BODY: &str = "\
+This directory is runner's container layer cache.
+
+It holds downloaded container image layer blobs (content-addressed
+files named by their SHA-256 digests) plus small per-image manifest
+records. runner reads them to launch containers without
+re-downloading images it already fetched.
+
+SAFE TO DELETE: you may delete this entire directory at any time to
+reclaim disk space. Deleting it will never harm your operating
+system, break runner, or delete any of your personal files or code.
+
+runner automatically re-downloads any layer it still needs the next
+time you run a container. Nothing stored here is irreplaceable.
+";
+
+/// Plant the safety signpost when absent (never clobbers existing
+/// content; fails closed so disk problems surface at bootstrap
+/// instead of mid-download).
+fn ensure_signpost(cache_root: &Path) -> Result<(), String> {
+    let signpost = cache_root.join(CACHE_SIGNPOST_NAME);
+    if signpost.exists() {
+        return Ok(());
+    }
+    std::fs::write(&signpost, CACHE_SIGNPOST_BODY)
+        .map_err(|e| format!("cannot write cache signpost {}: {e}", signpost.display()))
+}
+
 /// Content-addressed blob store rooted at one directory.
 #[derive(Debug, Clone)]
 pub struct LayerCache {
@@ -49,10 +83,13 @@ impl LayerCache {
         &self.dir
     }
 
-    /// Create the cache root (idempotent; call before staging).
+    /// Create the cache root (idempotent; call before staging)
+    /// and plant the safety signpost when absent, so a manually
+    /// deleted cache self-heals on the next bootstrap.
     pub fn ensure_dir(&self) -> Result<(), String> {
         std::fs::create_dir_all(&self.dir)
-            .map_err(|e| format!("cannot create layer cache {}: {e}", self.dir.display()))
+            .map_err(|e| format!("cannot create layer cache {}: {e}", self.dir.display()))?;
+        ensure_signpost(&self.dir)
     }
 
     /// Hex portion of a `sha256:<hex>` digest (shape-checked).
@@ -190,6 +227,11 @@ impl ImageStore {
     pub fn write_manifest(&self, reference: &str, manifest: &StoredManifest) -> Result<(), String> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| format!("cannot create image store {}: {e}", self.dir.display()))?;
+        // The store bootstrap creates the cache root as a side
+        // effect (parent chain), so it plants the signpost too.
+        if let Some(root) = self.dir.parent() {
+            ensure_signpost(root)?;
+        }
         let bytes = serde_json::to_string_pretty(manifest)
             .map_err(|e| format!("cannot encode manifest: {e}"))?;
         std::fs::write(self.manifest_path(reference), bytes)
@@ -310,5 +352,64 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"blob");
         assert!(!tmp.exists());
         assert!(cache.contains(&digest, 4));
+    }
+
+    #[test]
+    fn ensure_dir_plants_safety_signpost() {
+        let dir = runner_core::test_support::TempDir::new("layer-signpost").unwrap();
+        let cache = LayerCache::new(dir.path().join("layers"));
+        cache.ensure_dir().unwrap();
+        let body =
+            std::fs::read_to_string(dir.path().join("layers").join(CACHE_SIGNPOST_NAME)).unwrap();
+        // All four reassurances present verbatim.
+        assert!(body.contains("container image layer blobs"), "{body}");
+        assert!(body.contains("SAFE TO DELETE"), "{body}");
+        assert!(body.contains("never harm your operating"), "{body}");
+        assert!(body.contains("automatically re-downloads"), "{body}");
+    }
+
+    #[test]
+    fn signpost_self_heals_and_never_clobbers() {
+        let dir = runner_core::test_support::TempDir::new("layer-heal").unwrap();
+        let cache = LayerCache::new(dir.path().join("layers"));
+        cache.ensure_dir().unwrap();
+        // Deleting just the file restores it on re-bootstrap.
+        let signpost = dir.path().join("layers").join(CACHE_SIGNPOST_NAME);
+        std::fs::remove_file(&signpost).unwrap();
+        cache.ensure_dir().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&signpost).unwrap(),
+            CACHE_SIGNPOST_BODY
+        );
+        // Deleting the whole tree restores both on re-bootstrap.
+        std::fs::remove_dir_all(dir.path().join("layers")).unwrap();
+        cache.ensure_dir().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&signpost).unwrap(),
+            CACHE_SIGNPOST_BODY
+        );
+        // Pre-existing content (even foreign) is never overwritten.
+        std::fs::write(&signpost, "operator note").unwrap();
+        cache.ensure_dir().unwrap();
+        assert_eq!(std::fs::read_to_string(&signpost).unwrap(), "operator note");
+    }
+
+    #[test]
+    fn manifest_store_bootstrap_plants_signpost() {
+        let dir = runner_core::test_support::TempDir::new("layer-store-sign").unwrap();
+        let cache = LayerCache::new(dir.path().join("layers"));
+        let store = ImageStore::new(cache.dir());
+        store
+            .write_manifest(
+                "example.com/app:1",
+                &StoredManifest {
+                    reference: "example.com/app:1".to_string(),
+                    manifest_digest: "sha256:bbbb".to_string(),
+                    layers: vec![],
+                    pulled_at_secs: 1,
+                },
+            )
+            .unwrap();
+        assert!(dir.path().join("layers").join(CACHE_SIGNPOST_NAME).exists());
     }
 }

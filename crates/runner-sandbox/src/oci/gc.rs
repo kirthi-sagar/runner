@@ -310,6 +310,118 @@ pub fn eviction_notice(
     ))
 }
 
+/// Outcome of one snapshot eviction pass.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SnapshotGcOutcome {
+    pub triggered: bool,
+    pub snapshots_removed: usize,
+    pub bytes_freed: u64,
+    pub stale_reaped: usize,
+}
+
+/// Run one snapshot eviction pass: always reap crash debris, then
+/// (under pressure) evict oldest complete snapshots until relief.
+/// Snapshots rebuild locally from layers (no network), so callers
+/// run this pass before blob eviction. The metrics closure is
+/// injected like [`evict_to_target`] for deterministic tests.
+pub fn evict_snapshots_to_target(
+    snapshots: &crate::oci::snapshot::SnapshotCache,
+    policy: GcPolicy,
+    metrics: &dyn Fn() -> Result<VolumeMetrics, String>,
+    now: SystemTime,
+) -> Result<SnapshotGcOutcome, String> {
+    if !policy.auto_evict {
+        return Ok(SnapshotGcOutcome::default());
+    }
+    let mut outcome = SnapshotGcOutcome {
+        stale_reaped: snapshots.reap_stale(super::snapshot::STALE_SNAPSHOT_GRACE, now),
+        ..SnapshotGcOutcome::default()
+    };
+    if !policy.should_trigger(metrics()?) {
+        return Ok(outcome);
+    }
+    outcome.triggered = true;
+    let mut candidates: Vec<_> = snapshots
+        .snapshots()
+        .into_iter()
+        .filter(|info| {
+            now.duration_since(SystemTime::UNIX_EPOCH + Duration::from_secs(info.published_secs))
+                .unwrap_or_default()
+                >= policy.min_age
+        })
+        .collect();
+    candidates.sort_by_key(|info| info.published_secs);
+    for candidate in candidates {
+        if policy.reached_target(metrics()?) {
+            break;
+        }
+        // Size resolves per eviction (after age filtering above),
+        // so young snapshots never pay a tree walk.
+        let bytes = snapshots.disk_usage_bytes(&candidate.digest);
+        match snapshots.remove(&candidate.digest) {
+            Ok(()) => {
+                outcome.snapshots_removed += 1;
+                outcome.bytes_freed += bytes;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!("cannot evict snapshot {}: {e}", candidate.digest));
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// Non-intrusive eviction notice for snapshots (mirrors
+/// [`eviction_notice`]; quiet on no-ops).
+pub fn snapshot_eviction_notice(
+    outcome: &SnapshotGcOutcome,
+    free_before_bytes: u64,
+    high_watermark_pct: f64,
+) -> Option<String> {
+    if outcome.snapshots_removed == 0 && outcome.stale_reaped == 0 {
+        return None;
+    }
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    Some(format!(
+        "[runner::storage] Disk pressure exceeded {:.0}%; auto-evicted {} snapshot baselines \
+         (reclaimed {:.1} MB, free space: {:.1} GB; {} stale partials reaped).",
+        high_watermark_pct,
+        outcome.snapshots_removed,
+        outcome.bytes_freed as f64 / MB,
+        free_before_bytes.saturating_add(outcome.bytes_freed) as f64 / GB,
+        outcome.stale_reaped,
+    ))
+}
+
+/// Opportunistic snapshot hook for the pull path: same fail-open
+/// contract as [`evict_if_pressured`] (callers run snapshots first,
+/// since baselines rebuild cheaper than blobs re-download).
+pub fn evict_snapshots_if_pressured(
+    snapshots: &crate::oci::snapshot::SnapshotCache,
+    policy: GcPolicy,
+    now: SystemTime,
+) -> SnapshotGcOutcome {
+    let free_before = sense_volume(snapshots.dir()).map(|m| m.free_bytes);
+    match evict_snapshots_to_target(snapshots, policy, &|| sense_volume(snapshots.dir()), now) {
+        Ok(outcome) => {
+            if let Ok(free) = free_before {
+                if let Some(notice) =
+                    snapshot_eviction_notice(&outcome, free, policy.high_watermark_pct)
+                {
+                    eprintln!("{notice}");
+                }
+            }
+            outcome
+        }
+        Err(e) => {
+            eprintln!("[runner::storage] disk sensing failed ({e}); continuing without eviction");
+            SnapshotGcOutcome::default()
+        }
+    }
+}
+
 /// Opportunistic pull-path hook: run one eviction pass with live
 /// sensing, notify on stderr when blobs actually go, and fail open
 /// (sensing errors note themselves and let the pull proceed — a
@@ -597,5 +709,102 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "no disk");
+    }
+
+    fn digest_of(tag: u8) -> String {
+        format!("sha256:{}", format!("{:02x}", tag).repeat(32))
+    }
+
+    fn publish_snapshot(
+        snapshots: &crate::oci::snapshot::SnapshotCache,
+        tag: u8,
+        size: usize,
+    ) -> String {
+        let digest = digest_of(tag);
+        let staging = snapshots.begin_publish(&digest).unwrap().unwrap();
+        std::fs::write(staging.join("f"), vec![tag; size]).unwrap();
+        snapshots.commit_publish(&digest, &staging).unwrap();
+        digest
+    }
+
+    /// Snapshots older than the policy floor evict oldest-first under
+    /// pressure (mtimes backdated absolutely — no clock games).
+    #[test]
+    fn snapshot_pressure_evicts_oldest_first() {
+        let dir = runner_core::test_support::TempDir::new("gc-snap").unwrap();
+        let snapshots = crate::oci::snapshot::SnapshotCache::new(dir.path().join("snapshots"));
+        let old = publish_snapshot(&snapshots, 1, 1000);
+        let young = publish_snapshot(&snapshots, 2, 1000);
+        let backdate = |digest: &str, days: u64| {
+            let marker = snapshots
+                .rootfs_path(digest)
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join(".complete");
+            let ancient = SystemTime::now() - Duration::from_secs(days * 86_400);
+            std::fs::File::options()
+                .write(true)
+                .open(&marker)
+                .unwrap()
+                .set_modified(ancient)
+                .unwrap();
+        };
+        backdate(&old, 200);
+        backdate(&young, 100);
+        // Pressure, then relief after exactly one eviction.
+        let calls = Cell::new(0u32);
+        let scripted = || {
+            let call = calls.get();
+            calls.set(call + 1);
+            let free_bytes = if call < 2 { 500 } else { 2500 };
+            Ok(VolumeMetrics {
+                total_bytes: 10_000,
+                free_bytes,
+            })
+        };
+        let measured = snapshots.disk_usage_bytes(&old);
+        let outcome =
+            evict_snapshots_to_target(&snapshots, policy(), &scripted, SystemTime::now()).unwrap();
+        assert!(outcome.triggered);
+        assert_eq!(outcome.snapshots_removed, 1);
+        assert_eq!(outcome.bytes_freed, measured);
+        assert!(measured >= 1000);
+        assert!(!snapshots.is_complete(&old));
+        assert!(snapshots.is_complete(&young));
+    }
+
+    #[test]
+    fn snapshot_pass_preserves_fresh_and_reaps_stale() {
+        let dir = runner_core::test_support::TempDir::new("gc-snap-keep").unwrap();
+        let snapshots = crate::oci::snapshot::SnapshotCache::new(dir.path().join("snapshots"));
+        let fresh = publish_snapshot(&snapshots, 3, 100);
+        // Incomplete staging, backdated past any grace (directory
+        // mtimes are not settable on Windows — skip there; the reap
+        // logic itself is pinned portably in the snapshot suite).
+        let stale = snapshots.begin_publish(&digest_of(4)).unwrap().unwrap();
+        let ancient = SystemTime::now() - Duration::from_secs(400 * 86_400);
+        if std::fs::File::open(&stale)
+            .and_then(|file| file.set_modified(ancient))
+            .is_err()
+        {
+            eprintln!("cannot backdate test staging dir; skipping stale-reap assert");
+            return;
+        }
+        // Plentiful disk: nothing evicts, but debris still reaps.
+        let scripted = || {
+            Ok(VolumeMetrics {
+                total_bytes: 10_000,
+                free_bytes: 9_000,
+            })
+        };
+        let outcome =
+            evict_snapshots_to_target(&snapshots, policy(), &scripted, SystemTime::now()).unwrap();
+        // Fresh baselines survive even a triggered pass; only the
+        // backdated staging dir reaps.
+        assert_eq!(outcome.snapshots_removed, 0);
+        assert_eq!(outcome.stale_reaped, 1);
+        assert!(snapshots.is_complete(&fresh));
+        assert!(!stale.exists());
     }
 }

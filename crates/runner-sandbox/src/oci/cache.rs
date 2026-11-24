@@ -29,7 +29,7 @@ time you run a container. Nothing stored here is irreplaceable.
 /// Plant the safety signpost when absent (never clobbers existing
 /// content; fails closed so disk problems surface at bootstrap
 /// instead of mid-download).
-fn ensure_signpost(cache_root: &Path) -> Result<(), String> {
+pub(crate) fn ensure_signpost(cache_root: &Path) -> Result<(), String> {
     let signpost = cache_root.join(CACHE_SIGNPOST_NAME);
     if signpost.exists() {
         return Ok(());
@@ -93,7 +93,8 @@ impl LayerCache {
     }
 
     /// Hex portion of a `sha256:<hex>` digest (shape-checked).
-    fn hex_of(digest: &str) -> Result<&str, String> {
+    /// Shared with the snapshot store so both key content identically.
+    pub(crate) fn hex_of(digest: &str) -> Result<&str, String> {
         if digest.len() == 7 + 64
             && digest.starts_with("sha256:")
             && digest[7..].bytes().all(|b| b.is_ascii_hexdigit())

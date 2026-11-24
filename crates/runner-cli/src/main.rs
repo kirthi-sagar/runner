@@ -1449,12 +1449,13 @@ async fn cmd_image_pull(config: &RunnerConfig, image: &str) -> Result<()> {
 
     let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
     // Opportunistic pre-pull eviction (fail-open: never blocks).
-    runner_sandbox::oci::gc::evict_if_pressured(
-        &cache,
-        &store,
-        runner_sandbox::oci::gc::GcPolicy::from_config(&config.storage.gc),
-        std::time::SystemTime::now(),
-    );
+    // Snapshots go first: baselines rebuild locally while blobs
+    // re-download.
+    let snapshots = runner_sandbox::oci::snapshot::SnapshotCache::beside_layer_cache(&cache);
+    let policy = runner_sandbox::oci::gc::GcPolicy::from_config(&config.storage.gc);
+    let now = std::time::SystemTime::now();
+    runner_sandbox::oci::gc::evict_snapshots_if_pressured(&snapshots, policy, now);
+    runner_sandbox::oci::gc::evict_if_pressured(&cache, &store, policy, now);
     let auth_store = runner_core::auth::store::AuthStore::default_store();
     match pull_image(&cache, &store, image, auth_store.as_ref()).await {
         Ok(outcome) => {

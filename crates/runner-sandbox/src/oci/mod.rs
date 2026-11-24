@@ -7,6 +7,7 @@ pub mod download;
 pub mod gc;
 pub mod pull;
 pub mod registry;
+pub mod snapshot;
 pub mod unpack;
 
 use std::collections::HashMap;
@@ -895,36 +896,46 @@ async fn launch_container(
     // Auto-pull populates the bundle rootfs from cached layers (fresh
     // pulls resolve + download first); without it the minimal rootfs
     // stands (hermetic tests, config opt-out).
-    let pulled: Option<Vec<PathBuf>> = if launch.auto_pull {
+    let cache = cache::LayerCache::new(
+        launch
+            .layer_cache_dir
+            .clone()
+            .unwrap_or_else(cache::LayerCache::default_dir),
+    );
+    let store = cache::ImageStore::new(cache.dir());
+    let snapshots = snapshot::SnapshotCache::beside_layer_cache(&cache);
+    let pulled: Option<(String, Vec<PathBuf>)> = if launch.auto_pull {
         let reference = registry::OciReference::parse(&launch.image)?;
-        let cache = cache::LayerCache::new(
-            launch
-                .layer_cache_dir
-                .clone()
-                .unwrap_or_else(cache::LayerCache::default_dir),
-        );
-        let store = cache::ImageStore::new(cache.dir());
         let client = registry::RegistryClient::new();
         // Opportunistic pre-pull eviction (fail-open: sensing
-        // trouble never blocks the download).
+        // trouble never blocks the download). Snapshots go first:
+        // baselines rebuild locally while blobs re-download.
         if let Some(policy) = launch.gc_policy {
-            gc::evict_if_pressured(&cache, &store, policy, std::time::SystemTime::now());
+            let now = std::time::SystemTime::now();
+            gc::evict_snapshots_if_pressured(&snapshots, policy, now);
+            gc::evict_if_pressured(&cache, &store, policy, now);
         }
         let resolved = pull::ensure_image(&client, &cache, &store, &reference).await?;
-        Some(
-            resolved
-                .layers
-                .iter()
-                .map(|layer| cache.path_for(&layer.digest))
-                .collect::<Result<_, _>>()?,
-        )
+        let layers = resolved
+            .layers
+            .iter()
+            .map(|layer| cache.path_for(&layer.digest))
+            .collect::<Result<_, _>>()?;
+        Some((resolved.manifest_digest, layers))
     } else {
         None
     };
     let dir = assemble_bundle_at(bundle_parent, &id, &spec)?;
     let mut guard = OciBundleGuard::new(runtime.clone(), id.clone(), dir.clone());
-    if let Some(layers) = &pulled {
-        if let Err(e) = unpack::unpack_layers(layers, &dir.join("rootfs")) {
+    if let Some((digest, layers)) = &pulled {
+        // Snapshot baselines provision the rootfs in ~0ms; misses
+        // unpack once and publish for the next launch.
+        if let Err(e) = snapshot::provision_rootfs(
+            &snapshots,
+            digest,
+            |target| unpack::unpack_layers(layers, target),
+            &dir.join("rootfs"),
+        ) {
             guard.teardown().await;
             return Err(e);
         }

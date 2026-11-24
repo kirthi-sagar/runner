@@ -169,6 +169,16 @@ async fn auto_pull_launch_unpacks_layers_into_bundle() {
     );
     // Both layers fetched exactly once.
     assert_eq!(registry.blob_hits.load(Ordering::SeqCst), 2);
+    // The launch published exactly one complete snapshot baseline
+    // nested in the layer cache for the next provisioning.
+    let mut complete = 0;
+    for entry in std::fs::read_dir(dir.path().join("layers").join("snapshots")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().join(".complete").is_file() {
+            complete += 1;
+        }
+    }
+    assert_eq!(complete, 1);
 }
 
 /// MCP agent path: the shim cats the unpacked marker, so captured

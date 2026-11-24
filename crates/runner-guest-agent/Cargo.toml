@@ -2,7 +2,7 @@
 name = "runner-guest-agent"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Tier-1 in-guest exec agent: runs commands inside Firecracker guests over vsock"
 
 [[bin]]

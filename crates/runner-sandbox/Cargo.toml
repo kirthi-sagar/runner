@@ -2,7 +2,7 @@
 name = "runner-sandbox"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Pluggable isolation: process namespaces (community) and microVMs (enterprise)"
 
 [dependencies]

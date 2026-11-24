@@ -1,21 +1,101 @@
-MIT License
+THE RUNNER COMMERCIAL SOURCE-AVAILABLE LICENSE
+Version 1.0 — Effective November 2026
 
-Copyright (c) 2026 Kirthi Sagar
+Copyright (c) 2026 Kirthi Sagar. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. DEFINITIONS
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+"Licensor" means Kirthi Sagar.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+"Software" means the computer software, source code, object code, documentation,
+and associated assets distributed under this license, including all crates within
+the workspace located at https://github.com/kirthi-sagar/runner.
+
+"Derivative Work" means any work, modification, translation, enhancement, fork,
+or adaptation based upon or derived from the Software, or any portion thereof.
+
+"Commercial Entity" means any corporation, limited liability company, partnership,
+sole proprietorship operating with employees or subcontractors, joint venture,
+or other organization conducting commercial, business, or revenue-generating
+operations.
+
+"Individual Developer" means a single natural person acting solely on their own
+behalf, and not as an employee, contractor, or agent for or on behalf of any
+Commercial Entity.
+
+"Permitted Environment" means hardware owned, leased, or rented directly by an
+Individual Developer for their personal development, including personal workstations,
+trusted peer-to-peer mesh nodes, and individual cloud virtual machines funded
+via personal accounts or developer credits.
+
+2. GRANT OF RIGHTS AND PERMITTED USE
+
+Subject to the terms and conditions of this Agreement, Licensor hereby grants to
+each Individual Developer a non-exclusive, worldwide, royalty-free, revocable license
+to view, download, compile, execute, and modify the Software solely within a Permitted
+Environment for:
+  (a) personal education, evaluation, and research; or
+  (b) solo freelance software development performed directly by the Individual
+      Developer for their individual clients.
+
+3. COMMERCIAL AND ENTERPRISE RESTRICTIONS
+
+Any use of the Software outside of the Permitted Use defined in Section 2 is
+strictly prohibited without a separate, written Commercial License Agreement
+executed between the user and Licensor. Prohibited uses include, without limitation:
+  (a) Execution, deployment, or integration of the Software by, within, or for the
+      benefit of any Commercial Entity;
+  (b) Multi-user, team, or collaborative enterprise deployments; and
+  (c) Shared CI/CD infrastructure, automated server fleets, or internal corporate
+      developer platforms.
+
+4. PROHIBITION OF COMPETITION AND HOSTED SERVICES
+
+Neither the Software nor any Derivative Work may be used, in whole or in part, to:
+  (a) provide, operate, or offer any hosted service, managed service, cloud platform,
+      build farm, device farm, or software-as-a-service to third parties;
+  (b) redistribute, sublicense, or resell the Software or Derivative Works; or
+  (c) provide any functionality substantially similar to or directly or indirectly
+      competing with the Software or Licensor's commercial offerings.
+
+5. TERMINATION
+
+Any breach of the terms, conditions, or restrictions of this Agreement automatically
+and immediately terminates all rights granted herein. Upon termination, you must
+immediately cease all use, execution, and distribution of the Software and destroy
+all copies in your possession or control.
+
+6. DISCLAIMER OF WARRANTIES
+
+THE SOFTWARE IS PROVIDED BY THE LICENSOR "AS IS", AND ANY EXPRESS OR IMPLIED
+WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT ARE HEREBY DISCLAIMED. IN NO
+EVENT SHALL THE LICENSOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+7. LIMITATION OF LIABILITY
+
+UNDER NO CIRCUMSTANCES SHALL LICENSOR'S AGGREGATE LIABILITY ARISING OUT OF OR
+RELATING TO THIS AGREEMENT OR THE SOFTWARE EXCEED THE GREATER OF: (A) THE TOTAL
+FEES ACTUALLY PAID BY YOU TO LICENSOR FOR THE SOFTWARE IN THE TWELVE (12) MONTHS
+PRECEDING THE CLAIM; OR (B) ZERO UNITED STATES DOLLARS ($0.00 USD).
+
+8. MISCELLANEOUS
+
+(a) Severability: If any provision of this Agreement is held to be invalid or
+unenforceable, such provision shall be reformed only to the extent necessary to make
+it enforceable, and the remaining provisions shall remain in full force and effect.
+
+(b) Entire Agreement: This Agreement constitutes the complete and exclusive agreement
+between the parties concerning the subject matter hereof and supersedes all prior
+proposals, representations, or understandings.
+
+(c) No Waiver: Failure of Licensor to enforce any provision of this Agreement shall
+not be deemed a waiver of future enforcement of that or any other provision.
+
+(d) Commercial Licensing Inquiries: For commercial agreements, fleet licensing,
+or enterprise authorizations, contact: https://github.com/kirthi-sagar/runner

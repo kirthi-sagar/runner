@@ -2,7 +2,7 @@
 name = "runner-telemetry"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "Ring-buffer output capture and structured JSON log events"
 
 [dependencies]

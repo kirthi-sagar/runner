@@ -5,7 +5,7 @@ members = [".", "crates/*"]
 [workspace.package]
 version = "2.11.1"
 edition = "2021"
-license = "MIT"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "fs", "process", "signal", "sync"] }
@@ -45,7 +45,7 @@ name = "runner"
 version.workspace = true
 edition.workspace = true
 description = "Zero-freeze, AI-agent-native local and federated CI runner mesh (open-core facade)"
-license.workspace = true
+license-file.workspace = true
 
 [lib]
 name = "runner"

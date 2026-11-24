@@ -4,29 +4,25 @@
 
 use runner_core::auth::store::DeviceCredential;
 
-/// Browser opener per host platform: program plus fixed leading
-/// args (the URL appends last). `cmd start` needs an empty title
-/// slot or it eats the URL.
+/// Browser opener per host platform (non-Windows): program plus
+/// fixed leading args (the URL appends last). Windows launches via
+/// `ShellExecuteW` instead of a child process (see below), so no
+/// shell ever parses the URL there.
+#[cfg(not(target_os = "windows"))]
 pub fn browser_command() -> (&'static str, &'static [&'static str]) {
-    #[cfg(target_os = "macos")]
-    {
+    if cfg!(target_os = "macos") {
         ("open", &[])
-    }
-    #[cfg(target_os = "windows")]
-    {
-        ("cmd", &["/C", "start", ""])
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
+    } else {
         ("xdg-open", &[])
     }
 }
 
 /// Shell metacharacters that must never reach a command line.
-/// (`%` covers `cmd.exe` `%VAR%` expansion and `;` sh-style chaining;
-/// both are legal in URLs, but forge verification URIs never need
-/// either, so both fail closed.)
-const URL_FORBIDDEN: [char; 10] = ['&', '|', ';', '<', '>', '^', '%', '"', '\'', ' '];
+/// (`%` covers `cmd.exe` `%VAR%` expansion, `!` its delayed
+/// expansion, and `;` sh-style chaining; all are legal in URLs, but
+/// forge verification URIs never need any of them, so all fail
+/// closed.)
+const URL_FORBIDDEN: [char; 11] = ['&', '|', ';', '<', '>', '^', '%', '"', '\'', ' ', '!'];
 
 /// Validate a forge-supplied URL before handing it to the OS
 /// opener: strict `http(s)` shape, non-empty host, and no shell
@@ -57,16 +53,64 @@ pub fn validate_browser_url(url: &str) -> Result<(), String> {
 /// command execution.
 pub fn open_browser(url: &str) -> std::io::Result<()> {
     validate_browser_url(url).map_err(std::io::Error::other)?;
-    let (program, prefix) = browser_command();
-    let status = std::process::Command::new(program)
-        .args(prefix)
-        .arg(url)
-        .status()?;
-    if status.success() {
+    #[cfg(target_os = "windows")]
+    {
+        open_browser_windows(url)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (program, prefix) = browser_command();
+        let status = std::process::Command::new(program)
+            .args(prefix)
+            .arg(url)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(format!(
+                "browser opener exited with {status}"
+            )))
+        }
+    }
+}
+
+/// Windows browser launch without `cmd.exe`: `ShellExecuteW` hands
+/// the URL straight to the registered handler, so no shell ever
+/// re-parses it (defense in depth behind `validate_browser_url`).
+#[cfg(target_os = "windows")]
+fn open_browser_windows(url: &str) -> std::io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+
+    let url_w: Vec<u16> = OsStr::new(url)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb_w: Vec<u16> = OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both pointers reference live NUL-terminated UTF-16
+    // buffers; remaining args are null/default per ShellExecute docs.
+    // A return above 32 signals success; at or below is an error.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb_w.as_ptr(),
+            url_w.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOW,
+        )
+    };
+    if (result as usize) > 32 {
         Ok(())
     } else {
         Err(std::io::Error::other(format!(
-            "browser opener exited with {status}"
+            "ShellExecute failed with code {}",
+            result as usize
         )))
     }
 }
@@ -175,15 +219,17 @@ pub fn logout_one(
 mod tests {
     use super::*;
 
+    // Windows launches via ShellExecuteW (no child process), so
+    // there is no command shape to pin there.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn browser_command_targets_host_opener() {
         let (program, prefix) = browser_command();
-        #[cfg(target_os = "macos")]
-        assert_eq!((program, prefix), ("open", &[] as &[&str]));
-        #[cfg(target_os = "windows")]
-        assert_eq!((program, prefix), ("cmd", &["/C", "start", ""] as &[&str]));
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        assert_eq!((program, prefix), ("xdg-open", &[] as &[&str]));
+        if cfg!(target_os = "macos") {
+            assert_eq!((program, prefix), ("open", &[] as &[&str]));
+        } else {
+            assert_eq!((program, prefix), ("xdg-open", &[] as &[&str]));
+        }
         // Every branch takes the URL as a trailing argument.
         assert!(!program.is_empty());
     }
@@ -240,6 +286,7 @@ mod tests {
         // Every command separator / substitution vector fails closed.
         for evil in [
             "https://h/x&whoami",
+            "https://evil.com/&calc.exe",
             "https://h/x|whoami",
             "https://h/x;whoami",
             "https://h/<x",
@@ -247,6 +294,7 @@ mod tests {
             "https://h/^x",
             "https://h/%PATH%",
             "https://h/\"x\"",
+            "https://h/x!y",
             "https://h/x y",
             "https://h/x\ty",
             "https://h/x\ny",

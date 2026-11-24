@@ -473,9 +473,10 @@ impl AuthStore {
 
     /// Delete one forge entry, preserving the rest (`Ok(true)`
     /// when an entry was removed). An emptied file is deleted so the
-    /// store never lingers as `{}`. Unreadable files are unlinked
-    /// outright: logout revokes unknown secrets rather than leaving
-    /// them behind.
+    /// store never lingers as `{}`. Unreadable or undecodable files
+    /// are an error, never an excuse to unlink: a targeted logout
+    /// must not destroy the whole store on a read failure (only an
+    /// explicit unqualified `clear()` removes what it cannot read).
     pub fn clear_forge(&self, host: &str) -> std::io::Result<bool> {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -485,9 +486,18 @@ impl AuthStore {
             StoreRead::Missing => return Ok(false),
             StoreRead::Bytes(bytes) => match Self::parse_store_bytes(&bytes) {
                 Ok((map, _)) => map,
-                Err(_) => return self.unlink_locked(),
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("cannot decode credential store: {e}"),
+                    ));
+                }
             },
-            StoreRead::Unreadable(_) => return self.unlink_locked(),
+            StoreRead::Unreadable(e) => {
+                return Err(std::io::Error::other(format!(
+                    "cannot read credential store: {e}"
+                )));
+            }
         };
         if map.remove(host).is_none() {
             return Ok(false);
@@ -768,15 +778,28 @@ mod tests {
     }
 
     #[test]
-    fn clear_forge_on_unreadable_unlinks_without_reading() {
+    fn clear_forge_on_corrupt_errors_and_preserves() {
         let dir = crate::test_support::TempDir::new("auth-clear-corrupt").unwrap();
         let path = dir.path().join("auth.json");
         std::fs::write(&path, "{junk").unwrap();
         let store = AuthStore::new(path.clone());
-        // Logout revokes unknown secrets instead of stranding them.
-        assert!(store.clear_forge("github.com").unwrap());
-        assert!(!path.exists());
-        assert!(!store.clear_forge("github.com").unwrap());
+        // A targeted logout never wipes what it cannot decode.
+        let err = store.clear_forge("github.com").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{junk");
+    }
+
+    #[test]
+    fn clear_forge_on_unreadable_errors_and_preserves() {
+        let dir = crate::test_support::TempDir::new("auth-clear-denied").unwrap();
+        let path = dir.path().join("auth.json");
+        // A directory at the store path is unreadable-as-a-file on
+        // every platform (chmod 000 lies when tests run as root).
+        std::fs::create_dir(&path).unwrap();
+        let store = AuthStore::new(path.clone());
+        // Read failure surfaces loudly; the entry survives.
+        assert!(store.clear_forge("github.com").is_err());
+        assert!(path.exists());
     }
 
     #[test]

@@ -51,6 +51,12 @@ fn strip_url_suffix(url: &str) -> &str {
 pub fn forge_key_from_url(url: &str) -> Result<String, String> {
     let parsed =
         reqwest::Url::parse(url.trim()).map_err(|_| format!("forge URL is not a URL: '{url}'"))?;
+    // Userinfo never belongs in a forge base: reject it outright
+    // rather than stripping (which would silently launder
+    // `user:pass@host` into a clean-looking key).
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(format!("forge URL must not contain credentials: '{url}'"));
+    }
     match parsed.scheme() {
         "https" => {}
         "http" => match parsed.host_str() {
@@ -814,23 +820,23 @@ mod tests {
 
     #[test]
     fn userinfo_cannot_spoof_loopback() {
-        // The critical bypass: userinfo tricks prefix checks while
-        // the connection goes remote in plaintext. Real URL parsing
-        // sees through it.
+        // Userinfo is rejected outright at the credentials gate, so
+        // no bypass shape reaches loopback validation and no password
+        // can ever land in a storage key or status line.
         for evil in [
             "http://localhost@example.com/x",
             "http://localhost:80@git.example.com/x",
             "http://127.0.0.1@10.0.0.2/x",
+            "https://user:pass@git.example.com/x",
+            "https://user@git.example.com/x",
+            "http://user@localhost:9/x",
         ] {
             let err = forge_key_from_url(evil).unwrap_err();
-            assert!(err.contains("loopback-only"), "{evil}: {err}");
+            assert!(
+                err.contains("must not contain credentials"),
+                "{evil}: {err}"
+            );
         }
-        // Genuine loopback with (pointless) userinfo still parses to
-        // the loopback host itself (plus its path segment).
-        assert_eq!(
-            forge_key_from_url("http://user@localhost:9/x").unwrap(),
-            "localhost:9/x"
-        );
     }
 
     #[test]

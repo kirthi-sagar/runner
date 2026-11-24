@@ -1,16 +1,16 @@
 # runner
 
-[![CI](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/kirthi-sagar/runner/actions/workflows/ci.yml)
-[![Latest Release](https://img.shields.io/github/v/release/kirthi-sagar/runner?color=blue&label=release)](https://github.com/kirthi-sagar/runner/releases)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/kirthi-sagar/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-677%20passed-success.svg)](https://github.com/kirthi-sagar/runner/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/runnerhq/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/runnerhq/runner/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/runnerhq/runner?color=blue&label=release)](https://github.com/runnerhq/runner/releases)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/runnerhq/runner#platform-support)
+[![Tests](https://img.shields.io/badge/tests-712%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
+[![License: Runner Commercial Source-Available v1.0](https://img.shields.io/badge/License-Runner%20Commercial%20Source--Available%20v1.0-yellow.svg)](https://github.com/runnerhq/runner/blob/main/LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Generally Available (v1.8.x) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Generally Available (v2.12.1) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -135,6 +135,11 @@ Existing self-hosted runners fail at this because:
    - Zero divergence from GitHub Actions syntax, expressions, secrets, or composite actions, while maintaining 100% host kernel isolation and resource control.
    - **OCI container tier** (`runner exec --driver container`): auto-detected host runtime (crun/runc/youki preferred), generated v1.0.2 bundles with cgroup v2 limits, `--image`/`-v`/`--no-network` job controls, egress-guarded execution, `runner doctor` runtime probe, and `exec_command` MCP access. Daemonless auto-pull resolves the image, verifies layers into a content-addressed cache, and unpacks the bundle rootfs at launch; `runner image pull/list/prune` manages the cache.
 
+7. **Autonomous Multi-Agent Swarms**:
+   - Coding agents register under a shared `swarm_id` via MCP (`register_swarm_agent`/`leave_swarm`), pool host CPU/RAM into a shared capacity pool with leases, and dispatch jobs concurrently across process, container, and microVM tiers.
+   - Dynamic 0ms capacity handover between agents, priority preemption (higher preempts lower, equals queue FIFO), aggregated spend ledger with `[swarm]` budget caps, and a real-time event bus (`status_changed`, `capacity_yielded`, `agent_preempted`, `budget_updated`).
+   - Operate swarms with `runner swarm list` (status, members, pool usage, spend vs cap) and `runner swarm kill <swarm_id>` (terminate, reclaim slices, abandon jobs); `runner doctor` reports swarm readiness and event-bus integrity.
+
 ---
 
 ## 3. Comprehensive Comparison: `runner` vs. Alternatives
@@ -183,10 +188,10 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)), or Windows via WSL2 (see [`docs/windows.md`](docs/windows.md)).
 
-Zero-dependency install (downloads the prebuilt v2.11.1 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v2.12.1 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/runnerhq/runner/main/install.sh | sh
 ```
 
 Or build from source:
@@ -220,7 +225,7 @@ runner top
 ```
 
 ```text
-runner top v2.11.1  (q quit, live cadence)
+runner top v2.12.1  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -348,7 +353,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "2.11.1", "governor": "normal",
+{"status": "healthy", "version": "2.12.1", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 
@@ -716,7 +721,7 @@ with `--oidc-issuer`, `--client-id`, and `--client-secret`.
 ## 12. Open-Core Architecture (Cargo Workspace Monorepo)
 
 `runner` serves two audiences from one repository at
-`https://github.com/kirthi-sagar/runner` — no repo split, no feature
+`https://github.com/runnerhq/runner` — no repo split, no feature
 gating by binary. A Cargo workspace keeps every layer loosely coupled:
 
 | Crate | Role | Edition focus |

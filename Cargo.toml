@@ -7,6 +7,7 @@ version = "2.12.1"
 edition = "2021"
 license-file = "LICENSE"
 publish = false
+repository = "https://github.com/runnerhq/runner"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "fs", "process", "signal", "sync"] }
@@ -47,6 +48,7 @@ version.workspace = true
 edition.workspace = true
 description = "Zero-freeze, AI-agent-native local and federated CI runner mesh (open-core facade)"
 license-file.workspace = true
+repository.workspace = true
 publish.workspace = true
 
 [lib]

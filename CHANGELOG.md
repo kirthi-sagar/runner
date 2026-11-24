@@ -6,6 +6,44 @@ All notable releases of `runner`. Dates are release-tag dates (UTC).
 > the 0.3.0 number landed with the open-core workspace refactor while
 > 0.1.0 was still the installed release.
 
+## [2.12.1] - 2026-11-24
+
+### Fixed
+
+- Supply-chain CI audit triage: mark every workspace crate
+  `publish = false` (inherited from `[workspace.package]`) so
+  `cargo deny`'s `private.ignore` honors the commercial
+  source-available licensing (license-file manifests otherwise
+  report `unlicensed`). No code or test changes.
+
+## v2.12.0 — 2026-11-24
+
+- Phase 1: Swarm session protocol and shared resource pool
+  (`SwarmSession`/`SwarmAgent`/`SwarmPool`): MCP
+  `register_swarm_agent`/`leave_swarm` tools (14-tool contract),
+  host-ceiling capacity pooling with leases, duplicate rejection,
+  and atomic concurrent registration.
+- Phase 2: Dynamic preemption and cross-agent budget sharing:
+  instant 0ms capacity handover with FIFO wait queue,
+  intra-swarm priority preemption (higher displaces lower,
+  equals queue), aggregated core-hour/dollar spend ledger with
+  `[swarm]` cap enforcement (`BudgetExceeded` → `-32602`).
+- Phase 3: Concurrent multi-tier dispatch and swarm event bus:
+  per-agent job dispatch across process/container/microVM tiers
+  (draws capped at the agent slice), holderless membership with
+  high-priority join, and a non-blocking broadcast bus
+  (`status_changed`, `capacity_yielded`, `agent_preempted`,
+  `budget_updated`) plus Active → Draining → Terminated
+  lifecycle transitions.
+- Phase 4: CLI surface and doctor integration: `runner swarm
+  list` (status, members, pool usage, spend vs cap) and `runner
+  swarm kill` (terminate, reclaim slices, abandon jobs) over
+  daemon IPC, `swarm`/`swarm-events` doctor checks, and a 1,024
+  member-per-swarm safety ceiling.
+- License transition: MIT → The Runner Commercial
+  Source-Available License v1.0 (`LICENSE`, `license-file`
+  workspace metadata).
+
 ## [2.11.1] - 2026-11-23
 
 ### Fixed

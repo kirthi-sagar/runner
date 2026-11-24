@@ -9,7 +9,7 @@ Copyright (c) 2026 Kirthi Sagar. All rights reserved.
 
 "Software" means the computer software, source code, object code, documentation,
 and associated assets distributed under this license, including all crates within
-the workspace located at https://github.com/kirthi-sagar/runner.
+the workspace located at https://github.com/runnerhq/runner.
 
 "Derivative Work" means any work, modification, translation, enhancement, fork,
 or adaptation based upon or derived from the Software, or any portion thereof.
@@ -98,4 +98,4 @@ proposals, representations, or understandings.
 not be deemed a waiver of future enforcement of that or any other provision.
 
 (d) Commercial Licensing Inquiries: For commercial agreements, fleet licensing,
-or enterprise authorizations, contact: https://github.com/kirthi-sagar/runner
+or enterprise authorizations, contact: https://github.com/runnerhq/runner

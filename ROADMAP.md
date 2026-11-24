@@ -5,7 +5,7 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.11.0 and prior)
+## Shipped (v2.12.1 and prior)
 
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
@@ -54,15 +54,25 @@ services or heavyweight frameworks.
   verified layer cache, safe unpacker, auto-pull, `runner image`
   CLI, platform-aware doctor guidance (v2.11.0, Candidate E
   delivered).
+- Windows symlink patch: portable container-absolute link
+  resolution across Windows-MSVC and Windows-GNU (v2.11.1).
+- Autonomous multi-agent swarms: session protocol, 0ms handover,
+  priority preemption, spend ledger, multi-tier dispatch, event
+  bus, `runner swarm` CLI, doctor integration (v2.12.0,
+  Candidate F delivered).
+- Supply-chain patch: `publish = false` workspace protection
+  satisfying `cargo deny` under the commercial license (v2.12.1).
 
-## Current: v2.11.0 (Standalone OCI Image Pull & Layer Assembly)
+## Current: v2.12.1 (Autonomous Multi-Agent Swarms)
 
-- Daemonless pull: HTTPS registry client with Bearer auth,
-  content-addressed cache, tar-slip-safe unpacking.
-- Auto-pull on container exec plus `runner image` management CLI.
-- Platform-aware runtime guidance on every supported host.
+- Swarm sessions: membership, leases, shared CPU/RAM pools with
+  host ceilings, 1,024-member safety cap.
+- 0ms handover, priority preemption, spend ledger with budget
+  caps, multi-tier dispatch, lifecycle event bus.
+- `runner swarm list/kill` CLI plus `swarm`/`swarm-events`
+  doctor checks; 712 tests green across 57 suites.
 
-## Next: v2.12.0 candidates (all lettered candidates shipped)
+## Next: v2.13.0 candidates (all lettered candidates shipped)
 
 - Podman/docker engine dispatch (remaining half of the container
   Phase 2 deferral; engines manage their own image storage).
@@ -70,6 +80,7 @@ services or heavyweight frameworks.
 - Config-file volume declarations for container jobs.
 - Manifest-byte verification against the index digest (currently
   covered by TLS + trusted registry).
+- MCP→daemon swarm convergence (daemon-side registration arm).
 
 ## Shipped in v2.9.0: LAN Mesh Cache Federation & Peer Streaming
 

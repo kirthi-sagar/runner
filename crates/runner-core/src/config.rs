@@ -582,6 +582,8 @@ pub struct RunnerConfig {
     pub reservations: ReservationsConfig,
     #[serde(default)]
     pub swarm: SwarmConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 /// Nominal internal transfer rate, USD per core-hour, applied when
@@ -668,6 +670,57 @@ impl ReservationsConfig {
                     .unwrap_or(defaults.max_duration_secs),
                 max_active: limits.max_active.unwrap_or(defaults.max_active),
             },
+        }
+    }
+}
+
+fn default_gc_true() -> bool {
+    true
+}
+
+fn default_high_watermark_pct() -> u8 {
+    90
+}
+
+fn default_low_watermark_pct() -> u8 {
+    80
+}
+
+fn default_gc_min_age_days() -> u64 {
+    30
+}
+
+/// Layer cache storage governance (`[storage]`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub gc: StorageGcConfig,
+}
+
+/// Disk pressure-gated eviction policy (`[storage.gc]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StorageGcConfig {
+    /// Run pressure-gated eviction automatically (default true).
+    #[serde(default = "default_gc_true")]
+    pub auto_evict: bool,
+    /// Trigger eviction at or above this utilization percent.
+    #[serde(default = "default_high_watermark_pct")]
+    pub high_watermark_pct: u8,
+    /// Stop evicting below this utilization percent.
+    #[serde(default = "default_low_watermark_pct")]
+    pub low_watermark_pct: u8,
+    /// Only blobs unaccessed this long qualify, days.
+    #[serde(default = "default_gc_min_age_days")]
+    pub min_age_days: u64,
+}
+
+impl Default for StorageGcConfig {
+    fn default() -> Self {
+        Self {
+            auto_evict: true,
+            high_watermark_pct: 90,
+            low_watermark_pct: 80,
+            min_age_days: 30,
         }
     }
 }
@@ -1225,6 +1278,23 @@ mod tests {
         .unwrap();
         assert_eq!(config.swarm.monthly_spend_cap_usd, 25.0);
         assert_eq!(config.swarm.effective_rate(), 0.12);
+    }
+
+    #[test]
+    fn storage_gc_defaults_and_parses() {
+        let config = RunnerConfig::default();
+        assert!(config.storage.gc.auto_evict);
+        assert_eq!(config.storage.gc.high_watermark_pct, 90);
+        assert_eq!(config.storage.gc.low_watermark_pct, 80);
+        assert_eq!(config.storage.gc.min_age_days, 30);
+        let config: RunnerConfig = toml::from_str(
+            "[storage.gc]\nauto_evict = false\nhigh_watermark_pct = 95\nlow_watermark_pct = 70\nmin_age_days = 7\n",
+        )
+        .unwrap();
+        assert!(!config.storage.gc.auto_evict);
+        assert_eq!(config.storage.gc.high_watermark_pct, 95);
+        assert_eq!(config.storage.gc.low_watermark_pct, 70);
+        assert_eq!(config.storage.gc.min_age_days, 7);
     }
 
     #[test]

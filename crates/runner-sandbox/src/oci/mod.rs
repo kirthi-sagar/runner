@@ -4,6 +4,7 @@
 
 pub mod cache;
 pub mod download;
+pub mod gc;
 pub mod pull;
 pub mod registry;
 pub mod unpack;

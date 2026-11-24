@@ -39,37 +39,104 @@ pub fn open_browser(url: &str) -> std::io::Result<()> {
     }
 }
 
-/// Device-login status line: identity plus granted scopes, or the
-/// signed-out pointer. The token value never renders.
-pub fn render_device_status(credential: Option<&DeviceCredential>) -> String {
-    match credential {
-        Some(creds) => {
-            let scopes = if creds.scopes.is_empty() {
-                "no scopes granted".to_string()
-            } else {
-                creds.scopes.join(", ")
-            };
-            format!(
-                "signed in as {} ({}; scopes: {})\n",
-                creds.username, creds.forge, scopes
-            )
-        }
-        None => "not signed in (run `runner auth login`)\n".to_string(),
+/// Multi-forge status table, one line per connected host (entries
+/// arrive host-sorted from the store). Token values never render.
+pub fn render_multi_status(entries: &[(String, DeviceCredential)]) -> String {
+    if entries.is_empty() {
+        return "not signed in (run `runner auth login`)\n".to_string();
     }
+    let mut out = if entries.len() == 1 {
+        "signed in (1 forge):\n".to_string()
+    } else {
+        format!("signed in ({} forges):\n", entries.len())
+    };
+    for (host, creds) in entries {
+        let scopes = if creds.scopes.is_empty() {
+            "no scopes granted".to_string()
+        } else {
+            creds.scopes.join(", ")
+        };
+        out.push_str(&format!(
+            "  {host}: {} (scopes: {scopes})\n",
+            creds.username
+        ));
+    }
+    out
 }
 
-/// Validate the login forge argument (Phase 1 ships GitHub only).
+/// Validate the login forge argument (github and gitlab only).
 pub fn normalize_forge(forge: &str) -> Result<String, String> {
     let name = forge.trim().to_ascii_lowercase();
-    if name == "github" {
+    if name == "github" || name == "gitlab" {
         Ok(name)
     } else if name.is_empty() {
         Err("forge must not be empty".to_string())
     } else {
         Err(format!(
-            "only github device login is supported in this release (got '{forge}')"
+            "only github and gitlab device login are supported (got '{forge}')"
         ))
     }
+}
+
+/// Resolve a logout target against connected forges: an exact host
+/// wins outright; otherwise a forge name must match exactly one
+/// entry (ambiguous names list their hosts; unknown names fail
+/// closed). Matching is case-insensitive; the returned host keeps
+/// store casing.
+pub fn resolve_logout_target<'a>(
+    entries: &'a [(String, DeviceCredential)],
+    arg: &str,
+) -> Result<&'a str, String> {
+    let want = arg.trim().to_ascii_lowercase();
+    if let Some((host, _)) = entries
+        .iter()
+        .find(|(host, _)| host.to_ascii_lowercase() == want)
+    {
+        return Ok(host);
+    }
+    let named: Vec<&str> = entries
+        .iter()
+        .filter(|(_, creds)| creds.forge.to_ascii_lowercase() == want)
+        .map(|(host, _)| host.as_str())
+        .collect();
+    match named.as_slice() {
+        [host] => Ok(host),
+        [] => Err(format!("not signed in to '{arg}'")),
+        hosts => Err(format!(
+            "multiple '{arg}' logins; specify one of: {}",
+            hosts.join(", ")
+        )),
+    }
+}
+
+/// Sign out everywhere: unconditionally unlinks the store — even
+/// corrupt or unreadable blobs — so secrets are guaranteed gone.
+/// Returns the user message.
+pub fn logout_all(store: &runner_core::auth::store::AuthStore) -> Result<String, String> {
+    let count = store.load_all().len();
+    let existed = store.path().exists();
+    store
+        .clear()
+        .map_err(|e| format!("cannot clear credentials: {e}"))?;
+    Ok(match (existed, count) {
+        (false, _) => "not signed in".to_string(),
+        (true, 0) | (true, 1) => "signed out".to_string(),
+        (true, n) => format!("signed out of {n} forges"),
+    })
+}
+
+/// Sign out of one target (host or forge name), preserving the rest.
+/// Returns the user message.
+pub fn logout_one(
+    store: &runner_core::auth::store::AuthStore,
+    target: &str,
+) -> Result<String, String> {
+    let entries = store.load_all();
+    let host = resolve_logout_target(&entries, target)?;
+    store
+        .clear_forge(host)
+        .map_err(|e| format!("cannot clear credentials: {e}"))?;
+    Ok(format!("signed out of {host}"))
 }
 
 #[cfg(test)]
@@ -89,33 +156,129 @@ mod tests {
         assert!(!program.is_empty());
     }
 
-    #[test]
-    fn status_renders_identity_and_masks_nothing_else() {
-        let signed_in = render_device_status(Some(&DeviceCredential {
-            forge: "github".to_string(),
-            username: "octocat".to_string(),
-            scopes: vec!["repo".to_string(), "read:user".to_string()],
-            access_token: "[REDACTED]".to_string(),
-        }));
-        assert!(signed_in.contains("octocat"), "{signed_in}");
-        assert!(signed_in.contains("github"), "{signed_in}");
-        assert!(signed_in.contains("repo, read:user"), "{signed_in}");
-        assert!(!signed_in.contains("gho_secret"), "{signed_in}");
-        let bare = render_device_status(Some(&DeviceCredential {
-            forge: "github".to_string(),
-            username: "octocat".to_string(),
-            scopes: vec![],
-            access_token: "t".to_string(),
-        }));
-        assert!(bare.contains("no scopes granted"), "{bare}");
-        assert!(render_device_status(None).contains("not signed in"));
+    fn entry(host: &str, forge: &str) -> (String, DeviceCredential) {
+        (
+            host.to_string(),
+            DeviceCredential {
+                forge: forge.to_string(),
+                host: host.to_string(),
+                username: format!("user-of-{forge}"),
+                scopes: vec!["repo".to_string()],
+                access_token: "[REDACTED]".to_string(),
+            },
+        )
     }
 
     #[test]
-    fn forge_normalizes_github_only() {
+    fn status_renders_every_forge_and_never_tokens() {
+        let entries = vec![
+            entry("git.example.com", "gitlab"),
+            entry("github.com", "github"),
+        ];
+        let text = render_multi_status(&entries);
+        assert!(text.contains("signed in (2 forges)"), "{text}");
+        assert!(text.contains("git.example.com: user-of-gitlab"), "{text}");
+        assert!(text.contains("github.com: user-of-github"), "{text}");
+        assert!(!text.contains("gho_secret"), "{text}");
+        let solo = render_multi_status(&entries[..1]);
+        assert!(solo.contains("signed in (1 forge)"), "{solo}");
+        let bare = render_multi_status(&[(
+            "github.com".to_string(),
+            DeviceCredential {
+                forge: "github".to_string(),
+                host: "github.com".to_string(),
+                username: "octocat".to_string(),
+                scopes: vec![],
+                access_token: "t".to_string(),
+            },
+        )]);
+        assert!(bare.contains("no scopes granted"), "{bare}");
+        assert!(render_multi_status(&[]).contains("not signed in"));
+    }
+
+    #[test]
+    fn forge_normalizes_github_and_gitlab() {
         assert_eq!(normalize_forge("github").unwrap(), "github");
-        assert_eq!(normalize_forge("  GitHub ").unwrap(), "github");
-        assert!(normalize_forge("gitlab").is_err());
+        assert_eq!(normalize_forge("  GitLab ").unwrap(), "gitlab");
+        assert!(normalize_forge("bitbucket").is_err());
         assert!(normalize_forge("").is_err());
+    }
+
+    #[test]
+    fn logout_all_unlinks_even_corrupt_stores() {
+        use runner_core::auth::store::AuthStore;
+
+        let dir = runner_core::test_support::TempDir::new("auth-logout-all").unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        assert_eq!(logout_all(&store).unwrap(), "not signed in");
+        store
+            .save(&DeviceCredential {
+                forge: "github".to_string(),
+                host: "github.com".to_string(),
+                username: "octocat".to_string(),
+                scopes: vec![],
+                access_token: "t".to_string(),
+            })
+            .unwrap();
+        assert_eq!(logout_all(&store).unwrap(), "signed out");
+        assert!(!dir.path().join("auth.json").exists());
+        // Corrupt blobs unlink too (secrets guaranteed gone).
+        std::fs::write(dir.path().join("auth.json"), "{junk").unwrap();
+        assert_eq!(logout_all(&store).unwrap(), "signed out");
+        assert!(!dir.path().join("auth.json").exists());
+    }
+
+    #[test]
+    fn logout_one_revokes_single_forge() {
+        use runner_core::auth::store::AuthStore;
+
+        let dir = runner_core::test_support::TempDir::new("auth-logout-one").unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        for (host, forge) in [("github.com", "github"), ("git.example.com", "gitlab")] {
+            store
+                .save(&DeviceCredential {
+                    forge: forge.to_string(),
+                    host: host.to_string(),
+                    username: "u".to_string(),
+                    scopes: vec![],
+                    access_token: "t".to_string(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            logout_one(&store, "git.example.com").unwrap(),
+            "signed out of git.example.com"
+        );
+        assert!(store.load_forge("github.com").is_some());
+        assert!(logout_one(&store, "gitea").is_err());
+    }
+
+    #[test]
+    fn logout_target_prefers_host_then_unique_forge() {
+        let entries = vec![
+            entry("git.example.com", "gitlab"),
+            entry("github.com", "github"),
+            entry("gitlab.com", "gitlab"),
+        ];
+        // Exact host wins even when the forge name is ambiguous.
+        assert_eq!(
+            resolve_logout_target(&entries, "gitlab.com").unwrap(),
+            "gitlab.com"
+        );
+        assert_eq!(
+            resolve_logout_target(&entries, "GIT.EXAMPLE.COM").unwrap(),
+            "git.example.com"
+        );
+        // Unique forge name resolves to its host.
+        assert_eq!(
+            resolve_logout_target(&entries, "github").unwrap(),
+            "github.com"
+        );
+        // Ambiguous forge names list their hosts.
+        let err = resolve_logout_target(&entries, "gitlab").unwrap_err();
+        assert!(err.contains("git.example.com"), "{err}");
+        assert!(err.contains("gitlab.com"), "{err}");
+        // Unknown names fail closed.
+        assert!(resolve_logout_target(&entries, "gitea").is_err());
     }
 }

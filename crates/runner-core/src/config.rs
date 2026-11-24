@@ -735,6 +735,23 @@ pub struct AuthConfig {
     /// OAuth App and paste its client id here).
     #[serde(default)]
     pub github_client_id: String,
+    /// GitLab OAuth application id (same fail-closed contract).
+    #[serde(default)]
+    pub gitlab_client_id: String,
+    /// Self-hosted GitLab base URL override (`None` means
+    /// `https://gitlab.com`; `--url` beats this per invocation).
+    #[serde(default)]
+    pub gitlab_url: Option<String>,
+}
+
+impl AuthConfig {
+    /// Effective GitLab base URL: configured override or gitlab.com.
+    pub fn gitlab_base_url(&self) -> &str {
+        self.gitlab_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or("https://gitlab.com")
+    }
 }
 
 /// Agent swarm budget policy.
@@ -1315,6 +1332,15 @@ mod tests {
         let config: RunnerConfig =
             toml::from_str("[auth]\ngithub_client_id = \"Iv1.abc123\"\n").unwrap();
         assert_eq!(config.auth.github_client_id, "Iv1.abc123");
+    }
+
+    #[test]
+    fn auth_gitlab_url_defaults_to_gitlab_com() {
+        let config = RunnerConfig::default();
+        assert_eq!(config.auth.gitlab_base_url(), "https://gitlab.com");
+        let config: RunnerConfig =
+            toml::from_str("[auth]\ngitlab_url = \"https://git.example.com/\"\n").unwrap();
+        assert_eq!(config.auth.gitlab_base_url(), "https://git.example.com/");
     }
 
     #[test]

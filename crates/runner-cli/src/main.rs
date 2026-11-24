@@ -292,15 +292,21 @@ enum AuthCommands {
     Status,
     /// Sign in with a forge device flow (browser code approval)
     Login {
-        /// Forge to sign into (github only in this release)
+        /// Forge to sign into (github or gitlab)
         #[arg(default_value = "github")]
         forge: String,
+        /// Self-hosted GitLab base URL (gitlab only; beats config)
+        #[arg(long)]
+        url: Option<String>,
         /// Print the code and URL without opening a browser
         #[arg(long, default_value_t = false)]
         no_browser: bool,
     },
-    /// Sign out of device-flow login (clears stored credentials)
-    Logout,
+    /// Sign out of device-flow login (one forge, or all when omitted)
+    Logout {
+        /// Forge name or host to sign out of (all when omitted)
+        forge: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -920,25 +926,53 @@ fn cmd_auth_gitlab(token: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_auth_login(config: &RunnerConfig, forge: &str, no_browser: bool) -> Result<()> {
+async fn cmd_auth_login(
+    config: &RunnerConfig,
+    forge: &str,
+    url: Option<&str>,
+    no_browser: bool,
+) -> Result<()> {
     use runner_cli::commands::auth::{normalize_forge, open_browser};
-    use runner_core::auth::device_flow::{DeviceFlowClient, GITHUB_SCOPES};
+    use runner_core::auth::device_flow::{DeviceFlowClient, GITHUB_SCOPES, GITLAB_SCOPES};
     use runner_core::auth::store::AuthStore;
 
-    normalize_forge(forge).map_err(|e| anyhow::anyhow!(e))?;
-    let client_id = config.auth.github_client_id.trim().to_string();
-    if client_id.is_empty() {
-        anyhow::bail!(
-            "no GitHub OAuth App configured; register one and set [auth] github_client_id"
-        );
+    let forge = normalize_forge(forge).map_err(|e| anyhow::anyhow!(e))?;
+    if forge != "gitlab" && url.is_some_and(|u| !u.trim().is_empty()) {
+        anyhow::bail!("--url only applies to gitlab login");
     }
     let Some(store) = AuthStore::default_store() else {
         anyhow::bail!("no HOME for secrets file; cannot save login");
     };
-    let client = DeviceFlowClient::github(client_id);
+    let (client, scopes) = match forge.as_str() {
+        "gitlab" => {
+            let client_id = config.auth.gitlab_client_id.trim().to_string();
+            if client_id.is_empty() {
+                anyhow::bail!(
+                    "no GitLab OAuth application configured; register one and set [auth] gitlab_client_id"
+                );
+            }
+            let base = url
+                .filter(|u| !u.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| config.auth.gitlab_base_url().to_string());
+            (
+                DeviceFlowClient::gitlab(client_id, &base).map_err(|e| anyhow::anyhow!(e))?,
+                GITLAB_SCOPES,
+            )
+        }
+        _ => {
+            let client_id = config.auth.github_client_id.trim().to_string();
+            if client_id.is_empty() {
+                anyhow::bail!(
+                    "no GitHub OAuth App configured; register one and set [auth] github_client_id"
+                );
+            }
+            (DeviceFlowClient::github(client_id), GITHUB_SCOPES)
+        }
+    };
     let credential = client
         .login(
-            GITHUB_SCOPES,
+            scopes,
             |code| {
                 println!("Enter code {} at {}", code.user_code, code.verification_uri);
                 if no_browser {
@@ -956,39 +990,42 @@ async fn cmd_auth_login(config: &RunnerConfig, forge: &str, no_browser: bool) ->
         .save(&credential)
         .map_err(|e| anyhow::anyhow!("cannot save login: {e}"))?;
     println!(
-        "signed in as {} ({})",
-        credential.username, credential.forge
+        "signed in as {} ({} at {})",
+        credential.username, credential.forge, credential.host
     );
     Ok(())
 }
 
-fn cmd_auth_logout() -> Result<()> {
+fn cmd_auth_logout(forge: Option<&str>) -> Result<()> {
+    use runner_cli::commands::auth::{logout_all, logout_one};
     use runner_core::auth::store::AuthStore;
 
     let Some(store) = AuthStore::default_store() else {
         println!("no HOME for secrets file; no credentials configured");
         return Ok(());
     };
-    match store.clear() {
-        Ok(true) => println!("signed out"),
-        Ok(false) => println!("not signed in"),
-        Err(e) => anyhow::bail!("cannot clear credentials: {e}"),
+    // Local revocation only: public device-flow clients hold no
+    // secret, so forge-side revocation is impossible; deleting
+    // the stored bearer is the complete sign-out.
+    let message = match forge {
+        None => logout_all(&store),
+        Some(target) => logout_one(&store, target),
     }
+    .map_err(|e| anyhow::anyhow!(e))?;
+    println!("{message}");
     Ok(())
 }
 
 fn cmd_auth_status() -> Result<()> {
     use runner_core::auth::{ProviderSlot, TokenStore};
 
-    print!(
-        "{}",
-        runner_cli::commands::auth::render_device_status(
-            runner_core::auth::store::AuthStore::default_store()
-                .as_ref()
-                .and_then(|store| store.load())
-                .as_ref()
-        )
-    );
+    match runner_core::auth::store::AuthStore::default_store() {
+        Some(store) => print!(
+            "{}",
+            runner_cli::commands::auth::render_multi_status(&store.load_all())
+        ),
+        None => println!("no HOME for secrets file; no device credentials configured"),
+    }
     let Some(store) = TokenStore::default_store() else {
         println!("no HOME for secrets file; no legacy credentials configured");
         return Ok(());
@@ -1959,10 +1996,14 @@ async fn main() -> Result<()> {
                 client_secret,
             } => cmd_auth_bitbucket(client_id, client_secret)?,
             AuthCommands::Status => cmd_auth_status()?,
-            AuthCommands::Login { forge, no_browser } => {
-                cmd_auth_login(&config, &forge, no_browser).await?;
+            AuthCommands::Login {
+                forge,
+                url,
+                no_browser,
+            } => {
+                cmd_auth_login(&config, &forge, url.as_deref(), no_browser).await?;
             }
-            AuthCommands::Logout => cmd_auth_logout()?,
+            AuthCommands::Logout { forge } => cmd_auth_logout(forge.as_deref())?,
         },
         Commands::Audit { command } => match command {
             AuditCommands::Verify { file } => cmd_audit_verify(file)?,
@@ -2145,6 +2186,7 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Login {
                     no_browser: true,
+                    url: None,
                     ..
                 }
             }
@@ -2153,19 +2195,49 @@ mod tests {
         let cli = Cli::try_parse_from(["runner", "auth", "login"]).unwrap();
         match cli.command {
             Commands::Auth {
-                command: AuthCommands::Login { forge, no_browser },
+                command:
+                    AuthCommands::Login {
+                        forge, no_browser, ..
+                    },
             } => {
                 assert_eq!(forge, "github");
                 assert!(!no_browser);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+        // Self-hosted gitlab URL flag.
+        let cli = Cli::try_parse_from([
+            "runner",
+            "auth",
+            "login",
+            "gitlab",
+            "--url",
+            "https://git.example.com/",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Auth {
+                command: AuthCommands::Login { forge, url, .. },
+            } => {
+                assert_eq!(forge, "gitlab");
+                assert_eq!(url.as_deref(), Some("https://git.example.com/"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // Logout with and without a target.
         let cli = Cli::try_parse_from(["runner", "auth", "logout"]).unwrap();
         assert!(matches!(
             cli.command,
             Commands::Auth {
-                command: AuthCommands::Logout
+                command: AuthCommands::Logout { forge: None }
             }
         ));
+        let cli = Cli::try_parse_from(["runner", "auth", "logout", "gitlab"]).unwrap();
+        match cli.command {
+            Commands::Auth {
+                command: AuthCommands::Logout { forge },
+            } => assert_eq!(forge.as_deref(), Some("gitlab")),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

@@ -19,7 +19,65 @@ pub const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token"
 pub const GITHUB_USER_URL: &str = "https://api.github.com/user";
 /// Requested GitHub OAuth scopes (space-separated per RFC 6749).
 pub const GITHUB_SCOPES: &str = "repo";
+/// Default GitLab instance base URL (self-hosted overrides via flag).
+pub const GITLAB_DEFAULT_BASE_URL: &str = "https://gitlab.com";
+/// Requested GitLab OAuth scopes (runner registration needs API).
+pub const GITLAB_SCOPES: &str = "api";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// Join an instance base URL with an absolute API path (query
+/// strings and fragments stripped so pasted browser-bar URLs never
+/// malform endpoints; trailing slashes never double up).
+pub fn join_base_url(base: &str, path: &str) -> String {
+    format!("{}{}", strip_url_suffix(base).trim_end_matches('/'), path)
+}
+
+/// Cut a URL at the first query or fragment marker (both live after
+/// any path, so authority and path survive intact).
+fn strip_url_suffix(url: &str) -> &str {
+    let cut = url.find(&['?', '#'][..]).unwrap_or(url.len());
+    &url[..cut]
+}
+
+/// True for loopback authorities (exact host or host-plus-port;
+/// suffix lookalikes like `localhost.evil.com` never match).
+fn is_loopback_authority(authority: &str) -> bool {
+    let lower = authority.to_ascii_lowercase();
+    lower == "localhost"
+        || lower.starts_with("localhost:")
+        || lower == "127.0.0.1"
+        || lower.starts_with("127.0.0.1:")
+        || lower == "[::1]"
+        || lower.starts_with("[::1]:")
+}
+
+/// Forge host key for credential storage: URL authority (host plus
+/// explicit port), lowercased. Transport security: `https` everywhere,
+/// `http` strictly for loopback (hermetic mock testing) — anything
+/// else fails closed before any network or disk write.
+pub fn forge_host_from_url(url: &str) -> Result<String, String> {
+    let clean = strip_url_suffix(url.trim());
+    if let Some(rest) = clean.strip_prefix("https://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        if authority.is_empty() {
+            return Err(format!("forge URL has no host: '{url}'"));
+        }
+        return Ok(authority.to_ascii_lowercase());
+    }
+    if let Some(rest) = clean.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        if authority.is_empty() {
+            return Err(format!("forge URL has no host: '{url}'"));
+        }
+        if !is_loopback_authority(authority) {
+            return Err(format!(
+                "forge URL must use https (http is loopback-only): '{url}'"
+            ));
+        }
+        return Ok(authority.to_ascii_lowercase());
+    }
+    Err(format!("forge URL must use http(s): '{url}'"))
+}
 
 /// Device-flow HTTP endpoints (GitHub production or a test mock).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,12 +253,14 @@ pub fn split_scopes(scope: &str) -> Vec<String> {
         .collect()
 }
 
-/// Device-flow client: endpoint set plus the forge OAuth client id.
-/// Construct [`github`](Self::github) for production or
-/// [`custom`](Self::custom) for hermetic tests.
+/// Device-flow client: forge name, storage host key, endpoint set
+/// plus the forge OAuth client id. Construct [`github`](Self::github)
+/// or [`gitlab`](Self::gitlab) for production, [`custom`](Self::custom)
+/// for hermetic tests.
 #[derive(Debug, Clone)]
 pub struct DeviceFlowClient {
     forge: String,
+    host: String,
     client_id: String,
     endpoints: DeviceEndpoints,
     http: reqwest::Client,
@@ -208,16 +268,33 @@ pub struct DeviceFlowClient {
 
 impl DeviceFlowClient {
     pub fn github(client_id: String) -> Self {
-        Self::custom("github", client_id, DeviceEndpoints::github())
+        Self::custom("github", client_id, "github.com", DeviceEndpoints::github())
+    }
+
+    /// GitLab client for gitlab.com or a self-hosted base URL (slash
+    /// normalized; non-http(s) bases fail closed).
+    pub fn gitlab(client_id: String, base_url: &str) -> Result<Self, String> {
+        Ok(Self::custom(
+            "gitlab",
+            client_id,
+            forge_host_from_url(base_url)?,
+            DeviceEndpoints {
+                device_code_url: join_base_url(base_url, "/oauth/authorize_device"),
+                token_url: join_base_url(base_url, "/oauth/token"),
+                user_url: join_base_url(base_url, "/api/v4/user"),
+            },
+        ))
     }
 
     pub fn custom(
         forge: impl Into<String>,
         client_id: impl Into<String>,
+        host: impl Into<String>,
         endpoints: DeviceEndpoints,
     ) -> Self {
         Self {
             forge: forge.into(),
+            host: host.into(),
             client_id: client_id.into(),
             endpoints,
             http: reqwest::Client::builder()
@@ -265,11 +342,15 @@ impl DeviceFlowClient {
     }
 
     /// Resolve the bearer to `(username, granted scopes)` for the
-    /// stored credential (identity endpoint plus the OAuth scopes
-    /// response header; missing scopes read empty, never fatal).
+    /// stored credential, across forge shapes: the username reads
+    /// `login` or `username`, whichever the identity endpoint
+    /// returns; scopes prefer the OAuth scopes response header and
+    /// fall back to the granted `scope` string (missing everywhere
+    /// reads empty, never fatal).
     pub async fn fetch_identity(
         &self,
         access_token: &str,
+        granted_scope: &str,
     ) -> Result<(String, Vec<String>), String> {
         let response = self
             .http
@@ -288,21 +369,26 @@ impl DeviceFlowClient {
                 response.status()
             ));
         }
-        let scopes = response
+        let header_scopes = response
             .headers()
             .get("x-oauth-scopes")
             .and_then(|v| v.to_str().ok())
             .map(split_scopes)
             .unwrap_or_default();
+        let scopes = if header_scopes.is_empty() {
+            split_scopes(granted_scope)
+        } else {
+            header_scopes
+        };
         let body: serde_json::Value = response
             .json()
             .await
             .map_err(|e| format!("identity response is not JSON: {e}"))?;
-        let username = body
-            .get("login")
-            .and_then(|v| v.as_str())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "identity response lacks 'login'".to_string())?;
+        let username = ["login", "username"]
+            .iter()
+            .filter_map(|key| body.get(key).and_then(|v| v.as_str()))
+            .find(|v| !v.is_empty())
+            .ok_or_else(|| "identity response lacks a username".to_string())?;
         Ok((username.to_string(), scopes))
     }
 
@@ -331,10 +417,14 @@ impl DeviceFlowClient {
                 );
             }
             match self.poll_token(&device.device_code).await? {
-                TokenPoll::Granted { access_token, .. } => {
-                    let (username, scopes) = self.fetch_identity(&access_token).await?;
+                TokenPoll::Granted {
+                    access_token,
+                    scope,
+                } => {
+                    let (username, scopes) = self.fetch_identity(&access_token, &scope).await?;
                     return Ok(super::store::DeviceCredential {
                         forge: self.forge.clone(),
+                        host: self.host.clone(),
                         username,
                         scopes,
                         access_token,
@@ -479,6 +569,34 @@ mod tests {
         base: String,
     }
 
+    struct MockSpec {
+        device_path: &'static str,
+        token_path: &'static str,
+        user_path: &'static str,
+        user_body: serde_json::Value,
+        scope_header: Option<&'static str>,
+    }
+
+    fn github_spec() -> MockSpec {
+        MockSpec {
+            device_path: "/login/device/code",
+            token_path: "/login/oauth/access_token",
+            user_path: "/user",
+            user_body: serde_json::json!({ "login": "octocat" }),
+            scope_header: Some("repo,read:user"),
+        }
+    }
+
+    fn gitlab_spec() -> MockSpec {
+        MockSpec {
+            device_path: "/oauth/authorize_device",
+            token_path: "/oauth/token",
+            user_path: "/api/v4/user",
+            user_body: serde_json::json!({ "username": "dev" }),
+            scope_header: None,
+        }
+    }
+
     async fn respond(sock: &mut tokio::net::TcpStream, status: &str, extra: &str, body: &str) {
         use tokio::io::AsyncWriteExt;
         let raw = format!(
@@ -500,12 +618,22 @@ mod tests {
     }
 
     async fn spawn_mock_forge(token_script: Vec<serde_json::Value>) -> MockForge {
+        spawn_mock_forge_with(github_spec(), token_script).await
+    }
+
+    async fn spawn_mock_forge_with(
+        spec: MockSpec,
+        token_script: Vec<serde_json::Value>,
+    ) -> MockForge {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{port}");
         let hits = Arc::new(AtomicUsize::new(0));
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let device_route = format!("POST {}", spec.device_path);
+            let token_route = format!("POST {}", spec.token_path);
+            let user_route = format!("GET {}", spec.user_path);
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
                     return;
@@ -526,7 +654,7 @@ mod tests {
                 let head = String::from_utf8_lossy(&head).to_string();
                 let mut body = vec![0u8; content_length(&head)];
                 let _ = sock.read_exact(&mut body).await;
-                if head.contains("POST /login/device/code") {
+                if head.contains(&device_route) {
                     respond(
                         &mut sock,
                         "200 OK",
@@ -539,7 +667,7 @@ mod tests {
                         .to_string(),
                     )
                     .await;
-                } else if head.contains("POST /login/oauth/access_token") {
+                } else if head.contains(&token_route) {
                     let hit = hits.fetch_add(1, Ordering::SeqCst);
                     let body = token_script.get(hit).cloned().unwrap_or_else(|| {
                         token_script
@@ -548,14 +676,12 @@ mod tests {
                             .unwrap_or(serde_json::json!({}))
                     });
                     respond(&mut sock, "200 OK", "", &body.to_string()).await;
-                } else if head.contains("GET /user") {
-                    respond(
-                        &mut sock,
-                        "200 OK",
-                        "x-oauth-scopes: repo,read:user\r\n",
-                        &serde_json::json!({ "login": "octocat" }).to_string(),
-                    )
-                    .await;
+                } else if head.contains(&user_route) {
+                    let mut extra = String::new();
+                    if let Some(scopes) = spec.scope_header {
+                        extra = format!("x-oauth-scopes: {scopes}\r\n");
+                    }
+                    respond(&mut sock, "200 OK", &extra, &spec.user_body.to_string()).await;
                 } else {
                     respond(&mut sock, "404 Not Found", "", "").await;
                 }
@@ -569,12 +695,17 @@ mod tests {
         DeviceFlowClient::custom(
             "test-forge",
             "test-client",
+            forge.base.strip_prefix("http://").unwrap_or("127.0.0.1"),
             DeviceEndpoints {
                 device_code_url: format!("{}/login/device/code", forge.base),
                 token_url: format!("{}/login/oauth/access_token", forge.base),
                 user_url: format!("{}/user", forge.base),
             },
         )
+    }
+
+    fn mock_gitlab_client(forge: &MockForge) -> DeviceFlowClient {
+        DeviceFlowClient::gitlab("test-client".to_string(), &forge.base).unwrap()
     }
 
     #[tokio::test]
@@ -612,9 +743,103 @@ mod tests {
             [Duration::from_secs(5), Duration::from_secs(10)]
         );
         assert_eq!(credential.forge, "test-forge");
+        assert!(
+            credential.host.starts_with("127.0.0.1:"),
+            "{}",
+            credential.host
+        );
         assert_eq!(credential.username, "octocat");
         assert_eq!(credential.scopes, vec!["repo", "read:user"]);
         assert_eq!(credential.access_token, "gho_win");
+    }
+
+    #[test]
+    fn forge_urls_join_normalize_and_validate() {
+        assert_eq!(
+            join_base_url("https://git.example.com/", "/oauth/token"),
+            "https://git.example.com/oauth/token"
+        );
+        assert_eq!(
+            join_base_url("https://git.example.com", "/oauth/token"),
+            "https://git.example.com/oauth/token"
+        );
+        assert_eq!(
+            forge_host_from_url("https://Git.Example.COM:8443/x").unwrap(),
+            "git.example.com:8443"
+        );
+        assert_eq!(
+            forge_host_from_url("http://127.0.0.1:9/").unwrap(),
+            "127.0.0.1:9"
+        );
+        for bad in ["", "ftp://x/y", "git.example.com", "https://", "https:///x"] {
+            assert!(forge_host_from_url(bad).is_err(), "{bad:?}");
+        }
+        let _client =
+            DeviceFlowClient::gitlab("id".to_string(), "https://git.example.com/").unwrap();
+        assert!(DeviceFlowClient::gitlab("id".to_string(), "gopher://x").is_err());
+    }
+
+    #[test]
+    fn plain_http_is_loopback_only() {
+        // Loopback in every form (exact or host-plus-port).
+        for ok in [
+            "http://localhost/x",
+            "http://localhost:8080/x",
+            "http://127.0.0.1/x",
+            "http://127.0.0.1:9/",
+            "http://[::1]/x",
+            "http://[::1]:9/x",
+        ] {
+            assert!(forge_host_from_url(ok).is_ok(), "{ok}");
+        }
+        // Suffix lookalikes and LAN hosts never pass as loopback.
+        for bad in [
+            "http://localhost.evil.com/x",
+            "http://127.0.0.10/x",
+            "http://10.0.0.2/x",
+            "http://git.example.com/x",
+        ] {
+            let err = forge_host_from_url(bad).unwrap_err();
+            assert!(err.contains("loopback-only"), "{bad}: {err}");
+        }
+        // https is unrestricted.
+        assert!(forge_host_from_url("https://git.example.com/x").is_ok());
+    }
+
+    #[test]
+    fn url_suffixes_never_malform_endpoints() {
+        assert_eq!(
+            join_base_url("https://git.example.com/?x=1#y", "/oauth/token"),
+            "https://git.example.com/oauth/token"
+        );
+        assert_eq!(forge_host_from_url("https://h/x?next=/y#z").unwrap(), "h");
+        // Even a bare query-only URL keys cleanly.
+        assert_eq!(forge_host_from_url("https://h?x").unwrap(), "h");
+    }
+
+    #[tokio::test]
+    async fn gitlab_login_resolves_username_and_grant_scopes() {
+        let forge = spawn_mock_forge_with(
+            gitlab_spec(),
+            vec![
+                serde_json::json!({ "error": "authorization_pending" }),
+                serde_json::json!({ "access_token": "glpat_win", "scope": "api" }),
+            ],
+        )
+        .await;
+        let client = mock_gitlab_client(&forge);
+        let credential = client.login("api", |_| {}, |_| async {}).await.unwrap();
+        assert_eq!(credential.forge, "gitlab");
+        assert!(
+            credential.host.starts_with("127.0.0.1:"),
+            "{}",
+            credential.host
+        );
+        // GitLab shape: `username` field, no scopes header — the
+        // grant body supplies scopes via fallback.
+        assert_eq!(credential.username, "dev");
+        assert_eq!(credential.scopes, vec!["api"]);
+        assert_eq!(credential.access_token, "glpat_win");
     }
 
     #[tokio::test]

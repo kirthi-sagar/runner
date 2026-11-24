@@ -164,6 +164,11 @@ pub fn default_auth_path() -> Option<PathBuf> {
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceCredential {
     pub forge: String,
+    /// Storage key: forge host authority (`github.com`,
+    /// `git.example.com:8443`), lowercased. Defaults empty so Phase
+    /// 1 files (no host field) still parse for migration.
+    #[serde(default)]
+    pub host: String,
     pub username: String,
     pub scopes: Vec<String>,
     pub access_token: String,
@@ -173,6 +178,7 @@ impl std::fmt::Debug for DeviceCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeviceCredential")
             .field("forge", &self.forge)
+            .field("host", &self.host)
             .field("username", &self.username)
             .field("scopes", &self.scopes)
             .field("access_token", &"<redacted>")
@@ -180,14 +186,113 @@ impl std::fmt::Debug for DeviceCredential {
     }
 }
 
-/// Device-login store backed by one JSON file. Saves are atomic
-/// (unique temp file plus rename) and private from creation
-/// (`0600` at open on Unix, owner-only DACL on Windows), so a
-/// failed or concurrent save can never expose or clobber working
-/// credentials.
+/// Device-login store backed by one JSON file mapping forge host
+/// to credential (`{ "github.com": {...}, "git.example.com": ...
+/// }`). Saves are atomic (unique temp file plus rename) and private
+/// from creation (`0600` at open on Unix, owner-only DACL on
+/// Windows), so a failed or concurrent save can never expose or
+/// clobber working credentials. Phase 1 single-credential files
+/// migrate on first read (see [`load_all`](Self::load_all)).
 #[derive(Debug, Clone)]
 pub struct AuthStore {
     path: PathBuf,
+}
+
+/// Storage key for a legacy single credential: its own host when
+/// present, else the well-known host for its forge name.
+fn legacy_host_key(credential: &DeviceCredential) -> String {
+    if !credential.host.trim().is_empty() {
+        return credential.host.clone();
+    }
+    match credential.forge.trim().to_ascii_lowercase().as_str() {
+        "github" => "github.com".to_string(),
+        "gitlab" => "gitlab.com".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Raw store read: absent files seed fresh maps, while I/O
+/// failures and undecodable bytes are distinct errors (writers
+/// fail closed on both; readers treat both as signed-out).
+enum StoreRead {
+    Missing,
+    Bytes(Vec<u8>),
+    Unreadable(String),
+}
+
+/// Lock acquisition budget: 50ms polls, ~2s total, then a loud
+/// timeout (the critical section is milliseconds; anything longer
+/// is a wedged peer, never silent waiting).
+const LOCK_RETRIES: u32 = 40;
+const LOCK_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Cross-process exclusive lock guarding store read-modify-write.
+/// Unix holds a POSIX `flock`; Windows holds the lock file open
+/// with zero sharing. Both release on process death, so a crashed
+/// login can never wedge later ones.
+struct StoreLock {
+    _held: std::fs::File,
+}
+
+impl StoreLock {
+    fn acquire(lock_path: &Path) -> std::io::Result<Self> {
+        for _ in 0..LOCK_RETRIES {
+            match Self::try_acquire(lock_path) {
+                Ok(file) => return Ok(Self { _held: file }),
+                Err(None) => std::thread::sleep(LOCK_RETRY_WAIT),
+                Err(Some(e)) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "another login is saving credentials; please retry",
+        ))
+    }
+
+    /// Attempt once: `Ok` on acquisition, `None` when a peer holds
+    /// it (retry), `Some(err)` on fatal errors.
+    #[cfg(unix)]
+    fn try_acquire(lock_path: &Path) -> Result<std::fs::File, Option<std::io::Error>> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)
+            .map_err(Some)?;
+        // SAFETY: flock on a live fd; return code checked.
+        let rc = unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if rc == 0 {
+            return Ok(file);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(None);
+        }
+        Err(Some(e))
+    }
+
+    #[cfg(not(unix))]
+    fn try_acquire(lock_path: &Path) -> Result<std::fs::File, Option<std::io::Error>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(lock_path)
+        {
+            Ok(file) => Ok(file),
+            // ERROR_SHARING_VIOLATION: a peer holds the lock.
+            Err(e) if e.raw_os_error() == Some(32) => Err(None),
+            Err(e) => Err(Some(e)),
+        }
+    }
 }
 
 impl AuthStore {
@@ -204,14 +309,130 @@ impl AuthStore {
         &self.path
     }
 
-    /// Persist credentials atomically. Missing or corrupt files read
-    /// back as signed-out (see [`load`](Self::load)).
+    fn read_store(&self) -> StoreRead {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => StoreRead::Bytes(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StoreRead::Missing,
+            Err(e) => StoreRead::Unreadable(e.to_string()),
+        }
+    }
+
+    /// Parse store bytes: the keyed shape, else a legacy single
+    /// credential re-keyed by host (with the host field populated so
+    /// round-trips stay canonical). The flag reports migrations so
+    /// readers persist the upgrade exactly once.
+    fn parse_store_bytes(
+        bytes: &[u8],
+    ) -> Result<(std::collections::HashMap<String, DeviceCredential>, bool), String> {
+        if let Ok(map) =
+            serde_json::from_slice::<std::collections::HashMap<String, DeviceCredential>>(bytes)
+        {
+            return Ok((map, false));
+        }
+        let mut legacy = serde_json::from_slice::<DeviceCredential>(bytes)
+            .map_err(|_| "credentials file is not valid JSON".to_string())?;
+        legacy.host = legacy_host_key(&legacy);
+        let mut map = std::collections::HashMap::new();
+        map.insert(legacy.host.clone(), legacy);
+        Ok((map, true))
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        self.path.with_extension("lock")
+    }
+
+    /// Read the host map leniently: missing or corrupt files read
+    /// empty (signed-out); legacy files migrate and persist the
+    /// upgrade best-effort (under the mutation lock, re-verified so
+    /// a concurrent migrator wins exactly once).
+    fn load_map(&self) -> std::collections::HashMap<String, DeviceCredential> {
+        let bytes = match self.read_store() {
+            StoreRead::Missing => return std::collections::HashMap::new(),
+            StoreRead::Bytes(bytes) => bytes,
+            StoreRead::Unreadable(_) => return std::collections::HashMap::new(),
+        };
+        match Self::parse_store_bytes(&bytes) {
+            Ok((map, migrated)) => {
+                if migrated {
+                    // Best-effort persist: re-check under the lock so
+                    // concurrent migrators don't interleave.
+                    if let Ok(_guard) = StoreLock::acquire(&self.lock_path()) {
+                        let still_legacy = matches!(self.read_store(), StoreRead::Bytes(current) if current == bytes);
+                        if still_legacy {
+                            let _ = self.write_map(&map);
+                        }
+                    }
+                }
+                map
+            }
+            Err(_) => std::collections::HashMap::new(),
+        }
+    }
+
+    /// Persist one forge credential, preserving every other forge.
+    /// The whole read-modify-write holds the cross-process lock, so
+    /// concurrent logins serialize instead of clobbering; unreadable
+    /// stores fail closed instead of wiping unknown bytes.
     pub fn save(&self, credential: &DeviceCredential) -> std::io::Result<()> {
+        if credential.host.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "credential has no forge host key",
+            ));
+        }
+        // The lock file lives beside the store: ensure the parent
+        // first so acquisition itself never fails on fresh homes.
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let bytes = serde_json::to_vec_pretty(credential)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let _guard = StoreLock::acquire(&self.lock_path())?;
+        let mut map = match self.read_store() {
+            StoreRead::Missing => std::collections::HashMap::new(),
+            StoreRead::Bytes(bytes) => Self::parse_store_bytes(&bytes)
+                .map(|(map, _)| map)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            StoreRead::Unreadable(e) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+            }
+        };
+        map.insert(credential.host.clone(), credential.clone());
+        let bytes = Self::encode_map(&map)?;
+        self.write_bytes(&bytes)
+    }
+
+    /// Credentials for one host (`None` when that forge is signed out).
+    pub fn load_forge(&self, host: &str) -> Option<DeviceCredential> {
+        self.load_map().remove(host)
+    }
+
+    /// All stored credentials, sorted by host for stable display.
+    pub fn load_all(&self) -> Vec<(String, DeviceCredential)> {
+        let mut entries: Vec<_> = self.load_map().into_iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+
+    fn encode_map(
+        map: &std::collections::HashMap<String, DeviceCredential>,
+    ) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec_pretty(map)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    fn write_map(
+        &self,
+        map: &std::collections::HashMap<String, DeviceCredential>,
+    ) -> std::io::Result<()> {
+        let bytes = Self::encode_map(map)?;
+        self.write_bytes(&bytes)
+    }
+
+    /// Atomic private write of pre-encoded bytes (unique temp plus
+    /// rename, scrubbed on failure).
+    fn write_bytes(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         // Unique temp sibling (pid + nanos): concurrent savers never
         // share a staging file, and a crash leaves only orphans.
         let tmp = self.path.with_extension(format!(
@@ -233,12 +454,12 @@ impl AuthStore {
                     .mode(0o600)
                     .open(&tmp)?;
                 use std::io::Write;
-                file.write_all(&bytes)?;
+                file.write_all(bytes)?;
                 file.sync_all()?;
             }
             #[cfg(not(unix))]
             {
-                std::fs::write(&tmp, &bytes)?;
+                std::fs::write(&tmp, bytes)?;
                 crate::winacl::restrict_to_owner(&tmp)?;
             }
             std::fs::rename(&tmp, &self.path)?;
@@ -250,16 +471,47 @@ impl AuthStore {
         result
     }
 
-    /// Load credentials (`None` when missing or corrupt — the caller
-    /// reports signed-out either way).
-    pub fn load(&self) -> Option<DeviceCredential> {
-        let bytes = std::fs::read(&self.path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+    /// Delete one forge entry, preserving the rest (`Ok(true)`
+    /// when an entry was removed). An emptied file is deleted so the
+    /// store never lingers as `{}`. Unreadable files are unlinked
+    /// outright: logout revokes unknown secrets rather than leaving
+    /// them behind.
+    pub fn clear_forge(&self, host: &str) -> std::io::Result<bool> {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _guard = StoreLock::acquire(&self.lock_path())?;
+        let mut map = match self.read_store() {
+            StoreRead::Missing => return Ok(false),
+            StoreRead::Bytes(bytes) => match Self::parse_store_bytes(&bytes) {
+                Ok((map, _)) => map,
+                Err(_) => return self.unlink_locked(),
+            },
+            StoreRead::Unreadable(_) => return self.unlink_locked(),
+        };
+        if map.remove(host).is_none() {
+            return Ok(false);
+        }
+        if map.is_empty() {
+            return self.unlink_locked();
+        }
+        self.write_map(&map)?;
+        Ok(true)
     }
 
-    /// Delete stored credentials (`Ok(true)` when a file was
-    /// removed, `Ok(false)` when already signed out).
+    /// Delete all stored credentials (`Ok(true)` when a file was
+    /// removed, `Ok(false)` when already signed out). Serialized
+    /// with savers so logout and login compose coherently.
     pub fn clear(&self) -> std::io::Result<bool> {
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _guard = StoreLock::acquire(&self.lock_path())?;
+        self.unlink_locked()
+    }
+
+    /// Unlink the store file; callers hold the lock.
+    fn unlink_locked(&self) -> std::io::Result<bool> {
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -376,9 +628,20 @@ mod tests {
     fn credential() -> DeviceCredential {
         DeviceCredential {
             forge: "github".to_string(),
+            host: "github.com".to_string(),
             username: "octocat".to_string(),
             scopes: vec!["repo".to_string()],
             access_token: "[REDACTED]".to_string(),
+        }
+    }
+
+    fn gitlab_credential() -> DeviceCredential {
+        DeviceCredential {
+            forge: "gitlab".to_string(),
+            host: "git.example.com".to_string(),
+            username: "dev".to_string(),
+            scopes: vec!["api".to_string()],
+            access_token: "glpat-secret".to_string(),
         }
     }
 
@@ -393,11 +656,12 @@ mod tests {
     fn auth_store_roundtrips_and_clears_idempotently() {
         let dir = crate::test_support::TempDir::new("auth-json").unwrap();
         let store = AuthStore::new(dir.path().join("auth.json"));
-        assert_eq!(store.load(), None);
+        assert_eq!(store.load_forge("github.com"), None);
+        assert!(store.load_all().is_empty());
         store.save(&credential()).unwrap();
-        assert_eq!(store.load(), Some(credential()));
+        assert_eq!(store.load_forge("github.com"), Some(credential()));
         assert!(store.clear().unwrap());
-        assert_eq!(store.load(), None);
+        assert_eq!(store.load_forge("github.com"), None);
         assert!(!store.clear().unwrap());
     }
 
@@ -407,7 +671,9 @@ mod tests {
         let path = dir.path().join("auth.json");
         std::fs::create_dir_all(dir.path()).unwrap();
         std::fs::write(&path, "{not json").unwrap();
-        assert_eq!(AuthStore::new(path).load(), None);
+        let store = AuthStore::new(path);
+        assert_eq!(store.load_forge("github.com"), None);
+        assert!(store.load_all().is_empty());
     }
 
     #[test]
@@ -422,7 +688,7 @@ mod tests {
         std::fs::write(blocker.join("auth.json"), b"junk").unwrap();
         let dead = AuthStore::new(blocker.join("auth.json").join("nested.json"));
         assert!(dead.save(&credential()).is_err());
-        assert_eq!(store.load(), Some(credential()));
+        assert_eq!(store.load_forge("github.com"), Some(credential()));
         // Late failure (rename onto a directory): the staging temp
         // is scrubbed, leaving no litter behind.
         let clash = dir.path().join("clash");
@@ -437,6 +703,99 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn auth_store_isolates_forges_without_cross_clobber() {
+        let dir = crate::test_support::TempDir::new("auth-multi").unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        store.save(&credential()).unwrap();
+        // Second forge lands alongside; the first is untouched.
+        store.save(&gitlab_credential()).unwrap();
+        assert_eq!(store.load_forge("github.com"), Some(credential()));
+        assert_eq!(
+            store.load_forge("git.example.com"),
+            Some(gitlab_credential())
+        );
+        let hosts: Vec<String> = store.load_all().into_iter().map(|(host, _)| host).collect();
+        assert_eq!(hosts, vec!["git.example.com", "github.com"]);
+        // Per-forge clear preserves the survivor; last one out
+        // deletes the file instead of lingering as `{}`.
+        assert!(store.clear_forge("git.example.com").unwrap());
+        assert!(!store.clear_forge("git.example.com").unwrap());
+        assert_eq!(store.load_forge("github.com"), Some(credential()));
+        assert!(store.clear_forge("github.com").unwrap());
+        assert!(!dir.path().join("auth.json").exists());
+    }
+
+    #[test]
+    fn auth_store_concurrent_saves_lose_nothing() {
+        let dir = crate::test_support::TempDir::new("auth-race").unwrap();
+        let path = dir.path().join("auth.json");
+        // Eight writers hammering distinct hosts: optimistic retry
+        // merges every interleaving instead of last-write-wins.
+        std::thread::scope(|scope| {
+            for t in 0..8u32 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let store = AuthStore::new(path);
+                    for i in 0..25u32 {
+                        let mut creds = credential();
+                        creds.host = format!("h{t}.example.com");
+                        creds.username = format!("u{t}-{i}");
+                        store.save(&creds).unwrap();
+                    }
+                });
+            }
+        });
+        let store = AuthStore::new(path);
+        assert_eq!(store.load_all().len(), 8);
+        for t in 0..8u32 {
+            assert!(store.load_forge(&format!("h{t}.example.com")).is_some());
+        }
+    }
+
+    #[test]
+    fn auth_store_save_onto_corrupt_fails_without_wiping() {
+        let dir = crate::test_support::TempDir::new("auth-corrupt-save").unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{not json").unwrap();
+        let store = AuthStore::new(path.clone());
+        let err = store.save(&credential()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // Unknown bytes survive untouched for forensics/recovery.
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not json");
+    }
+
+    #[test]
+    fn auth_store_migrates_legacy_single_token() {
+        let dir = crate::test_support::TempDir::new("auth-migrate").unwrap();
+        let path = dir.path().join("auth.json");
+        // Phase 1 shape: one bare credential, no host field.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "forge": "github",
+                "username": "octocat",
+                "scopes": ["repo"],
+                "access_token": "[REDACTED]",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = AuthStore::new(path.clone());
+        let migrated = store.load_forge("github.com").unwrap();
+        assert_eq!(migrated.username, "octocat");
+        assert_eq!(migrated.access_token, "[REDACTED]");
+        // The migrated record carries its canonical host, so a
+        // re-save lands on the same key instead of forking a "" one.
+        assert_eq!(migrated.host, "github.com");
+        store.save(&migrated).unwrap();
+        assert_eq!(store.load_all().len(), 1);
+        // Migration persists: the file is now the keyed shape.
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw.get("github.com").is_some(), "{raw}");
     }
 
     #[cfg(unix)]

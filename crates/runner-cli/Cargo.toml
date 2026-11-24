@@ -3,6 +3,7 @@ name = "runner-cli"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
+publish.workspace = true
 description = "Unified runner binary entrypoint and service management"
 
 [[bin]]

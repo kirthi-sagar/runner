@@ -3,6 +3,7 @@ name = "runner-core"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
+publish.workspace = true
 description = "Core engine: config, resource governor, federated mesh, IPC, MCP, status"
 
 [dependencies]

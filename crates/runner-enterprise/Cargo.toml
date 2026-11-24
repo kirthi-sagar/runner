@@ -3,6 +3,7 @@ name = "runner-enterprise"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
+publish.workspace = true
 description = "Enterprise governance: control plane, audit trail, fleet policy, SSO"
 
 [dependencies]

@@ -19,7 +19,9 @@ unmaintained = "all"
 ignore = []
 
 [licenses]
-# Workspace crates are MIT; allow the common permissive set only.
+# Workspace crates are unpublished commercial source-available code
+# (`publish = false`, honored by `private.ignore` below); allow the
+# common permissive set for dependencies only.
 allow = [
     "MIT",
     "Apache-2.0",

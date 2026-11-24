@@ -3,6 +3,7 @@ name = "runner-providers"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
+publish.workspace = true
 description = "Universal CI provider adapters: GitHub, GitLab, Bitbucket, local"
 
 [dependencies]

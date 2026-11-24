@@ -584,6 +584,8 @@ pub struct RunnerConfig {
     pub swarm: SwarmConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 /// Nominal internal transfer rate, USD per core-hour, applied when
@@ -723,6 +725,16 @@ impl Default for StorageGcConfig {
             min_age_days: 30,
         }
     }
+}
+
+/// Forge device-flow login (`[auth]`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// GitHub OAuth App client id for RFC 8628 device login (empty
+    /// fails `auth login` closed with setup guidance; register an
+    /// OAuth App and paste its client id here).
+    #[serde(default)]
+    pub github_client_id: String,
 }
 
 /// Agent swarm budget policy.
@@ -1295,6 +1307,14 @@ mod tests {
         assert_eq!(config.storage.gc.high_watermark_pct, 95);
         assert_eq!(config.storage.gc.low_watermark_pct, 70);
         assert_eq!(config.storage.gc.min_age_days, 7);
+    }
+
+    #[test]
+    fn auth_client_id_defaults_empty_and_parses() {
+        assert!(RunnerConfig::default().auth.github_client_id.is_empty());
+        let config: RunnerConfig =
+            toml::from_str("[auth]\ngithub_client_id = \"Iv1.abc123\"\n").unwrap();
+        assert_eq!(config.auth.github_client_id, "Iv1.abc123");
     }
 
     #[test]

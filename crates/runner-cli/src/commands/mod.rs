@@ -4,4 +4,5 @@
 pub mod auth;
 pub mod git_credential;
 pub mod image;
+pub mod snapshot;
 pub mod swarm;

@@ -33,7 +33,7 @@ fn assert_key_set(value: &serde_json::Value, required: &[&str], optional: &[&str
 }
 
 #[tokio::test]
-async fn mcp_tools_list_pins_fourteen_names_and_schemas() {
+async fn mcp_tools_list_pins_fifteen_names_and_schemas() {
     let server = McpServer::new(ToolContext::new(
         new_shared_state(),
         RunnerConfig::default(),
@@ -64,6 +64,7 @@ async fn mcp_tools_list_pins_fourteen_names_and_schemas() {
             "get_cache_stats",
             "register_swarm_agent",
             "leave_swarm",
+            "runner_snapshot",
         ]
     );
     // Exact served input schemas: any drift breaks the freeze.
@@ -172,6 +173,16 @@ async fn mcp_tools_list_pins_fourteen_names_and_schemas() {
                 "swarm_id": { "type": "string" },
                 "agent_id": { "type": "string" }},
             "required": ["swarm_id", "agent_id"]}),
+    );
+    expected.insert(
+        "runner_snapshot",
+        serde_json::json!({"type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["create", "restore", "list", "rm"] },
+                "name": { "type": "string" },
+                "force": { "type": "boolean" },
+                "path": { "type": "string" }},
+            "required": ["action"]}),
     );
     for tool in tools {
         let name = tool["name"].as_str().unwrap();

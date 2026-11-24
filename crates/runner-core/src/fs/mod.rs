@@ -2,3 +2,4 @@
 //! portable fs helpers as they earn their place.
 
 pub mod cow;
+pub mod snapshot;

@@ -528,8 +528,9 @@ fn copy_file_range_fallback(src: &Path, dst: &Path, len: u64) -> std::io::Result
 
 /// Remove a file or symlink (never a directory — checked upstream).
 /// Windows symlinks-to-directories need `remove_dir`, so both are
-/// attempted there in order.
-fn remove_file_or_symlink(path: &Path) -> std::io::Result<()> {
+/// attempted there in order. Shared with the snapshot store for
+/// worktree entry replacement during restore.
+pub(crate) fn remove_file_or_symlink(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(first) => {
@@ -565,6 +566,26 @@ fn mirror_mode(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// loud instead of silently dropping data. Hardlinks materialize as
 /// independent files; modification times are not preserved.
 pub fn cow_clone_tree(src: &Path, dst: &Path) -> std::io::Result<CowTreeStats> {
+    cow_clone_tree_inner(src, dst, &[])
+}
+
+/// Clone a directory tree while skipping entries whose file name
+/// appears in `exclude_names` (matched at every depth). Shares the
+/// walker with [`cow_clone_tree`]; nesting under an excluded
+/// top-level entry is safe because the walker never descends there.
+pub fn cow_clone_tree_excluding(
+    src: &Path,
+    dst: &Path,
+    exclude_names: &[&str],
+) -> std::io::Result<CowTreeStats> {
+    cow_clone_tree_inner(src, dst, exclude_names)
+}
+
+fn cow_clone_tree_inner(
+    src: &Path,
+    dst: &Path,
+    exclude_names: &[&str],
+) -> std::io::Result<CowTreeStats> {
     if !std::fs::symlink_metadata(src)
         .map(|meta| meta.file_type().is_dir())
         .unwrap_or(false)
@@ -580,7 +601,7 @@ pub fn cow_clone_tree(src: &Path, dst: &Path) -> std::io::Result<CowTreeStats> {
             format!("clone destination exists: {}", dst.display()),
         ));
     }
-    if dst_within_src(src, dst)? {
+    if dst_nests_unexcluded(src, dst, exclude_names)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
@@ -597,7 +618,7 @@ pub fn cow_clone_tree(src: &Path, dst: &Path) -> std::io::Result<CowTreeStats> {
         native_clones: 0,
         fallback_copies: 0,
     };
-    clone_dir_into(src, dst, &mut stats)?;
+    clone_dir_into(src, dst, &mut stats, exclude_names)?;
     Ok(stats)
 }
 
@@ -608,16 +629,19 @@ pub fn cow_clone_tree(src: &Path, dst: &Path) -> std::io::Result<CowTreeStats> {
 /// the remainder rejoined before comparing. Permission-masked
 /// ancestors compare lexically (traversal would fail there first
 /// anyway, so no infinite descent can result).
-fn dst_within_src(src: &Path, dst: &Path) -> std::io::Result<bool> {
+/// True when `dst` nests inside `src` through a path the walker
+/// will actually descend: nesting whose top-level entry is excluded
+/// is safe (the walker skips that whole subtree, so `dst` is never
+/// reached during traversal).
+fn dst_nests_unexcluded(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Result<bool> {
     let canonical_src = std::fs::canonicalize(src)?;
     let mut ancestor = dst;
     let mut rest = PathBuf::new();
-    loop {
+    let full = loop {
         if let Ok(canonical) = std::fs::canonicalize(ancestor) {
-            let full = rest.components().fold(canonical, |path, component| {
+            break rest.components().fold(canonical, |path, component| {
                 path.join(component.as_os_str())
             });
-            return Ok(full.starts_with(&canonical_src));
         }
         match (ancestor.parent(), ancestor.file_name()) {
             (Some(parent), Some(name)) => {
@@ -628,13 +652,27 @@ fn dst_within_src(src: &Path, dst: &Path) -> std::io::Result<bool> {
             // here, and those canonicalize): cannot be inside `src`.
             _ => return Ok(false),
         }
+    };
+    let Ok(rel) = full.strip_prefix(&canonical_src) else {
+        return Ok(false);
+    };
+    match rel.components().next() {
+        None => Ok(true),
+        Some(first) => Ok(!exclude
+            .iter()
+            .any(|name| first.as_os_str() == std::ffi::OsStr::new(name))),
     }
 }
 
 /// Recursive tree worker: `src` is a directory, `dst` is created.
 /// Every entry is classified by symlink-blind metadata so links are
 /// never followed into.
-fn clone_dir_into(src: &Path, dst: &Path, stats: &mut CowTreeStats) -> std::io::Result<()> {
+fn clone_dir_into(
+    src: &Path,
+    dst: &Path,
+    stats: &mut CowTreeStats,
+    exclude_names: &[&str],
+) -> std::io::Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| {
         std::io::Error::new(
             e.kind(),
@@ -659,10 +697,16 @@ fn clone_dir_into(src: &Path, dst: &Path, stats: &mut CowTreeStats) -> std::io::
                 format!("clone entry has no name: {}", src_path.display()),
             )
         })?;
+        if exclude_names
+            .iter()
+            .any(|excluded| name == std::ffi::OsStr::new(excluded))
+        {
+            continue;
+        }
         let dst_path = dst.join(name);
         let file_type = std::fs::symlink_metadata(src_path)?.file_type();
         if file_type.is_dir() && !file_type.is_symlink() {
-            clone_dir_into(src_path, &dst_path, stats)?;
+            clone_dir_into(src_path, &dst_path, stats, exclude_names)?;
         } else if file_type.is_symlink() {
             mirror_symlink(src_path, &dst_path)?;
             stats.symlinks += 1;
@@ -695,8 +739,9 @@ fn clone_dir_into(src: &Path, dst: &Path, stats: &mut CowTreeStats) -> std::io::
 /// Recreate one symlink at its mirror path (target copied verbatim,
 /// never resolved). Windows needs the link flavor upfront, read
 /// from the source link itself (`is_symlink_dir`, never the
-/// target) so dangling directory links keep their flavor.
-fn mirror_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// target) so dangling directory links keep their flavor. Shared
+/// with the snapshot store for verbatim link restoration.
+pub(crate) fn mirror_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
     let target = std::fs::read_link(src)?;
     #[cfg(unix)]
     {
@@ -731,9 +776,17 @@ mod tests {
         let dir = crate::test_support::TempDir::new("cow-contained").unwrap();
         let src = dir.path().join("src");
         std::fs::create_dir_all(src.join("a")).unwrap();
-        assert!(dst_within_src(&src, &src.join("snapshots")).unwrap());
-        assert!(dst_within_src(&src, &src.join("a").join("b").join("snapshots")).unwrap());
-        assert!(!dst_within_src(&src, &dir.path().join("sibling")).unwrap());
-        assert!(!dst_within_src(&src, &src.join("..").join("sibling")).unwrap());
+        assert!(dst_nests_unexcluded(&src, &src.join("snapshots"), &[]).unwrap());
+        assert!(
+            dst_nests_unexcluded(&src, &src.join("a").join("b").join("snapshots"), &[]).unwrap()
+        );
+        assert!(!dst_nests_unexcluded(&src, &dir.path().join("sibling"), &[]).unwrap());
+        assert!(!dst_nests_unexcluded(&src, &src.join("..").join("sibling"), &[]).unwrap());
+        // Nesting under an excluded top-level entry is safe: the
+        // walker never descends there.
+        assert!(
+            !dst_nests_unexcluded(&src, &src.join(".runner").join("snapshots"), &[".runner"])
+                .unwrap()
+        );
     }
 }

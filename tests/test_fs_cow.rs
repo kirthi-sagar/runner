@@ -72,6 +72,33 @@ fn cloned_hardlink_alias_preserves_links() {
     assert_eq!(std::fs::read(&second).unwrap(), bytes);
 }
 
+/// Excluded names vanish at every depth, including nested
+/// destinations parked under an excluded top-level entry.
+#[test]
+fn cloned_tree_excluding_skips_named_entries() {
+    use runner_core::fs::cow::cow_clone_tree_excluding;
+
+    let dir = TempDir::new("cow-exclude").unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join(".git")).unwrap();
+    std::fs::write(src.join(".git").join("HEAD"), b"ref").unwrap();
+    std::fs::write(src.join("keep.txt"), b"keep").unwrap();
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("sub").join("deep.txt"), b"deep").unwrap();
+    // Destination nests inside the source under an excluded entry:
+    // the walker skips `.runner` (including the just-created `dst`
+    // itself), so no descent loops back into the output.
+    let dst = src.join(".runner").join("snapshots").join("v1");
+    let stats = cow_clone_tree_excluding(&src, &dst, &[".git", ".runner"]).unwrap();
+    assert_eq!(stats.files, 2);
+    assert_eq!(std::fs::read(dst.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(
+        std::fs::read(dst.join("sub").join("deep.txt")).unwrap(),
+        b"deep"
+    );
+    assert!(!dst.join(".git").exists());
+}
+
 /// Destinations inside the source are rejected before anything is
 /// created (no infinite descent, no pollution).
 #[test]

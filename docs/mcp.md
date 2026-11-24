@@ -41,7 +41,7 @@ below and `tests/test_schema_freeze.rs`).
 ## What agents can do
 
 The server speaks newline-delimited JSON-RPC on stdio
-(`initialize`, `tools/list`, `tools/call`). Fourteen tools are exposed:
+(`initialize`, `tools/list`, `tools/call`). Fifteen tools are exposed:
 
 | Tool | Purpose |
 |---|---|
@@ -59,6 +59,7 @@ The server speaks newline-delimited JSON-RPC on stdio
 | `get_cache_stats` | LAN cache entries, size, hits, misses, bandwidth saved |
 | `register_swarm_agent` | Join an agent swarm; draw a headroom slice under a lease |
 | `leave_swarm` | Leave an agent swarm; return the headroom slice |
+| `runner_snapshot` | Checkpoint and roll back workspaces with copy-on-write snapshots |
 
 Example — check status, then throttle a noisy neighbor during a demo:
 
@@ -198,3 +199,14 @@ Local state only (no daemon arm yet).
 `leave_swarm` — input: `swarm_id` (string, required), `agent_id`
 (string, required). Output: the pool-after-release lease shape
 plus `left: true`. Unknown swarm or id → `-32602`.
+
+`runner_snapshot` — input: `action` (`create`|`restore`|`list`|`rm`,
+required), `name` (string, required except `list`), `force`
+(boolean, restores only), `path` (string, workspace root to
+discover the repo from; default `.`). Output: per-action JSON
+(`snapshot`/`created_secs`, `restored` with `files_restored` /
+`entries_removed`, `snapshots` array, `removed`). Checkpoints live
+under `<repo>/.runner/snapshots/`, excluding `.git`/`.runner`;
+restore reverts snapshotted state freely but deletes untracked
+extras only with `force: true`. Unknown action, bad name, unknown
+snapshot, or unforced extras → `-32602`.

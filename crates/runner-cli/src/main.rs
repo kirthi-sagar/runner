@@ -197,6 +197,11 @@ enum Commands {
         #[command(subcommand)]
         command: ImageCommands,
     },
+    /// Checkpoint and roll back working trees with copy-on-write snapshots
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommands,
+    },
     /// Execute a command locally inside the zero-freeze sandbox
     Exec {
         /// Command and arguments to execute
@@ -430,6 +435,34 @@ enum ImageCommands {
         /// Skip interactive confirmation
         #[arg(short, long, default_value_t = false)]
         force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommands {
+    /// Capture the working tree into a named snapshot
+    Create {
+        /// Snapshot name
+        name: String,
+    },
+    /// Restore the working tree to a named snapshot
+    Restore {
+        /// Snapshot name
+        name: String,
+        /// Also delete worktree entries absent from the snapshot
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// List snapshots newest-last
+    List {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Delete a named snapshot
+    Rm {
+        /// Snapshot name
+        name: String,
     },
 }
 
@@ -1491,6 +1524,60 @@ fn cmd_image_list(config: &RunnerConfig, format: &str) -> Result<()> {
     Ok(())
 }
 
+/// `runner snapshot create`: checkpoint the enclosing repository.
+fn cmd_snapshot_create(name: &str) -> Result<()> {
+    use runner_cli::commands::snapshot::{open_workspace_store, render_create_text};
+    use runner_core::fs::snapshot::discover_repo_root;
+
+    let store = open_workspace_store().map_err(|e| anyhow::anyhow!(e))?;
+    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let repo = discover_repo_root(&cwd).map_err(|e| anyhow::anyhow!(e))?;
+    let meta = store.create(&repo, name).map_err(|e| anyhow::anyhow!(e))?;
+    print!("{}", render_create_text(&meta, &repo));
+    Ok(())
+}
+
+/// `runner snapshot restore`: roll the worktree back to a snapshot.
+fn cmd_snapshot_restore(name: &str, force: bool) -> Result<()> {
+    use runner_cli::commands::snapshot::{open_workspace_store, render_restore_text};
+    use runner_core::fs::snapshot::discover_repo_root;
+
+    let store = open_workspace_store().map_err(|e| anyhow::anyhow!(e))?;
+    let cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let repo = discover_repo_root(&cwd).map_err(|e| anyhow::anyhow!(e))?;
+    let stats = store
+        .restore(&repo, name, force)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    print!("{}", render_restore_text(name, &stats));
+    Ok(())
+}
+
+/// `runner snapshot list`: show checkpoints newest-last.
+fn cmd_snapshot_list(format: &str) -> Result<()> {
+    use runner_cli::commands::snapshot::{
+        open_workspace_store, render_list_json, render_list_text,
+    };
+
+    let store = open_workspace_store().map_err(|e| anyhow::anyhow!(e))?;
+    let metas = store.list();
+    match format.trim().to_ascii_lowercase().as_str() {
+        "text" => print!("{}", render_list_text(&metas)),
+        "json" => println!("{}", render_list_json(&metas)),
+        other => anyhow::bail!("unsupported snapshot list format {other:?}: want text|json"),
+    }
+    Ok(())
+}
+
+/// `runner snapshot rm`: delete a named snapshot.
+fn cmd_snapshot_rm(name: &str) -> Result<()> {
+    use runner_cli::commands::snapshot::{open_workspace_store, render_remove_text};
+
+    let store = open_workspace_store().map_err(|e| anyhow::anyhow!(e))?;
+    store.remove(name).map_err(|e| anyhow::anyhow!(e))?;
+    print!("{}", render_remove_text(name));
+    Ok(())
+}
+
 /// `runner image prune`: drop unreferenced blobs and stale staging files.
 fn cmd_image_prune(config: &RunnerConfig, dry_run: bool) -> Result<()> {
     use runner_cli::commands::image::{
@@ -2140,6 +2227,20 @@ async fn main() -> Result<()> {
                 cmd_image_rm(&config, &image, force)?;
             }
         },
+        Commands::Snapshot { command } => match command {
+            SnapshotCommands::Create { name } => {
+                cmd_snapshot_create(&name)?;
+            }
+            SnapshotCommands::Restore { name, force } => {
+                cmd_snapshot_restore(&name, force)?;
+            }
+            SnapshotCommands::List { format } => {
+                cmd_snapshot_list(&format)?;
+            }
+            SnapshotCommands::Rm { name } => {
+                cmd_snapshot_rm(&name)?;
+            }
+        },
         Commands::Exec {
             command,
             no_sandbox,
@@ -2316,5 +2417,41 @@ mod tests {
             } => assert_eq!(operation, "get"),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_group_parse() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["runner", "snapshot", "create", "v1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Snapshot {
+                command: SnapshotCommands::Create { .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["runner", "snapshot", "restore", "v1", "--force"]).unwrap();
+        match cli.command {
+            Commands::Snapshot {
+                command: SnapshotCommands::Restore { name, force },
+            } => {
+                assert_eq!(name, "v1");
+                assert!(force);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        let cli = Cli::try_parse_from(["runner", "snapshot", "list", "--format", "json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Snapshot {
+                command: SnapshotCommands::List { .. }
+            }
+        ));
+        let cli = Cli::try_parse_from(["runner", "snapshot", "rm", "v1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Snapshot {
+                command: SnapshotCommands::Rm { .. }
+            }
+        ));
     }
 }

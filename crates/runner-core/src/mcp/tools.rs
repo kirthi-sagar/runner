@@ -33,9 +33,10 @@ pub const TOOL_MANAGE_CLOUD_CAPACITY: &str = "manage_cloud_capacity";
 pub const TOOL_GET_CACHE_STATS: &str = "get_cache_stats";
 pub const TOOL_REGISTER_SWARM_AGENT: &str = "register_swarm_agent";
 pub const TOOL_LEAVE_SWARM: &str = "leave_swarm";
+pub const TOOL_RUNNER_SNAPSHOT: &str = "runner_snapshot";
 
 /// All tool names, in contract order.
-pub const ALL_TOOLS: [&str; 14] = [
+pub const ALL_TOOLS: [&str; 15] = [
     TOOL_GET_CI_STATUS,
     TOOL_GET_FLEET_TOPOLOGY,
     TOOL_RESERVE_HOST_RESOURCES,
@@ -50,6 +51,7 @@ pub const ALL_TOOLS: [&str; 14] = [
     TOOL_GET_CACHE_STATS,
     TOOL_REGISTER_SWARM_AGENT,
     TOOL_LEAVE_SWARM,
+    TOOL_RUNNER_SNAPSHOT,
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -174,6 +176,17 @@ pub struct RegisterSwarmAgentArgs {
 pub struct LeaveSwarmArgs {
     pub swarm_id: String,
     pub agent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunnerSnapshotArgs {
+    pub action: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub force: Option<bool>,
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// Agent-native capabilities, implemented outside `runner-core`.
@@ -862,6 +875,10 @@ pub async fn execute_tool(
             let args: LeaveSwarmArgs = parse_args(args)?;
             leave_swarm(&args, ctx).await
         }
+        TOOL_RUNNER_SNAPSHOT => {
+            let args: RunnerSnapshotArgs = parse_args(args)?;
+            runner_snapshot(&args, ctx).await
+        }
         _ => Err(ToolError {
             code: -32601,
             message: format!("unknown tool: {name}"),
@@ -963,6 +980,80 @@ async fn leave_swarm(
         map.insert("left".to_string(), serde_json::Value::from(true));
     }
     Ok(value)
+}
+
+fn snapshot_error(e: crate::fs::snapshot::SnapshotError) -> ToolError {
+    use crate::fs::snapshot::SnapshotError;
+    match e {
+        SnapshotError::Invalid(message) => ToolError::invalid_params(message),
+        SnapshotError::Io(message) => ToolError::internal(message),
+    }
+}
+
+async fn runner_snapshot(
+    args: &RunnerSnapshotArgs,
+    _ctx: &ToolContext,
+) -> Result<serde_json::Value, ToolError> {
+    // Snapshot capture/restore walks whole trees synchronously;
+    // offload to the blocking pool so tokio workers never stall
+    // behind a large workspace operation.
+    let owned = args.clone();
+    tokio::task::spawn_blocking(move || runner_snapshot_blocking(&owned))
+        .await
+        .map_err(|e| ToolError::internal(format!("snapshot task failed: {e}")))?
+}
+
+fn runner_snapshot_blocking(args: &RunnerSnapshotArgs) -> Result<serde_json::Value, ToolError> {
+    use crate::fs::snapshot::{discover_repo_root, WorkspaceSnapshots};
+
+    let start = args.path.as_deref().unwrap_or(".");
+    let repo = discover_repo_root(std::path::Path::new(start)).map_err(snapshot_error)?;
+    let store = WorkspaceSnapshots::for_repository(&repo).map_err(snapshot_error)?;
+    let named = |what: &str| {
+        args.name
+            .clone()
+            .ok_or_else(|| ToolError::invalid_params(format!("snapshot {what} requires name")))
+    };
+    match args.action.as_str() {
+        "create" => {
+            let meta = store
+                .create(&repo, &named("create")?)
+                .map_err(snapshot_error)?;
+            Ok(serde_json::json!({
+                "snapshot": meta.name,
+                "created_secs": meta.created_secs,
+            }))
+        }
+        "restore" => {
+            let name = named("restore")?;
+            let stats = store
+                .restore(&repo, &name, args.force.unwrap_or(false))
+                .map_err(snapshot_error)?;
+            Ok(serde_json::json!({
+                "restored": name,
+                "files_restored": stats.files_restored,
+                "entries_removed": stats.entries_removed,
+            }))
+        }
+        "list" => {
+            let snapshots: Vec<_> = store
+                .list()
+                .iter()
+                .map(|meta| {
+                    serde_json::json!({"name": meta.name, "created_secs": meta.created_secs})
+                })
+                .collect();
+            Ok(serde_json::json!({ "snapshots": snapshots }))
+        }
+        "rm" => {
+            let name = named("rm")?;
+            store.remove(&name).map_err(snapshot_error)?;
+            Ok(serde_json::json!({ "removed": name }))
+        }
+        other => Err(ToolError::invalid_params(format!(
+            "unknown action: '{other}' (want create|restore|list|rm)"
+        ))),
+    }
 }
 
 async fn throttle_runner(
@@ -1124,6 +1215,15 @@ pub fn tool_schema(name: &str) -> serde_json::Value {
             }),
             vec!["swarm_id", "agent_id"],
         ),
+        TOOL_RUNNER_SNAPSHOT => (
+            serde_json::json!({
+                "action": { "type": "string", "enum": ["create", "restore", "list", "rm"] },
+                "name": { "type": "string" },
+                "force": { "type": "boolean" },
+                "path": { "type": "string" },
+            }),
+            vec!["action"],
+        ),
         _ => (serde_json::json!({}), vec![]),
     };
     serde_json::json!({ "type": "object", "properties": props, "required": required })
@@ -1146,6 +1246,9 @@ pub fn tool_description(name: &str) -> &'static str {
         TOOL_GET_CACHE_STATS => "LAN cache entries, size, hits, misses, and bandwidth saved.",
         TOOL_REGISTER_SWARM_AGENT => "Join an agent swarm; draw a headroom slice under a lease.",
         TOOL_LEAVE_SWARM => "Leave an agent swarm; return the headroom slice.",
+        TOOL_RUNNER_SNAPSHOT => {
+            "Checkpoint and roll back agent workspaces with copy-on-write snapshots."
+        }
         _ => "Unknown tool.",
     }
 }
@@ -1636,9 +1739,52 @@ mod tests {
         assert_eq!(out["entries"], 3);
     }
 
+    #[tokio::test]
+    async fn snapshot_tool_roundtrips_through_dispatch() {
+        let dir = crate::test_support::TempDir::new("mcp-snapshot").unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("code.rs"), b"v1").unwrap();
+        let repo_str = repo.to_str().unwrap().to_string();
+        let call = |args: serde_json::Value| {
+            let ctx = ctx();
+            async move { execute_tool(TOOL_RUNNER_SNAPSHOT, Some(&args), &ctx).await }
+        };
+        let out =
+            call(serde_json::json!({"action": "create", "name": "v1", "path": repo_str.as_str()}))
+                .await
+                .unwrap();
+        assert_eq!(out["snapshot"], "v1");
+        let out = call(serde_json::json!({"action": "list", "path": repo_str.as_str()}))
+            .await
+            .unwrap();
+        assert_eq!(out["snapshots"].as_array().unwrap().len(), 1);
+        std::fs::write(repo.join("code.rs"), b"v2").unwrap();
+        let out =
+            call(serde_json::json!({"action": "restore", "name": "v1", "path": repo_str.as_str()}))
+                .await
+                .unwrap();
+        assert_eq!(out["restored"], "v1");
+        assert_eq!(std::fs::read(repo.join("code.rs")).unwrap(), b"v1");
+        let out =
+            call(serde_json::json!({"action": "rm", "name": "v1", "path": repo_str.as_str()}))
+                .await
+                .unwrap();
+        assert_eq!(out["removed"], "v1");
+        // Unknown actions and missing names fail as invalid params.
+        let err = call(serde_json::json!({"action": "explode", "path": repo_str.as_str()}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        let err = call(serde_json::json!({"action": "create", "path": repo_str.as_str()}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
     #[test]
-    fn all_fourteen_tools_have_schemas_and_descriptions() {
-        assert_eq!(ALL_TOOLS.len(), 14);
+    fn all_fifteen_tools_have_schemas_and_descriptions() {
+        assert_eq!(ALL_TOOLS.len(), 15);
         for name in ALL_TOOLS {
             let schema = tool_schema(name);
             assert_eq!(schema["type"], "object", "{name}");

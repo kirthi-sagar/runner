@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 use crate::config::DEFAULT_HOST_CORE_HOUR_USD;
 use crate::governor::topology::{detect_slots, JOB_MIN_CORES, JOB_MIN_MEM_MB};
@@ -26,6 +27,9 @@ pub const SWARM_AGENT_MEM_MB: u64 = JOB_MIN_MEM_MB;
 /// Lease hold per registration, seconds (renewed by re-registering;
 /// expiry returns the slice to the pool on the next mutation).
 pub const SWARM_LEASE_SECS: u64 = 1800;
+/// Per-session event bus buffer: lagging receivers drop old events,
+/// the sender never blocks (see [`SwarmEvent`]).
+pub const SWARM_EVENT_BUFFER: usize = 64;
 
 /// Physical host capacity ceiling: logical CPUs plus total RAM, MiB.
 /// Detection failure fails the registration closed (unknown capacity
@@ -175,10 +179,75 @@ impl SwarmBudget {
     }
 }
 
+/// Real-time swarm lifecycle event, broadcast per session.
+/// Emission is non-blocking fan-out: [`broadcast::Sender::send`]
+/// never waits (receivers absent or lagging only lose events), so
+/// publishing under the supervisor write lock cannot stall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event")]
+pub enum SwarmEvent {
+    StatusChanged {
+        swarm_id: String,
+        status: SwarmStatus,
+    },
+    CapacityYielded {
+        swarm_id: String,
+        agent_id: String,
+        granted_to: Option<String>,
+    },
+    AgentPreempted {
+        swarm_id: String,
+        victim: String,
+        by: String,
+    },
+    BudgetUpdated {
+        swarm_id: String,
+        spent_usd: f64,
+    },
+}
+
+/// Execution tier for a swarm-dispatched job (names mirror the
+/// sandbox driver names: `process`, `container`/`oci`,
+/// `microvm`/`micro-vm`/`firecracker`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SwarmTier {
+    Process,
+    Container,
+    MicroVm,
+}
+
+impl SwarmTier {
+    /// Parse a tier name (case-insensitive, driver aliases honored).
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "process" => Ok(Self::Process),
+            "microvm" | "micro-vm" | "firecracker" => Ok(Self::MicroVm),
+            "container" | "oci" => Ok(Self::Container),
+            other => Err(format!(
+                "unknown execution tier: '{other}' (want process|container|microvm)"
+            )),
+        }
+    }
+}
+
+/// One active swarm-dispatched job: the agent's slice covers its
+/// draw (validated at dispatch), the pool accounting stays at the
+/// slice level, and completion releases the agent for its next job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmJob {
+    pub job_id: String,
+    pub agent_id: String,
+    pub tier: SwarmTier,
+    pub cores: f64,
+    pub memory_mb: u64,
+}
+
 /// One agent swarm: membership, its shared capacity pool, its spend
-/// ledger, and the FIFO execution wait queue (priority governs
-/// preemption; FIFO governs the queue).
-#[derive(Debug, Clone, PartialEq)]
+/// ledger, the FIFO execution wait queue (priority governs
+/// preemption; FIFO governs the queue), active dispatches, and the
+/// lifecycle event bus.
+#[derive(Debug, Clone)]
 pub struct SwarmSession {
     pub swarm_id: String,
     pub members: HashMap<String, SwarmAgent>,
@@ -186,10 +255,14 @@ pub struct SwarmSession {
     pub status: SwarmStatus,
     pub budget: SwarmBudget,
     pub waiters: VecDeque<String>,
+    pub active_jobs: HashMap<String, SwarmJob>,
+    pub next_job: u64,
+    event_tx: broadcast::Sender<SwarmEvent>,
 }
 
 impl SwarmSession {
     pub fn new(swarm_id: String, cpu_weight_max: f64, memory_max_mb: u64) -> Self {
+        let (event_tx, _) = broadcast::channel(SWARM_EVENT_BUFFER);
         Self {
             swarm_id,
             members: HashMap::new(),
@@ -197,7 +270,21 @@ impl SwarmSession {
             status: SwarmStatus::Active,
             budget: SwarmBudget::new(0.0, DEFAULT_HOST_CORE_HOUR_USD),
             waiters: VecDeque::new(),
+            active_jobs: HashMap::new(),
+            next_job: 1,
+            event_tx,
         }
+    }
+
+    /// Subscribe to this session's lifecycle events (buffered;
+    /// lagging receivers observe `Lagged` and skip, never stall).
+    pub fn subscribe(&self) -> broadcast::Receiver<SwarmEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Publish one event (non-blocking; receiver absence is silent).
+    fn emit(&self, event: SwarmEvent) {
+        let _ = self.event_tx.send(event);
     }
 
     pub fn with_budget(mut self, cap_usd: f64, rate_usd_per_core_hour: f64) -> Self {
@@ -218,12 +305,20 @@ impl SwarmSession {
         let elapsed_secs = acquired
             .map(|taken| now.saturating_duration_since(taken).as_secs_f64())
             .unwrap_or(0.0);
-        self.budget
-            .record(SWARM_AGENT_CORES * elapsed_secs / 3600.0);
+        let core_hours = SWARM_AGENT_CORES * elapsed_secs / 3600.0;
+        if core_hours > 0.0 {
+            self.budget.record(core_hours);
+            let spent_usd = self.budget.spent_usd;
+            self.emit(SwarmEvent::BudgetUpdated {
+                swarm_id: self.swarm_id.clone(),
+                spent_usd,
+            });
+        }
     }
 
-    /// Drop expired leases, accruing and returning their slices, and
-    /// scrub them from the wait queue. Returns the pruned count.
+    /// Drop expired leases, accruing and returning their slices,
+    /// abandoning their active jobs, and scrubbing the wait queue.
+    /// Returns the pruned count.
     pub fn prune_expired(&mut self, now: Instant) -> usize {
         let expired: Vec<String> = self
             .members
@@ -238,6 +333,7 @@ impl SwarmSession {
             if held {
                 self.capacity_pool.dealloc_agent();
             }
+            self.active_jobs.retain(|_, job| job.agent_id != *id);
             self.waiters.retain(|waiter| waiter != id);
         }
         expired.len()
@@ -289,15 +385,15 @@ impl SwarmLease {
 }
 
 /// Swarm membership failure: invalid requests (`-32602`) versus
-/// retryable `-32603` capacity and host-probe denials. Budget
-/// exhaustion is `-32602` per contract (the cap is a request
-/// precondition, like an unknown id — not a transient shortage).
+/// retryable `-32603` host-probe denials. Capacity shortage never
+/// denies: members join holderless and execution requests queue
+/// (Phase 3 holderless membership). Budget exhaustion is `-32602`
+/// per contract (the cap is a request precondition, like an
+/// unknown id — not a transient shortage).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SwarmError {
     /// Malformed request, duplicate, unknown id, or closed swarm.
     Invalid(String),
-    /// No headroom left (session pool or host-global).
-    Full(String),
     /// Host capacity unreadable; fail closed without minting.
     Internal(String),
     /// Cumulative spend reached the configured cap.
@@ -307,21 +403,43 @@ pub enum SwarmError {
 impl std::fmt::Display for SwarmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid(message)
-            | Self::Full(message)
-            | Self::Internal(message)
-            | Self::BudgetExceeded(message) => write!(f, "{message}"),
+            Self::Invalid(message) | Self::Internal(message) | Self::BudgetExceeded(message) => {
+                write!(f, "{message}")
+            }
         }
     }
 }
 
 impl std::error::Error for SwarmError {}
 
+/// Total slices out across every live session, as
+/// `(cores, memory_mb)`. Callers prune expired leases first.
+fn global_used(sessions: &HashMap<String, SwarmSession>) -> (f64, u64) {
+    sessions.values().fold((0.0, 0), |totals, session| {
+        (
+            totals.0 + session.capacity_pool.cpu_weight_allocated,
+            totals.1 + session.capacity_pool.memory_allocated_mb,
+        )
+    })
+}
+
+/// True when one more agent slice fits the host-global totals.
+fn global_fits(
+    sessions: &HashMap<String, SwarmSession>,
+    host_cores: f64,
+    host_mem_mb: u64,
+) -> bool {
+    let (used_cores, used_mem_mb) = global_used(sessions);
+    used_cores + SWARM_AGENT_CORES <= host_cores
+        && used_mem_mb.saturating_add(SWARM_AGENT_MEM_MB) <= host_mem_mb
+}
+
 /// Register one agent: validate, prune expired leases, create the
-/// session on first use (host ceilings, unenforced budget), then
-/// draw the slice. Duplicate ids within a swarm reject; closed
-/// swarms reject; the draw must fit both the session pool and the
-/// host-global totals across every session.
+/// session on first use (host ceilings, policy budget), then draw a
+/// slice when one fits — otherwise the member joins holderless and
+/// queues (Phase 3 holderless membership: joins never deny on
+/// capacity). Duplicate ids within a swarm reject; closed swarms
+/// reject; a blown budget fails the join closed.
 pub fn register_agent(
     sessions: &mut HashMap<String, SwarmSession>,
     swarm_id: &str,
@@ -369,22 +487,9 @@ pub fn register_agent_with_budget(
     for session in sessions.values_mut() {
         session.prune_expired(now);
     }
-    // Host-global remaining across every live session.
+    // Host ceilings seed first-use sessions; the global fit check
+    // runs at draw time (below), where holderless joins bypass it.
     let (host_cores, host_mem_mb) = host_capacity().map_err(SwarmError::Internal)?;
-    let (used_cores, used_mem_mb) = sessions.values().fold((0.0, 0), |totals, session| {
-        (
-            totals.0 + session.capacity_pool.cpu_weight_allocated,
-            totals.1 + session.capacity_pool.memory_allocated_mb,
-        )
-    });
-    if used_cores + SWARM_AGENT_CORES > host_cores
-        || used_mem_mb.saturating_add(SWARM_AGENT_MEM_MB) > host_mem_mb
-    {
-        return Err(SwarmError::Full(format!(
-            "host swarm capacity exhausted ({used_cores:.1}/{host_cores:.0} cores, \
-             {used_mem_mb}/{host_mem_mb} MiB); retry after leave or expiry"
-        )));
-    }
     let session = match sessions.get(swarm_id) {
         Some(existing) => existing,
         None => {
@@ -407,14 +512,14 @@ pub fn register_agent_with_budget(
             "agent '{agent_id}' is already registered in swarm '{swarm_id}'"
         )));
     }
-    // Registration draws a slice (execution capacity), so a blown
-    // budget fails the join closed, like a dispatch.
+    // Joins draw execution capacity when it fits, so a blown budget
+    // fails closed even before the fit check.
     session.budget.check()?;
-    if !session.capacity_pool.fits_agent() {
-        return Err(SwarmError::Full(format!(
-            "swarm '{swarm_id}' pool exhausted; retry after leave or expiry"
-        )));
-    }
+    // Opportunistic draw: room in the session pool and the host
+    // totals grants a slice at join; otherwise the member waits
+    // holderless (high-priority joins then preempt at request time).
+    let draws =
+        session.capacity_pool.fits_agent() && global_fits(sessions, host_cores, host_mem_mb);
     let session = sessions
         .get_mut(swarm_id)
         .expect("just inserted or matched");
@@ -423,17 +528,23 @@ pub fn register_agent_with_budget(
         role: role.to_string(),
         priority,
         lease_expires_at: now + Duration::from_secs(SWARM_LEASE_SECS),
-        holds_slice: true,
-        slice_acquired_at: Some(now),
+        holds_slice: draws,
+        slice_acquired_at: draws.then_some(now),
     };
     session.members.insert(agent_id.to_string(), agent.clone());
-    session.capacity_pool.alloc_agent();
+    if draws {
+        session.capacity_pool.alloc_agent();
+    } else {
+        session.waiters.push_back(agent_id.to_string());
+    }
     Ok(SwarmLease::grant(session, &agent))
 }
 
 /// Release one agent's membership and (when held) its slice back to
-/// the pool, accruing the hold to the spend ledger. Unknown swarms
-/// and ids fail closed (`-32602`, mirroring reservation release).
+/// the pool, accruing the hold to the spend ledger. Members with an
+/// active job must complete it first (protocol discipline; expiry
+/// abandons instead). Unknown swarms and ids fail closed (`-32602`,
+/// mirroring reservation release).
 pub fn leave_swarm(
     sessions: &mut HashMap<String, SwarmSession>,
     swarm_id: &str,
@@ -447,6 +558,15 @@ pub fn leave_swarm(
     if !session.members.contains_key(agent_id) {
         return Err(SwarmError::Invalid(format!(
             "agent '{agent_id}' is not registered in swarm '{swarm_id}'"
+        )));
+    }
+    if session
+        .active_jobs
+        .values()
+        .any(|job| job.agent_id == agent_id)
+    {
+        return Err(SwarmError::Invalid(format!(
+            "agent '{agent_id}' still runs a job; complete it before leaving"
         )));
     }
     session.accrue(agent_id, now);
@@ -506,6 +626,11 @@ pub fn yield_execution_slice(
     }
     session.capacity_pool.dealloc_agent();
     let granted_to = grant_front_waiter(session, now);
+    session.emit(SwarmEvent::CapacityYielded {
+        swarm_id: session.swarm_id.clone(),
+        agent_id: agent_id.to_string(),
+        granted_to: granted_to.clone(),
+    });
     Ok(YieldOutcome { granted_to })
 }
 
@@ -520,38 +645,63 @@ pub enum ExecutionGrant {
     Queued { position: usize },
 }
 
-/// Request an execution slice: budget-gated, then granted from free
-/// pool, else by preempting the lowest-priority strictly-lower
-/// holder (ties break by smallest id), else queued FIFO.
-/// Already-holding members re-grant idempotently.
+/// Request an execution slice: budget-gated, then granted from
+/// free pool (session fit and host-global fit), else by preempting
+/// the lowest-priority strictly-lower holder (ties break by
+/// smallest id), else queued FIFO. Already-holding members
+/// re-grant idempotently.
 pub fn request_execution_slice(
     sessions: &mut HashMap<String, SwarmSession>,
     swarm_id: &str,
     agent_id: &str,
     now: Instant,
 ) -> Result<ExecutionGrant, SwarmError> {
+    // Phase 1: membership, budget, and session fit (borrow
+    // released before the table-wide global check below; the caller
+    // holds the supervisor write lock throughout, so no TOCTOU).
+    let (priority, session_fits) = {
+        let session = sessions
+            .get_mut(swarm_id)
+            .ok_or_else(|| SwarmError::Invalid(format!("unknown swarm_id: '{swarm_id}'")))?;
+        session.prune_expired(now);
+        if session.status == SwarmStatus::Terminated {
+            return Err(SwarmError::Invalid(format!(
+                "swarm '{swarm_id}' is terminated; execution closed"
+            )));
+        }
+        let agent = session.members.get(agent_id).ok_or_else(|| {
+            SwarmError::Invalid(format!(
+                "agent '{agent_id}' is not registered in swarm '{swarm_id}'"
+            ))
+        })?;
+        if agent.holds_slice {
+            session.dequeue(agent_id);
+            return Ok(ExecutionGrant::Granted { preempted: None });
+        }
+        let priority = agent.priority;
+        session.budget.check()?;
+        (priority, session.capacity_pool.fits_agent())
+    };
+    // A clean grant needs room in the session pool and the
+    // host-global totals (sessions overcommit the host against each
+    // other, so both gates bind every draw).
+    if session_fits {
+        let (host_cores, host_mem_mb) = host_capacity().map_err(SwarmError::Internal)?;
+        if global_fits(sessions, host_cores, host_mem_mb) {
+            let session = sessions
+                .get_mut(swarm_id)
+                .expect("membership checked above");
+            grant_slice(session, agent_id, now);
+            return Ok(ExecutionGrant::Granted { preempted: None });
+        }
+    }
     let session = sessions
         .get_mut(swarm_id)
-        .ok_or_else(|| SwarmError::Invalid(format!("unknown swarm_id: '{swarm_id}'")))?;
-    session.prune_expired(now);
-    let agent = session.members.get(agent_id).ok_or_else(|| {
-        SwarmError::Invalid(format!(
-            "agent '{agent_id}' is not registered in swarm '{swarm_id}'"
-        ))
-    })?;
-    if agent.holds_slice {
-        session.dequeue(agent_id);
-        return Ok(ExecutionGrant::Granted { preempted: None });
-    }
-    let priority = agent.priority;
-    session.budget.check()?;
-    if session.capacity_pool.fits_agent() {
-        grant_slice(session, agent_id, now);
-        return Ok(ExecutionGrant::Granted { preempted: None });
-    }
+        .expect("membership checked above");
     // Fully subscribed: evict the lowest strictly-lower holder
     // (deterministic by id within a rank), re-queueing the victim
-    // at the front so preempted work resumes first.
+    // at the front so preempted work resumes first. Eviction frees
+    // both the session and the global draw, so no re-check fits.
     let victim = session
         .members
         .values()
@@ -573,6 +723,11 @@ pub fn request_execution_slice(
             session.dequeue(&victim);
             session.waiters.push_front(victim.clone());
             grant_slice(session, agent_id, now);
+            session.emit(SwarmEvent::AgentPreempted {
+                swarm_id: session.swarm_id.clone(),
+                victim: victim.clone(),
+                by: agent_id.to_string(),
+            });
             Ok(ExecutionGrant::Granted {
                 preempted: Some(victim),
             })
@@ -612,6 +767,146 @@ fn grant_front_waiter(session: &mut SwarmSession, now: Instant) -> Option<String
         }
     }
     None
+}
+
+/// Outcome of a [`dispatch_swarm_job`] call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DispatchOutcome {
+    /// Job admitted and running (concurrently with any others).
+    Dispatched(SwarmJob),
+    /// No slice held and none obtainable right now: the member
+    /// waits at this 1-based FIFO position; redispatch after a
+    /// yield grants it (preemption may also displace it sooner).
+    Queued { position: usize },
+}
+
+/// Dispatch one job for a swarm member: the member draws an
+/// execution slice when holderless (grant, preempt, or queue —
+/// shared with [`request_execution_slice`]), then the job draw is
+/// validated against the agent's slice (one active job per agent;
+/// capped at the slice size). Pool and host ceilings hold
+/// transitively: every running job rides a pool-accounted slice.
+pub fn dispatch_swarm_job(
+    sessions: &mut HashMap<String, SwarmSession>,
+    swarm_id: &str,
+    agent_id: &str,
+    tier: &str,
+    cores: f64,
+    memory_mb: u64,
+    now: Instant,
+) -> Result<DispatchOutcome, SwarmError> {
+    let session = sessions
+        .get_mut(swarm_id)
+        .ok_or_else(|| SwarmError::Invalid(format!("unknown swarm_id: '{swarm_id}'")))?;
+    session.prune_expired(now);
+    if session.status == SwarmStatus::Terminated {
+        return Err(SwarmError::Invalid(format!(
+            "swarm '{swarm_id}' is terminated; dispatches closed"
+        )));
+    }
+    if !session.members.contains_key(agent_id) {
+        return Err(SwarmError::Invalid(format!(
+            "agent '{agent_id}' is not registered in swarm '{swarm_id}'"
+        )));
+    }
+    // Money fail-fast: even a second job for a busy agent reports
+    // the blown budget (this is the active-execution enforcement).
+    session.budget.check()?;
+    let tier = SwarmTier::parse(tier).map_err(SwarmError::Invalid)?;
+    if !cores.is_finite() || cores <= 0.0 || memory_mb == 0 {
+        return Err(SwarmError::Invalid(
+            "job draw must be finite cores > 0 and memory_mb > 0".to_string(),
+        ));
+    }
+    if cores > SWARM_AGENT_CORES || memory_mb > SWARM_AGENT_MEM_MB {
+        return Err(SwarmError::Invalid(format!(
+            "job draw ({cores} cores, {memory_mb} MiB) exceeds the agent slice \
+             ({SWARM_AGENT_CORES} cores, {SWARM_AGENT_MEM_MB} MiB)"
+        )));
+    }
+    if session
+        .active_jobs
+        .values()
+        .any(|job| job.agent_id == agent_id)
+    {
+        return Err(SwarmError::Invalid(format!(
+            "agent '{agent_id}' already runs a job; complete it first"
+        )));
+    }
+    // Draw the slice when holderless (grant, preempt, or queue).
+    match request_execution_slice(sessions, swarm_id, agent_id, now)? {
+        ExecutionGrant::Queued { position } => return Ok(DispatchOutcome::Queued { position }),
+        ExecutionGrant::Granted { .. } => {}
+    }
+    let session = sessions
+        .get_mut(swarm_id)
+        .expect("membership checked above");
+    let job_id = format!("{swarm_id}-job-{}", session.next_job);
+    session.next_job += 1;
+    let job = SwarmJob {
+        job_id: job_id.clone(),
+        agent_id: agent_id.to_string(),
+        tier,
+        cores,
+        memory_mb,
+    };
+    session.active_jobs.insert(job_id, job.clone());
+    Ok(DispatchOutcome::Dispatched(job))
+}
+
+/// Complete one active job, releasing its agent for the next
+/// dispatch. Spend stays slice-based (the hold accrues when the
+/// slice itself releases), so completion only clears the record.
+pub fn complete_swarm_job(
+    sessions: &mut HashMap<String, SwarmSession>,
+    swarm_id: &str,
+    job_id: &str,
+    now: Instant,
+) -> Result<SwarmJob, SwarmError> {
+    let session = sessions
+        .get_mut(swarm_id)
+        .ok_or_else(|| SwarmError::Invalid(format!("unknown swarm_id: '{swarm_id}'")))?;
+    session.prune_expired(now);
+    session.active_jobs.remove(job_id).ok_or_else(|| {
+        SwarmError::Invalid(format!("unknown job_id '{job_id}' in swarm '{swarm_id}'"))
+    })
+}
+
+/// Move a swarm along Active → Draining → Terminated (no
+/// resurrection, no post-terminal change). Draining keeps
+/// incumbents running to lease end; Terminated closes dispatch
+/// while the record lingers for audit.
+pub fn transition_swarm_status(
+    sessions: &mut HashMap<String, SwarmSession>,
+    swarm_id: &str,
+    status: SwarmStatus,
+    now: Instant,
+) -> Result<(), SwarmError> {
+    let session = sessions
+        .get_mut(swarm_id)
+        .ok_or_else(|| SwarmError::Invalid(format!("unknown swarm_id: '{swarm_id}'")))?;
+    session.prune_expired(now);
+    if session.status == status {
+        return Ok(());
+    }
+    let legal = matches!(
+        (session.status, status),
+        (SwarmStatus::Active, SwarmStatus::Draining)
+            | (SwarmStatus::Active, SwarmStatus::Terminated)
+            | (SwarmStatus::Draining, SwarmStatus::Terminated)
+    );
+    if !legal {
+        return Err(SwarmError::Invalid(format!(
+            "illegal swarm transition {:?} -> {status:?}",
+            session.status
+        )));
+    }
+    session.status = status;
+    session.emit(SwarmEvent::StatusChanged {
+        swarm_id: session.swarm_id.clone(),
+        status,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -699,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_session_pool_denies_retryable() {
+    fn subslice_pool_join_queues_holderless() {
         let mut table = sessions();
         // Session ceilings below one agent slice: the global host
         // check passes, the session pool denies.
@@ -707,11 +1002,40 @@ mod tests {
             "tiny".to_string(),
             SwarmSession::new("tiny".to_string(), 0.5, 512),
         );
-        let err =
-            register_agent(&mut table, "tiny", "a", "builder", 0, Instant::now()).unwrap_err();
-        assert!(matches!(err, SwarmError::Full(_)), "{err}");
-        assert!(err.to_string().contains("pool exhausted"), "{err}");
-        assert!(table["tiny"].members.is_empty());
+        let lease = register_agent(&mut table, "tiny", "a", "builder", 0, Instant::now()).unwrap();
+        // Sub-slice ceilings: the member joins holderless and queues
+        // (Phase 3 holderless membership; joins never deny).
+        assert!(!lease.holds_slice);
+        assert_eq!(table["tiny"].capacity_pool.cpu_weight_allocated, 0.0);
+        assert_eq!(table["tiny"].waiters.len(), 1);
+    }
+
+    #[test]
+    fn full_pool_join_queues_in_order() {
+        let mut table = sessions();
+        tiny_session(&mut table, 1);
+        let now = Instant::now();
+        let first = register_agent(&mut table, "s", "a", "builder", 0, now).unwrap();
+        assert!(first.holds_slice);
+        // Full pool: joins succeed holderless and queue in order.
+        for (id, members) in [("b", 2), ("c", 3)] {
+            let lease = register_agent(&mut table, "s", id, "tester", 0, now).unwrap();
+            assert!(!lease.holds_slice, "{id}");
+            assert_eq!(lease.active_members, members);
+        }
+        assert_eq!(
+            table["s"].capacity_pool.cpu_weight_allocated,
+            SWARM_AGENT_CORES
+        );
+        assert_eq!(
+            table["s"].waiters.iter().collect::<Vec<_>>(),
+            vec![&"b".to_string(), &"c".to_string()]
+        );
+        // A yield hands the slice to the front waiter only.
+        let outcome = yield_execution_slice(&mut table, "s", "a", now).unwrap();
+        assert_eq!(outcome.granted_to, Some("b".to_string()));
+        assert!(table["s"].members["b"].holds_slice);
+        assert!(!table["s"].members["c"].holds_slice);
     }
 
     #[test]
@@ -719,24 +1043,22 @@ mod tests {
         let mut table = sessions();
         let now = Instant::now();
         let (host_cores, host_mem) = host_capacity().unwrap();
-        // Fill every session until the host denies (bounded: real
-        // hosts exhaust in hundreds of draws at most).
-        let mut granted = 0;
-        for i in 0..10_000 {
-            match register_agent(
+        // Over-join across sessions: joins always land (holderless
+        // past capacity), slices stop at the host ceilings.
+        let slices = ((host_cores / SWARM_AGENT_CORES).floor() as usize)
+            .min((host_mem / SWARM_AGENT_MEM_MB) as usize);
+        assert!(slices >= 1);
+        for i in 0..slices + 3 {
+            register_agent(
                 &mut table,
-                &format!("s{}", i % 4),
+                &format!("s{}", i % 2),
                 &format!("a{i}"),
                 "builder",
                 0,
                 now,
-            ) {
-                Ok(_) => granted += 1,
-                Err(SwarmError::Full(_)) => break,
-                Err(e) => panic!("unexpected: {e}"),
-            }
+            )
+            .unwrap();
         }
-        assert!(granted > 0);
         let (used_cores, used_mem) = table.values().fold((0.0, 0), |totals, session| {
             (
                 totals.0 + session.capacity_pool.cpu_weight_allocated,
@@ -745,7 +1067,47 @@ mod tests {
         });
         assert!(used_cores <= host_cores, "{used_cores} > {host_cores}");
         assert!(used_mem <= host_mem, "{used_mem} > {host_mem}");
-        assert_eq!(used_cores, granted as f64 * SWARM_AGENT_CORES);
+        assert_eq!(used_cores, slices as f64 * SWARM_AGENT_CORES);
+        // Holderless members queue on request (nothing preemptible
+        // at equal rank, even where the session pool has room: the
+        // host-global gate binds too).
+        let holderless: Vec<(String, String)> = table
+            .values()
+            .flat_map(|session| {
+                session
+                    .members
+                    .values()
+                    .filter(|member| !member.holds_slice)
+                    .map(|member| (session.swarm_id.clone(), member.agent_id.clone()))
+            })
+            .collect();
+        assert_eq!(holderless.len(), 3);
+        for (swarm, id) in &holderless {
+            assert!(matches!(
+                request_execution_slice(&mut table, swarm, id, now).unwrap(),
+                ExecutionGrant::Queued { .. }
+            ));
+        }
+        // Session s0 provably holds a slice (first join drew) and a
+        // waiter (its last join landed past capacity): a yield
+        // recycles without overshoot.
+        let holder = table["s0"]
+            .members
+            .values()
+            .find(|member| member.holds_slice)
+            .unwrap()
+            .agent_id
+            .clone();
+        assert!(!table["s0"].waiters.is_empty());
+        let outcome = yield_execution_slice(&mut table, "s0", &holder, now).unwrap();
+        assert!(outcome.granted_to.is_some());
+        let (used_cores, _) = table.values().fold((0.0, 0), |totals, session| {
+            (
+                totals.0 + session.capacity_pool.cpu_weight_allocated,
+                totals.1 + session.capacity_pool.memory_allocated_mb,
+            )
+        });
+        assert!(used_cores <= host_cores);
     }
 
     #[test]
@@ -977,5 +1339,244 @@ mod tests {
         let lease = leave_swarm(&mut table, "s", "b", start + Duration::from_secs(7200)).unwrap();
         assert_eq!(lease.spent_usd, 2.0 * SWARM_AGENT_CORES * 0.05);
         assert_eq!(table["s"].capacity_pool.cpu_weight_allocated, 0.0);
+    }
+
+    #[test]
+    fn dispatch_runs_multitier_jobs_concurrently() {
+        let mut table = sessions();
+        let now = Instant::now();
+        register_agent(&mut table, "s", "a", "builder", 0, now).unwrap();
+        register_agent(&mut table, "s", "b", "tester", 0, now).unwrap();
+        // Process + container jobs run simultaneously under the pool.
+        let first = dispatch_swarm_job(&mut table, "s", "a", "container", 1.0, 1024, now);
+        let second = dispatch_swarm_job(&mut table, "s", "b", "process", 0.5, 512, now);
+        let (first, second) = match (first.unwrap(), second.unwrap()) {
+            (DispatchOutcome::Dispatched(a), DispatchOutcome::Dispatched(b)) => (a, b),
+            other => panic!("expected two dispatches, got {other:?}"),
+        };
+        assert_eq!(first.tier, SwarmTier::Container);
+        assert_eq!(second.tier, SwarmTier::Process);
+        assert_ne!(first.job_id, second.job_id);
+        assert_eq!(table["s"].active_jobs.len(), 2);
+        // Tier aliases parse; unknown tiers fail closed.
+        assert_eq!(SwarmTier::parse("OCI").unwrap(), SwarmTier::Container);
+        assert_eq!(SwarmTier::parse("micro-vm").unwrap(), SwarmTier::MicroVm);
+        assert!(SwarmTier::parse("baremetal").is_err());
+        // Completion releases agents one at a time.
+        complete_swarm_job(&mut table, "s", &first.job_id, now).unwrap();
+        assert_eq!(table["s"].active_jobs.len(), 1);
+        complete_swarm_job(&mut table, "s", &second.job_id, now).unwrap();
+        assert!(table["s"].active_jobs.is_empty());
+        assert!(complete_swarm_job(&mut table, "s", &first.job_id, now).is_err());
+    }
+
+    #[test]
+    fn dispatch_validates_draw_membership_and_busy() {
+        let mut table = sessions();
+        let now = Instant::now();
+        register_agent(&mut table, "s", "a", "builder", 0, now).unwrap();
+        // Unknown swarm, member, and tier fail closed.
+        assert!(dispatch_swarm_job(&mut table, "nope", "a", "process", 1.0, 512, now).is_err());
+        assert!(dispatch_swarm_job(&mut table, "s", "ghost", "process", 1.0, 512, now).is_err());
+        assert!(dispatch_swarm_job(&mut table, "s", "a", "baremetal", 1.0, 512, now).is_err());
+        // Garbage and over-slice draws fail closed.
+        for (cores, mem) in [(0.0, 512), (f64::NAN, 512), (1.0, 0)] {
+            assert!(
+                dispatch_swarm_job(&mut table, "s", "a", "process", cores, mem, now).is_err(),
+                "{cores}/{mem}"
+            );
+        }
+        let err = dispatch_swarm_job(&mut table, "s", "a", "process", 64.0, 512, now).unwrap_err();
+        assert!(err.to_string().contains("exceeds the agent slice"), "{err}");
+        // One active job per agent.
+        dispatch_swarm_job(&mut table, "s", "a", "process", 1.0, 512, now).unwrap();
+        let err = dispatch_swarm_job(&mut table, "s", "a", "process", 1.0, 512, now).unwrap_err();
+        assert!(err.to_string().contains("already runs a job"), "{err}");
+        // Members with active jobs must complete before leaving.
+        let err = leave_swarm(&mut table, "s", "a", now).unwrap_err();
+        assert!(err.to_string().contains("still runs a job"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_draws_slice_for_holderless_members() {
+        let mut table = sessions();
+        tiny_session(&mut table, 1);
+        let now = Instant::now();
+        register_agent(&mut table, "s", "a", "builder", 0, now).unwrap();
+        register_agent(&mut table, "s", "b", "tester", 0, now).unwrap();
+        assert!(!table["s"].members["b"].holds_slice);
+        dispatch_swarm_job(&mut table, "s", "a", "process", 1.0, 512, now).unwrap();
+        // B dispatches while sliceless against the full pool: queued.
+        assert!(matches!(
+            dispatch_swarm_job(&mut table, "s", "b", "container", 1.0, 512, now).unwrap(),
+            DispatchOutcome::Queued { position: 1 }
+        ));
+        // A completes and yields: B redispatches into the free slice.
+        let job = table["s"]
+            .active_jobs
+            .values()
+            .next()
+            .unwrap()
+            .job_id
+            .clone();
+        complete_swarm_job(&mut table, "s", &job, now).unwrap();
+        yield_execution_slice(&mut table, "s", "a", now).unwrap();
+        assert!(matches!(
+            dispatch_swarm_job(&mut table, "s", "b", "container", 1.0, 512, now).unwrap(),
+            DispatchOutcome::Dispatched(_)
+        ));
+    }
+
+    #[test]
+    fn budget_blocks_dispatch_during_active_execution() {
+        let mut table = sessions();
+        table.insert(
+            "s".to_string(),
+            SwarmSession::new("s".to_string(), 64.0, 65_536).with_budget(0.5, 0.5),
+        );
+        let start = Instant::now();
+        register_agent(&mut table, "s", "a", "builder", 0, start).unwrap();
+        register_agent(&mut table, "s", "b", "tester", 0, start).unwrap();
+        // Two jobs running across tiers; A outlives the accrual jump.
+        dispatch_swarm_job(&mut table, "s", "a", "container", 1.0, 512, start).unwrap();
+        dispatch_swarm_job(&mut table, "s", "b", "process", 1.0, 512, start).unwrap();
+        table
+            .get_mut("s")
+            .unwrap()
+            .members
+            .get_mut("a")
+            .unwrap()
+            .lease_expires_at = start + Duration::from_secs(7200);
+        // B's hour-long hold accrues past the cap on yield (two
+        // slices fit every CI host; a third member would overcommit
+        // small runners).
+        table
+            .get_mut("s")
+            .unwrap()
+            .members
+            .get_mut("b")
+            .unwrap()
+            .lease_expires_at = start + Duration::from_secs(7200);
+        // B completes, then its hour-long hold accrues past the cap
+        // on yield; B leaves the way clear.
+        let job = table["s"]
+            .active_jobs
+            .values()
+            .find(|job| job.agent_id == "b")
+            .unwrap()
+            .job_id
+            .clone();
+        complete_swarm_job(&mut table, "s", &job, start).unwrap();
+        yield_execution_slice(&mut table, "s", "b", start + Duration::from_secs(3600)).unwrap();
+        leave_swarm(&mut table, "s", "b", start + Duration::from_secs(3600)).unwrap();
+        assert!(table["s"].budget.spent_usd >= 0.5);
+        // A's job keeps running, but new dispatches fail closed with
+        // the BudgetExceeded marker — even for busy agents.
+        assert_eq!(table["s"].active_jobs.len(), 1);
+        let err = dispatch_swarm_job(&mut table, "s", "a", "process", 1.0, 512, start).unwrap_err();
+        assert!(matches!(err, SwarmError::BudgetExceeded(_)), "{err}");
+        register_agent(&mut table, "s", "d", "builder", 0, start).unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn event_bus_delivers_lifecycle_in_order() {
+        let mut table = sessions();
+        tiny_session(&mut table, 1);
+        let start = Instant::now();
+        register_agent(&mut table, "s", "lo", "tester", 0, start).unwrap();
+        register_agent(&mut table, "s", "hi", "builder", 9, start).unwrap();
+        // Every lease outlives the hour-long accrual jump below.
+        for id in ["lo", "hi"] {
+            table
+                .get_mut("s")
+                .unwrap()
+                .members
+                .get_mut(id)
+                .unwrap()
+                .lease_expires_at = start + Duration::from_secs(7200);
+        }
+        let mut events = table["s"].subscribe();
+        // Yield (0s hold: no spend event) hands the slice over.
+        yield_execution_slice(&mut table, "s", "lo", start).unwrap();
+        // High-priority re-dispatch preempts after an hour-long hold
+        // accrues spend on the victim's release.
+        register_agent(&mut table, "s", "mid", "tester", 0, start).unwrap();
+        table
+            .get_mut("s")
+            .unwrap()
+            .members
+            .get_mut("mid")
+            .unwrap()
+            .lease_expires_at = start + Duration::from_secs(7200);
+        assert_eq!(
+            request_execution_slice(&mut table, "s", "mid", start).unwrap(),
+            ExecutionGrant::Queued { position: 1 }
+        );
+        yield_execution_slice(&mut table, "s", "hi", start + Duration::from_secs(3600)).unwrap();
+        assert_eq!(
+            request_execution_slice(&mut table, "s", "hi", start + Duration::from_secs(3600))
+                .unwrap(),
+            ExecutionGrant::Granted {
+                preempted: Some("mid".to_string())
+            }
+        );
+        transition_swarm_status(&mut table, "s", SwarmStatus::Draining, start).unwrap();
+        // Drain the bus: yield, spend, preemption, and status events
+        // arrive in exact emission order.
+        let mut got = Vec::new();
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+        {
+            got.push(event);
+        }
+        assert_eq!(
+            got,
+            vec![
+                SwarmEvent::CapacityYielded {
+                    swarm_id: "s".to_string(),
+                    agent_id: "lo".to_string(),
+                    granted_to: Some("hi".to_string()),
+                },
+                SwarmEvent::BudgetUpdated {
+                    swarm_id: "s".to_string(),
+                    spent_usd: SWARM_AGENT_CORES * 0.05,
+                },
+                SwarmEvent::CapacityYielded {
+                    swarm_id: "s".to_string(),
+                    agent_id: "hi".to_string(),
+                    granted_to: Some("mid".to_string()),
+                },
+                SwarmEvent::AgentPreempted {
+                    swarm_id: "s".to_string(),
+                    victim: "mid".to_string(),
+                    by: "hi".to_string(),
+                },
+                SwarmEvent::StatusChanged {
+                    swarm_id: "s".to_string(),
+                    status: SwarmStatus::Draining,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn status_transitions_move_forward_only() {
+        let mut table = sessions();
+        let now = Instant::now();
+        register_agent(&mut table, "s", "a", "builder", 0, now).unwrap();
+        // Same-state transitions are idempotent no-ops.
+        transition_swarm_status(&mut table, "s", SwarmStatus::Active, now).unwrap();
+        transition_swarm_status(&mut table, "s", SwarmStatus::Draining, now).unwrap();
+        // Draining incumbents keep running; joins close.
+        dispatch_swarm_job(&mut table, "s", "a", "process", 1.0, 512, now).unwrap();
+        assert!(register_agent(&mut table, "s", "b", "tester", 0, now).is_err());
+        // No resurrection, no post-terminal change.
+        assert!(transition_swarm_status(&mut table, "s", SwarmStatus::Active, now).is_err());
+        transition_swarm_status(&mut table, "s", SwarmStatus::Terminated, now).unwrap();
+        assert!(transition_swarm_status(&mut table, "s", SwarmStatus::Draining, now).is_err());
+        // Terminated closes requests and dispatches; cleanup still flows.
+        assert!(request_execution_slice(&mut table, "s", "a", now).is_err());
+        assert!(dispatch_swarm_job(&mut table, "s", "a", "process", 1.0, 512, now).is_err());
+        assert!(transition_swarm_status(&mut table, "nope", SwarmStatus::Active, now).is_err());
     }
 }

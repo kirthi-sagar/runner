@@ -180,15 +180,20 @@ preempts lower within the swarm). Output: the `SwarmLease`
 `holds_slice`, `cpu_weight_allocated`/`cpu_weight_max`,
 `memory_allocated_mb`/`memory_max_mb`, `active_members`,
 `spent_usd`, `spend_cap_usd`). Each member draws one fixed
-slice (1.5 cores, 2048 MiB); duplicate ids, closed swarms, and
-blank fields deny with `-32602`, exhausted session or host
-capacity with `-32603` (retryable). Members may yield the slice
-while keeping the lease; waiters acquire freed slices instantly
-(FIFO), and a higher-priority request preempts the lowest
-strictly-lower holder. Slice holds accrue to the swarm spend
-ledger; once cumulative spend reaches the configured `[swarm]`
-cap, joins and execution requests fail closed with `-32602`
-(`BudgetExceeded`). Local state only (no daemon arm yet).
+slice (1.5 cores, 2048 MiB) when one fits; otherwise the member
+joins holderless and queues — joins never deny on capacity
+(duplicate ids, closed swarms, and blank fields deny with
+`-32602`). Members may yield the slice while keeping the lease;
+waiters acquire freed slices instantly (FIFO), and a
+higher-priority request preempts the lowest strictly-lower
+holder. Slice holds accrue to the swarm spend ledger; once
+cumulative spend reaches the configured `[swarm]` cap, joins
+and execution requests fail closed with `-32602`
+(`BudgetExceeded`). Members dispatch one job each across the
+process, container, and microvm tiers (draws capped at the
+slice); lifecycle events (`status_changed`, `capacity_yielded`,
+`agent_preempted`, `budget_updated`) stream on the session bus.
+Local state only (no daemon arm yet).
 
 `leave_swarm` — input: `swarm_id` (string, required), `agent_id`
 (string, required). Output: the pool-after-release lease shape

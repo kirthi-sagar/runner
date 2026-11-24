@@ -438,6 +438,15 @@ impl SupervisorState {
         &mut self.swarms
     }
 
+    /// Subscribe to one session's lifecycle event bus (`None` for
+    /// unknown swarms). Receivers never stall the sender.
+    pub fn swarm_event_stream(
+        &self,
+        swarm_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<crate::mcp::swarm::SwarmEvent>> {
+        self.swarms.get(swarm_id).map(|session| session.subscribe())
+    }
+
     /// Spend cap seed for new swarm sessions (0 = unenforced).
     pub fn swarm_spend_cap_usd(&self) -> f64 {
         self.swarm_spend_cap_usd

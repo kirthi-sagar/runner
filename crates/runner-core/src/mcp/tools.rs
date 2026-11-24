@@ -918,9 +918,7 @@ fn swarm_error(e: super::swarm::SwarmError) -> ToolError {
         SwarmError::Invalid(message) | SwarmError::BudgetExceeded(message) => {
             ToolError::invalid_params(message)
         }
-        full @ (SwarmError::Full(_) | SwarmError::Internal(_)) => {
-            ToolError::internal(full.to_string())
-        }
+        internal @ SwarmError::Internal(_) => ToolError::internal(internal.to_string()),
     }
 }
 

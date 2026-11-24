@@ -31,18 +31,28 @@ pub struct PullOutcome {
 }
 
 /// Resolve, download (missing layers only), verify, and record one
-/// image reference.
+/// image reference. When an auth store is supplied, the registry's
+/// mapped forge device token (if any) authenticates the token
+/// request; unmapped registries and store misses stay anonymous.
 pub async fn pull_image(
     cache: &LayerCache,
     store: &ImageStore,
     image: &str,
+    auth_store: Option<&runner_core::auth::store::AuthStore>,
 ) -> Result<PullOutcome, String> {
     use runner_sandbox::oci::{
         pull::ensure_image,
         registry::{OciReference, RegistryClient},
     };
     let reference = OciReference::parse(image)?;
-    let client = RegistryClient::new();
+    let mut client = RegistryClient::new();
+    if let Some(auth) = auth_store {
+        if let Some(key) = super::auth::registry_forge_key(&reference.registry) {
+            if let Some(credential) = auth.load_forge(&key) {
+                client = client.with_basic_auth(credential.username, credential.access_token);
+            }
+        }
+    }
     let resolved = ensure_image(&client, cache, store, &reference).await?;
     Ok(PullOutcome {
         reference: reference.normalized(),

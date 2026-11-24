@@ -1404,7 +1404,8 @@ async fn cmd_image_pull(config: &RunnerConfig, image: &str) -> Result<()> {
         runner_sandbox::oci::gc::GcPolicy::from_config(&config.storage.gc),
         std::time::SystemTime::now(),
     );
-    match pull_image(&cache, &store, image).await {
+    let auth_store = runner_core::auth::store::AuthStore::default_store();
+    match pull_image(&cache, &store, image, auth_store.as_ref()).await {
         Ok(outcome) => {
             println!(
                 "pulled {} ({}, {} layers, {})",

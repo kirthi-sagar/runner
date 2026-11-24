@@ -55,9 +55,37 @@ async fn spawn_mock_registry() -> MockRegistry {
     let digest_two = hex_digest(&layer_two);
     let size_one = layer_one.len() as u64;
     let size_two = layer_two.len() as u64;
-    let amd64 = format!("sha256:{}", "a".repeat(64));
-    let arm64 = format!("sha256:{}", "b".repeat(64));
     let config = format!("sha256:{}", "c".repeat(64));
+    // Manifest bodies are built once so the index advertises their
+    // real digests and every response carries a verifiable header.
+    let manifest_body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": config, "size": 100},
+        "layers": [
+            {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+             "digest": digest_one, "size": size_one},
+            {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+             "digest": digest_two, "size": size_two},
+        ],
+    })
+    .to_string();
+    let manifest_digest = hex_digest(manifest_body.as_bytes());
+    let index_body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+             "digest": manifest_digest, "size": 500,
+             "platform": {"os": "linux", "architecture": "amd64"}},
+            {"mediaType": "application/vnd.oci.image.manifest.v1+json",
+             "digest": manifest_digest, "size": 500,
+             "platform": {"os": "linux", "architecture": "arm64"}},
+        ],
+    })
+    .to_string();
+    let index_digest = hex_digest(index_body.as_bytes());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -85,35 +113,11 @@ async fn spawn_mock_registry() -> MockRegistry {
             }
             let head = String::from_utf8_lossy(&head).to_string();
             if head.contains("/manifests/test") {
-                let body = serde_json::json!({
-                    "schemaVersion": 2,
-                    "mediaType": "application/vnd.oci.image.index.v1+json",
-                    "manifests": [
-                        {"mediaType": "application/vnd.oci.image.manifest.v1+json",
-                         "digest": amd64, "size": 500,
-                         "platform": {"os": "linux", "architecture": "amd64"}},
-                        {"mediaType": "application/vnd.oci.image.manifest.v1+json",
-                         "digest": arm64, "size": 500,
-                         "platform": {"os": "linux", "architecture": "arm64"}},
-                    ],
-                })
-                .to_string();
-                respond_bytes(&mut sock, "200 OK", "", body.as_bytes()).await;
-            } else if head.contains(&amd64) || head.contains(&arm64) {
-                let body = serde_json::json!({
-                    "schemaVersion": 2,
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
-                               "digest": config, "size": 100},
-                    "layers": [
-                        {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                         "digest": digest_one, "size": size_one},
-                        {"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                         "digest": digest_two, "size": size_two},
-                    ],
-                })
-                .to_string();
-                respond_bytes(&mut sock, "200 OK", "", body.as_bytes()).await;
+                let extra = format!("Docker-Content-Digest: {index_digest}\r\n");
+                respond_bytes(&mut sock, "200 OK", &extra, index_body.as_bytes()).await;
+            } else if head.contains(&manifest_digest) {
+                let extra = format!("Docker-Content-Digest: {manifest_digest}\r\n");
+                respond_bytes(&mut sock, "200 OK", &extra, manifest_body.as_bytes()).await;
             } else if head.contains(&digest_one) {
                 served.fetch_add(1, Ordering::SeqCst);
                 respond_bytes(&mut sock, "200 OK", "", &layer_one).await;
@@ -222,12 +226,12 @@ async fn image_pull_list_prune_roundtrip() {
     let (cache, store) = open_store(Some(dir.path()));
     let image = format!("{}/e2e:test", registry.base);
 
-    let outcome = pull_image(&cache, &store, &image).await.unwrap();
+    let outcome = pull_image(&cache, &store, &image, None).await.unwrap();
     assert!(outcome.reference.contains("e2e"), "{}", outcome.reference);
     assert_eq!(outcome.layers, 2);
     assert!(outcome.bytes > 0);
     // Second pull resolves again but downloads nothing.
-    pull_image(&cache, &store, &image).await.unwrap();
+    pull_image(&cache, &store, &image, None).await.unwrap();
     assert_eq!(registry.blob_hits.load(Ordering::SeqCst), 2);
 
     let listed = list_images(&store, &cache);
@@ -255,6 +259,32 @@ async fn image_pull_list_prune_roundtrip() {
     assert_eq!(list_images(&store, &cache).len(), 1);
 }
 
+/// A supplied auth store flows into the pull: unmapped loopback
+/// registries stay anonymous and the pull still succeeds.
+#[tokio::test]
+async fn image_pull_with_auth_store_stays_anonymous_on_loopback() {
+    use runner_cli::commands::image::{open_store, pull_image};
+    use runner_core::auth::store::{AuthStore, DeviceCredential};
+
+    let registry = spawn_mock_registry().await;
+    let dir = runner_core::test_support::TempDir::new("oci-image-auth").unwrap();
+    let (cache, store) = open_store(Some(dir.path()));
+    let auth = AuthStore::new(dir.path().join("auth.json"));
+    auth.save(&DeviceCredential {
+        forge: "github".to_string(),
+        host: "github.com".to_string(),
+        username: "octocat".to_string(),
+        scopes: vec!["repo".to_string()],
+        access_token: "[REDACTED]".to_string(),
+    })
+    .unwrap();
+    let image = format!("{}/e2e:test", registry.base);
+    let outcome = pull_image(&cache, &store, &image, Some(&auth))
+        .await
+        .unwrap();
+    assert_eq!(outcome.layers, 2);
+}
+
 /// Bad references fail closed before any network traffic.
 #[tokio::test]
 async fn image_pull_rejects_bad_reference() {
@@ -263,7 +293,7 @@ async fn image_pull_rejects_bad_reference() {
     let registry = spawn_mock_registry().await;
     let dir = runner_core::test_support::TempDir::new("oci-image-badref").unwrap();
     let (cache, store) = open_store(Some(dir.path()));
-    let err = pull_image(&cache, &store, ":::").await.unwrap_err();
+    let err = pull_image(&cache, &store, ":::", None).await.unwrap_err();
     assert!(!err.is_empty());
     assert_eq!(registry.blob_hits.load(Ordering::SeqCst), 0);
 }
@@ -280,7 +310,7 @@ async fn pressure_eviction_then_pull_recovers_cleanly() {
     let dir = runner_core::test_support::TempDir::new("oci-gc-pull").unwrap();
     let (cache, store) = open_store(Some(dir.path()));
     let image = format!("{}/e2e:test", registry.base);
-    pull_image(&cache, &store, &image).await.unwrap();
+    pull_image(&cache, &store, &image, None).await.unwrap();
     assert_eq!(list_images(&store, &cache).len(), 1);
     // Scripted permanent pressure, 200-day-old layers: everything
     // evicts and the manifest is cleaned.
@@ -303,7 +333,7 @@ async fn pressure_eviction_then_pull_recovers_cleanly() {
     assert_eq!(outcome.manifests_cleaned, 1);
     assert!(list_images(&store, &cache).is_empty());
     // The next pull re-downloads both layers from scratch.
-    pull_image(&cache, &store, &image).await.unwrap();
+    pull_image(&cache, &store, &image, None).await.unwrap();
     assert_eq!(list_images(&store, &cache).len(), 1);
     assert_eq!(registry.blob_hits.load(Ordering::SeqCst), 4);
 }

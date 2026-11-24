@@ -201,6 +201,34 @@ pub fn resolve_logout_target<'a>(
     }
 }
 
+/// Map a registry host to the forge store key holding its device
+/// credential: well-known pairs first (`ghcr.io`→`github.com`,
+/// `registry.gitlab.com`→`gitlab.com`), else the registry host
+/// itself — a colocated self-hosted forge answers under its own
+/// name (the default GitLab registry port `:5050` strips so
+/// `gitlab.company.com:5050` resolves to its forge login; the
+/// store's port fallback absorbs explicit `:443`/`:80`, and a miss
+/// simply means anonymous). Returns `None` for registries with no
+/// device flow: Docker Hub stays anonymous.
+pub fn registry_forge_key(registry: &str) -> Option<String> {
+    let host = registry.trim();
+    let bare = host
+        .strip_suffix(":443")
+        .or_else(|| host.strip_suffix(":80"))
+        .unwrap_or(host)
+        .to_ascii_lowercase();
+    match bare.as_str() {
+        "ghcr.io" => Some("github.com".to_string()),
+        "registry.gitlab.com" => Some("gitlab.com".to_string()),
+        "registry-1.docker.io" | "docker.io" => None,
+        _ => Some(
+            host.strip_suffix(":5050")
+                .unwrap_or(host)
+                .to_ascii_lowercase(),
+        ),
+    }
+}
+
 /// Sign out everywhere: unconditionally unlinks the store — even
 /// corrupt or unreadable blobs — so secrets are guaranteed gone.
 /// Returns the user message.
@@ -430,5 +458,42 @@ mod tests {
         assert!(resolve_logout_target(&entries, "git.corp.com/team-a").is_err());
         // Bare host matches neither sub-path entry.
         assert!(resolve_logout_target(&entries, "git.corp.com").is_err());
+    }
+
+    #[test]
+    fn registry_forge_key_maps_known_and_colocated() {
+        assert_eq!(registry_forge_key("ghcr.io").as_deref(), Some("github.com"));
+        assert_eq!(
+            registry_forge_key("GHCR.IO:443").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            registry_forge_key("registry.gitlab.com").as_deref(),
+            Some("gitlab.com")
+        );
+        // Docker Hub has no device flow: anonymous.
+        assert_eq!(registry_forge_key("registry-1.docker.io"), None);
+        assert_eq!(registry_forge_key("docker.io"), None);
+        // Colocated self-hosted forges answer under their own name
+        // (explicit ports preserved for the store lookup, except the
+        // default GitLab registry port).
+        assert_eq!(
+            registry_forge_key("registry.corp.com:5050").as_deref(),
+            Some("registry.corp.com")
+        );
+        assert_eq!(
+            registry_forge_key("Registry.Corp.Com").as_deref(),
+            Some("registry.corp.com")
+        );
+        // Default GitLab registry port strips to the forge login.
+        assert_eq!(
+            registry_forge_key("gitlab.company.com:5050").as_deref(),
+            Some("gitlab.company.com")
+        );
+        // Other explicit ports still pass through for the store.
+        assert_eq!(
+            registry_forge_key("gitlab.company.com:5443").as_deref(),
+            Some("gitlab.company.com:5443")
+        );
     }
 }

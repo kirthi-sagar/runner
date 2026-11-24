@@ -17,8 +17,10 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 pub const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 pub const GITHUB_USER_URL: &str = "https://api.github.com/user";
-/// Requested GitHub OAuth scopes (space-separated per RFC 6749).
-pub const GITHUB_SCOPES: &str = "repo";
+/// Requested GitHub OAuth scopes, comma-joined (`repo` for code,
+/// `read:packages` so fresh tokens can pull private container
+/// images without a second login).
+pub const GITHUB_SCOPES: &str = "repo,read:packages";
 /// Default GitLab instance base URL (self-hosted overrides via flag).
 pub const GITLAB_DEFAULT_BASE_URL: &str = "https://gitlab.com";
 /// Requested GitLab OAuth scopes (runner registration needs API).
@@ -556,6 +558,8 @@ mod tests {
         assert_eq!(split_scopes("repo,read:user"), vec!["repo", "read:user"]);
         assert_eq!(split_scopes("repo workflow"), vec!["repo", "workflow"]);
         assert!(split_scopes("").is_empty());
+        // Fresh GitHub tokens must keep registry pull rights.
+        assert!(GITHUB_SCOPES.contains("read:packages"), "{GITHUB_SCOPES}");
     }
 
     #[test]

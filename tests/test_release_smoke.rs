@@ -15,7 +15,7 @@ fn read(rel: &str) -> String {
     std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// `VERSION="2.13.0"` from install.sh.
+/// `VERSION="2.14.0"` from install.sh.
 fn installer_version(sh: &str) -> String {
     sh.lines()
         .find_map(|line| {
@@ -27,7 +27,7 @@ fn installer_version(sh: &str) -> String {
         .to_string()
 }
 
-/// `[workspace.package] version = "2.13.0"` from the root manifest.
+/// `[workspace.package] version = "2.14.0"` from the root manifest.
 fn workspace_version(toml: &str) -> String {
     let mut in_workspace_package = false;
     for line in toml.lines() {
@@ -173,7 +173,7 @@ fn installer_fails_closed_on_wsl2_misconfiguration() {
 fn sha256_sidecar_format_parses() {
     // Format produced by `sha256sum file > file.sha256` in release.yml:
     // "<64 hex>  <filename>". Parse it the way a verifier would.
-    let line = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  runner-v2.13.0-x86_64-unknown-linux-gnu.tar.gz\n";
+    let line = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  runner-v2.14.0-x86_64-unknown-linux-gnu.tar.gz\n";
     let (hex, file) = line.split_once("  ").expect("two-space separator");
     assert_eq!(hex.len(), 64);
     assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));

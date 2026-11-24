@@ -3,14 +3,14 @@
 [![CI](https://github.com/runnerhq/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/runnerhq/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/runnerhq/runner?color=blue&label=release)](https://github.com/runnerhq/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/runnerhq/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-733%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-793%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
 [![License: Runner Commercial Source-Available v1.0](https://img.shields.io/badge/License-Runner%20Commercial%20Source--Available%20v1.0-yellow.svg)](https://github.com/runnerhq/runner/blob/main/LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Generally Available (v2.13.0) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Generally Available (v2.14.0) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -146,6 +146,19 @@ Existing self-hosted runners fail at this because:
    - Two-tier storage governor (`[storage.gc]`): past 90% utilization or under 10 GB free, the oldest cold layers (30+ days unaccessed) evict down to 80% / 15 GB free; plentiful disks preserve everything indefinitely. Eviction runs opportunistically before pulls (fail-open) with a stderr notice, and `runner image prune --dry-run` previews reclamation.
    - `runner doctor` reports cache volume utilization, free space, and pressure status via the `storage` check.
 
+9. **Forge Federation & Device-Code Auth**:
+   - One daemonless login per forge: `runner auth login [github|gitlab]` runs the RFC 8628 browser-code flow (GitHub plus gitlab.com and self-hosted GitLab); tokens live in a host-keyed, file-locked store with legacy migration, and `runner auth status` / `logout` manage every connected forge.
+   - Native git password fill: `runner auth git-credential` answers `https` password prompts from stored device tokens (enable with `git config --global credential.helper '!runner auth git-credential'`); misses stay silent so git falls through, and tokens never emit over non-loopback cleartext HTTP.
+   - Daemonless OCI cross-auth: `runner image pull` authenticates private registries (ghcr.io, GitLab, colocated self-hosted) with the mapped forge token; token realms pass SSRF validation (HTTPS, host pairing, no intranet targets, no redirects) with anonymous fallback, and every manifest's bytes hash against its digest before layers download.
+
+**v2.14.0 auth capability matrix:**
+
+| Capability | Command | What it does |
+| :--- | :--- | :--- |
+| Device login | `runner auth login` | Browser-code sign-in per forge |
+| Git passwords | `runner auth git-credential` | Fills `https` password prompts |
+| Registry pulls | `runner image pull` | Private pulls via forge tokens |
+
 ---
 
 ## 3. Comprehensive Comparison: `runner` vs. Alternatives
@@ -194,7 +207,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)), or Windows via WSL2 (see [`docs/windows.md`](docs/windows.md)).
 
-Zero-dependency install (downloads the prebuilt v2.13.0 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v2.14.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runnerhq/runner/main/install.sh | sh
@@ -231,7 +244,7 @@ runner top
 ```
 
 ```text
-runner top v2.13.0  (q quit, live cadence)
+runner top v2.14.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -359,7 +372,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "2.13.0", "governor": "normal",
+{"status": "healthy", "version": "2.14.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 

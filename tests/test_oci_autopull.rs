@@ -267,3 +267,43 @@ async fn image_pull_rejects_bad_reference() {
     assert!(!err.is_empty());
     assert_eq!(registry.blob_hits.load(Ordering::SeqCst), 0);
 }
+
+/// Pressure eviction composes with pulls: evicted layers clean
+/// their manifest, and the next pull re-downloads cleanly
+/// (self-healing across the GC boundary).
+#[tokio::test]
+async fn pressure_eviction_then_pull_recovers_cleanly() {
+    use runner_cli::commands::image::{list_images, open_store, pull_image};
+    use runner_sandbox::oci::gc::{evict_to_target, GcPolicy, VolumeMetrics};
+
+    let registry = spawn_mock_registry().await;
+    let dir = runner_core::test_support::TempDir::new("oci-gc-pull").unwrap();
+    let (cache, store) = open_store(Some(dir.path()));
+    let image = format!("{}/e2e:test", registry.base);
+    pull_image(&cache, &store, &image).await.unwrap();
+    assert_eq!(list_images(&store, &cache).len(), 1);
+    // Scripted permanent pressure, 200-day-old layers: everything
+    // evicts and the manifest is cleaned.
+    let policy = GcPolicy {
+        auto_evict: true,
+        high_watermark_pct: 90.0,
+        low_watermark_pct: 80.0,
+        min_age: std::time::Duration::from_secs(30 * 86_400),
+    };
+    let pressured = || {
+        Ok(VolumeMetrics {
+            total_bytes: 10_000,
+            free_bytes: 500,
+        })
+    };
+    let now = std::time::SystemTime::now() + std::time::Duration::from_secs(200 * 86_400);
+    let outcome = evict_to_target(&cache, &store, policy, &pressured, now).unwrap();
+    assert!(outcome.triggered);
+    assert_eq!(outcome.blobs_removed, 2);
+    assert_eq!(outcome.manifests_cleaned, 1);
+    assert!(list_images(&store, &cache).is_empty());
+    // The next pull re-downloads both layers from scratch.
+    pull_image(&cache, &store, &image).await.unwrap();
+    assert_eq!(list_images(&store, &cache).len(), 1);
+    assert_eq!(registry.blob_hits.load(Ordering::SeqCst), 4);
+}

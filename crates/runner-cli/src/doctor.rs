@@ -587,6 +587,50 @@ fn check_swarm_bus() -> Check {
     }
 }
 
+/// Gathered storage facts; verdict logic lives in [`storage_verdict`].
+struct StorageFacts {
+    metrics: Result<runner_sandbox::oci::gc::VolumeMetrics, String>,
+    high_watermark_pct: f64,
+}
+
+/// Storage diagnostic: cache volume utilization, free space, and
+/// pressure status against the high watermark. Pressure warns
+/// (actionable, not fatal); unreadable volumes warn, never fail.
+fn storage_verdict(facts: &StorageFacts) -> Check {
+    match &facts.metrics {
+        Err(e) => Check::warn("storage", format!("cache volume unreadable: {e}")),
+        Ok(metrics) => {
+            let detail = format!(
+                "cache volume {:.1}% used, {} free (evict above {:.0}%)",
+                metrics.used_pct(),
+                crate::cache::format_bytes(metrics.free_bytes),
+                facts.high_watermark_pct,
+            );
+            if metrics.used_pct() >= facts.high_watermark_pct {
+                Check::warn("storage", format!("disk pressure: {detail}"))
+            } else {
+                Check::pass("storage", detail)
+            }
+        }
+    }
+}
+
+fn check_storage(config: &runner_core::config::RunnerConfig) -> Check {
+    use runner_sandbox::oci::cache::LayerCache;
+    use runner_sandbox::oci::gc::sense_volume;
+
+    let dir = config
+        .sandbox
+        .container
+        .cache_dir
+        .clone()
+        .unwrap_or_else(LayerCache::default_dir);
+    storage_verdict(&StorageFacts {
+        metrics: sense_volume(&dir).map_err(|e| e.to_string()),
+        high_watermark_pct: f64::from(config.storage.gc.high_watermark_pct),
+    })
+}
+
 /// Real writability proof: permission bits lie under ACLs and
 /// overlays, so create the directory and round-trip a probe file.
 fn store_writable(dir: &std::path::Path) -> bool {
@@ -879,6 +923,7 @@ pub async fn run_all(
         )),
         check_swarm(config),
         check_swarm_bus(),
+        check_storage(config),
         check_daemon().await,
         check_mcp(),
         check_cache(config),
@@ -1443,5 +1488,46 @@ mod tests {
         assert_eq!(check.name, "swarm-events");
         assert!(matches!(check.status, Status::Pass), "{}", check.detail);
         assert!(check.detail.contains("roundtrip ok"), "{}", check.detail);
+    }
+
+    #[test]
+    fn storage_verdict_reports_pressure_and_relief() {
+        use runner_sandbox::oci::gc::VolumeMetrics;
+
+        let calm = storage_verdict(&StorageFacts {
+            metrics: Ok(VolumeMetrics {
+                total_bytes: 1000,
+                free_bytes: 500,
+            }),
+            high_watermark_pct: 90.0,
+        });
+        assert_eq!(calm.name, "storage");
+        assert!(matches!(calm.status, Status::Pass));
+        assert!(calm.detail.contains("50.0% used"), "{}", calm.detail);
+        assert!(calm.detail.contains("evict above 90%"), "{}", calm.detail);
+        let pressured = storage_verdict(&StorageFacts {
+            metrics: Ok(VolumeMetrics {
+                total_bytes: 1000,
+                free_bytes: 50,
+            }),
+            high_watermark_pct: 90.0,
+        });
+        assert!(matches!(pressured.status, Status::Warn));
+        assert!(
+            pressured.detail.contains("disk pressure"),
+            "{}",
+            pressured.detail
+        );
+        assert!(
+            pressured.detail.contains("95.0% used"),
+            "{}",
+            pressured.detail
+        );
+        let blind = storage_verdict(&StorageFacts {
+            metrics: Err("no disk".to_string()),
+            high_watermark_pct: 90.0,
+        });
+        assert!(matches!(blind.status, Status::Warn));
+        assert!(blind.detail.contains("unreadable"), "{}", blind.detail);
     }
 }

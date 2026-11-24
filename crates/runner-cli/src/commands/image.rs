@@ -145,6 +145,46 @@ pub struct PruneOutcome {
     pub tmps_bytes: u64,
 }
 
+/// Prune candidates, collected without touching disk (shared by
+/// real pruning and `--dry-run` inspection).
+pub struct PruneTargets {
+    pub blobs: Vec<std::path::PathBuf>,
+    pub tmps: Vec<std::path::PathBuf>,
+}
+
+/// Collect unreferenced blobs plus stale staging files (older than
+/// `grace`). Pure collection: callers decide removal vs preview.
+pub fn collect_prune_targets(
+    store: &ImageStore,
+    cache: &LayerCache,
+    grace: std::time::Duration,
+) -> PruneTargets {
+    PruneTargets {
+        blobs: store.unreferenced_blobs(cache),
+        tmps: cache.stale_tmps(grace),
+    }
+}
+
+/// Human-readable dry-run inspection: what pruning would remove.
+pub fn render_prune_preview(targets: &PruneTargets) -> String {
+    let bytes: u64 = targets
+        .blobs
+        .iter()
+        .chain(targets.tmps.iter())
+        .map(|path| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let mut out = format!(
+        "would remove {} blobs and {} staging files ({})\n",
+        targets.blobs.len(),
+        targets.tmps.len(),
+        crate::cache::format_bytes(bytes),
+    );
+    for path in targets.blobs.iter().chain(targets.tmps.iter()) {
+        out.push_str(&format!("  {}\n", path.display()));
+    }
+    out
+}
+
 /// Remove unreferenced layer blobs and stale staging files (older
 /// than `grace`). Continues past individual removal failures but
 /// reports the first one so skips never pass silently.
@@ -174,11 +214,12 @@ pub fn prune_cache(
             }
         }
     };
-    for path in store.unreferenced_blobs(cache) {
-        remove(&path, &mut outcome, true);
+    let targets = collect_prune_targets(store, cache, grace);
+    for path in &targets.blobs {
+        remove(path, &mut outcome, true);
     }
-    for path in cache.stale_tmps(grace) {
-        remove(&path, &mut outcome, false);
+    for path in &targets.tmps {
+        remove(path, &mut outcome, false);
     }
     if let Some(error) = first_error {
         return Err(error);
@@ -397,6 +438,31 @@ mod tests {
         assert!(ok.contains("preserved 1 shared layer"), "{ok}");
         let err = render_remove_text(&reports[1]);
         assert!(err.contains("Cannot remove 'ghost:1'"), "{err}");
+    }
+
+    #[test]
+    fn prune_preview_lists_without_deleting() {
+        let (_dir, cache, store) = test_store("img-dryrun");
+        std::fs::create_dir_all(cache.dir()).unwrap();
+        let orphan = "f".repeat(64);
+        std::fs::write(cache.dir().join(&orphan), vec![1u8; 4]).unwrap();
+        std::fs::write(cache.dir().join("old.tmp"), vec![2u8; 6]).unwrap();
+        let targets = collect_prune_targets(&store, &cache, std::time::Duration::ZERO);
+        assert_eq!(targets.blobs.len(), 1);
+        assert_eq!(targets.tmps.len(), 1);
+        let preview = render_prune_preview(&targets);
+        assert!(preview.contains("would remove 1 blobs"), "{preview}");
+        assert!(preview.contains("1 staging files"), "{preview}");
+        assert!(preview.contains(&orphan), "{preview}");
+        assert!(preview.contains("old.tmp"), "{preview}");
+        // Nothing touched.
+        assert!(cache.dir().join(&orphan).exists());
+        assert!(cache.dir().join("old.tmp").exists());
+        let empty = render_prune_preview(&PruneTargets {
+            blobs: vec![],
+            tmps: vec![],
+        });
+        assert!(empty.contains("would remove 0 blobs"), "{empty}");
     }
 
     #[test]

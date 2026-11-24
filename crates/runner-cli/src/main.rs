@@ -384,7 +384,11 @@ enum ImageCommands {
         format: String,
     },
     /// Remove unreferenced layer blobs and stale staging files
-    Prune,
+    Prune {
+        /// Show what would be removed without deleting anything
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Remove cached images, keeping blobs shared with survivors
     #[command(alias = "rmi")]
     Rm {
@@ -1279,6 +1283,13 @@ async fn cmd_image_pull(config: &RunnerConfig, image: &str) -> Result<()> {
     use runner_cli::commands::image::{open_store, pull_image};
 
     let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
+    // Opportunistic pre-pull eviction (fail-open: never blocks).
+    runner_sandbox::oci::gc::evict_if_pressured(
+        &cache,
+        &store,
+        runner_sandbox::oci::gc::GcPolicy::from_config(&config.storage.gc),
+        std::time::SystemTime::now(),
+    );
     match pull_image(&cache, &store, image).await {
         Ok(outcome) => {
             println!(
@@ -1314,10 +1325,17 @@ fn cmd_image_list(config: &RunnerConfig, format: &str) -> Result<()> {
 }
 
 /// `runner image prune`: drop unreferenced blobs and stale staging files.
-fn cmd_image_prune(config: &RunnerConfig) -> Result<()> {
-    use runner_cli::commands::image::{open_store, prune_cache, PRUNE_TMP_GRACE};
+fn cmd_image_prune(config: &RunnerConfig, dry_run: bool) -> Result<()> {
+    use runner_cli::commands::image::{
+        collect_prune_targets, open_store, prune_cache, render_prune_preview, PRUNE_TMP_GRACE,
+    };
 
     let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
+    if dry_run {
+        let targets = collect_prune_targets(&store, &cache, PRUNE_TMP_GRACE);
+        print!("{}", render_prune_preview(&targets));
+        return Ok(());
+    }
     match prune_cache(&store, &cache, PRUNE_TMP_GRACE) {
         Ok(outcome) => {
             println!(
@@ -1500,6 +1518,9 @@ async fn cmd_exec_container(
         env: None,
         auto_pull: config.sandbox.container.auto_pull,
         layer_cache_dir: config.sandbox.container.cache_dir.clone(),
+        gc_policy: Some(runner_sandbox::oci::gc::GcPolicy::from_config(
+            &config.storage.gc,
+        )),
     };
     let engine = SandboxEngine::new(SandboxDriver::Container).with_container_launch(launch);
     match engine.execute(command, timeout).await {
@@ -1936,8 +1957,8 @@ async fn main() -> Result<()> {
             ImageCommands::List { format } => {
                 cmd_image_list(&config, &format)?;
             }
-            ImageCommands::Prune => {
-                cmd_image_prune(&config)?;
+            ImageCommands::Prune { dry_run } => {
+                cmd_image_prune(&config, dry_run)?;
             }
             ImageCommands::Rm { image, force } => {
                 cmd_image_rm(&config, &image, force)?;

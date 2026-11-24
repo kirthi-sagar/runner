@@ -107,6 +107,9 @@ impl CliAgentTools {
             env: Some(env.into_iter().map(|(k, v)| format!("{k}={v}")).collect()),
             auto_pull: self.config.sandbox.container.auto_pull,
             layer_cache_dir: self.config.sandbox.container.cache_dir.clone(),
+            gc_policy: Some(runner_sandbox::oci::gc::GcPolicy::from_config(
+                &self.config.storage.gc,
+            )),
         };
         let start = Instant::now();
         match execute_container_captured(launch).await {

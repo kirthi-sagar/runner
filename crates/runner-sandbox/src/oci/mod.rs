@@ -708,6 +708,9 @@ pub struct ContainerLaunch {
     pub auto_pull: bool,
     /// Layer cache root override (`None` uses the default dir).
     pub layer_cache_dir: Option<PathBuf>,
+    /// Storage GC policy for pre-pull eviction (`None` skips the
+    /// hook: hermetic tests; production resolves from config).
+    pub gc_policy: Option<gc::GcPolicy>,
 }
 
 impl Default for ContainerLaunch {
@@ -723,6 +726,7 @@ impl Default for ContainerLaunch {
             env: None,
             auto_pull: false,
             layer_cache_dir: None,
+            gc_policy: None,
         }
     }
 }
@@ -901,6 +905,11 @@ async fn launch_container(
         );
         let store = cache::ImageStore::new(cache.dir());
         let client = registry::RegistryClient::new();
+        // Opportunistic pre-pull eviction (fail-open: sensing
+        // trouble never blocks the download).
+        if let Some(policy) = launch.gc_policy {
+            gc::evict_if_pressured(&cache, &store, policy, std::time::SystemTime::now());
+        }
         let resolved = pull::ensure_image(&client, &cache, &store, &reference).await?;
         Some(
             resolved

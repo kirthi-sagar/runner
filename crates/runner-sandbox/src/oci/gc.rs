@@ -274,9 +274,9 @@ fn clean_broken_manifests(store: &ImageStore, cache: &LayerCache) -> usize {
     cleaned
 }
 
-/// Production entry: real volume sensing for the cache dir. The
-/// Phase 4+ hook for automatic invocation (pull path / daemon tick);
-/// Phase 3 exercises the injected policy core above.
+/// Production entry: real volume sensing for the cache dir.
+/// Strict core (sensing errors propagate) for callers that want to
+/// decide themselves; the pull path uses [`evict_if_pressured`].
 pub fn maybe_auto_evict(
     cache: &LayerCache,
     store: &ImageStore,
@@ -284,6 +284,57 @@ pub fn maybe_auto_evict(
     now: SystemTime,
 ) -> Result<GcOutcome, String> {
     evict_to_target(cache, store, policy, &|| sense_volume(cache.dir()), now)
+}
+
+/// Non-intrusive eviction notice, rendered only when blobs were
+/// actually reclaimed (`None` otherwise — quiet on no-ops). Free
+/// space is pre-pass free plus reclaimed bytes (no second sense
+/// call; concurrent writers make any reading approximate).
+pub fn eviction_notice(
+    outcome: &GcOutcome,
+    free_before_bytes: u64,
+    high_watermark_pct: f64,
+) -> Option<String> {
+    if outcome.blobs_removed == 0 {
+        return None;
+    }
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    Some(format!(
+        "[runner::storage] Disk pressure exceeded {:.0}%; auto-evicted {} idle layer blobs \
+         (reclaimed {:.1} MB, free space: {:.1} GB).",
+        high_watermark_pct,
+        outcome.blobs_removed,
+        outcome.bytes_freed as f64 / MB,
+        free_before_bytes.saturating_add(outcome.bytes_freed) as f64 / GB,
+    ))
+}
+
+/// Opportunistic pull-path hook: run one eviction pass with live
+/// sensing, notify on stderr when blobs actually go, and fail open
+/// (sensing errors note themselves and let the pull proceed — a
+/// blind GC must never block a download).
+pub fn evict_if_pressured(
+    cache: &LayerCache,
+    store: &ImageStore,
+    policy: GcPolicy,
+    now: SystemTime,
+) -> GcOutcome {
+    let free_before = sense_volume(cache.dir()).map(|m| m.free_bytes);
+    match evict_to_target(cache, store, policy, &|| sense_volume(cache.dir()), now) {
+        Ok(outcome) => {
+            if let Ok(free) = free_before {
+                if let Some(notice) = eviction_notice(&outcome, free, policy.high_watermark_pct) {
+                    eprintln!("{notice}");
+                }
+            }
+            outcome
+        }
+        Err(e) => {
+            eprintln!("[runner::storage] disk sensing failed ({e}); continuing without eviction");
+            GcOutcome::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -499,6 +550,37 @@ mod tests {
         for layer in &survivor.layers {
             assert!(cache.path_for(&layer.digest).unwrap().exists());
         }
+    }
+
+    #[test]
+    fn eviction_notice_renders_exactly_and_only_on_removal() {
+        // Quiet on no-ops (untriggered or zero-blob passes).
+        assert_eq!(eviction_notice(&GcOutcome::default(), 0, 90.0), None);
+        assert_eq!(
+            eviction_notice(
+                &GcOutcome {
+                    triggered: true,
+                    ..GcOutcome::default()
+                },
+                0,
+                90.0
+            ),
+            None
+        );
+        // Exact wire format (reclaimed in MB, free in GB).
+        let outcome = GcOutcome {
+            triggered: true,
+            blobs_removed: 3,
+            bytes_freed: 126_353_408,
+            manifests_cleaned: 1,
+        };
+        assert_eq!(
+            eviction_notice(&outcome, 8 * GB, 90.0).as_deref(),
+            Some(
+                "[runner::storage] Disk pressure exceeded 90%; auto-evicted 3 idle layer blobs \
+                 (reclaimed 120.5 MB, free space: 8.1 GB)."
+            )
+        );
     }
 
     #[test]

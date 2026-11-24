@@ -3,7 +3,7 @@
 [![CI](https://github.com/runnerhq/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/runnerhq/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/runnerhq/runner?color=blue&label=release)](https://github.com/runnerhq/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/runnerhq/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-793%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-794%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
 [![License: Runner Commercial Source-Available v1.0](https://img.shields.io/badge/License-Runner%20Commercial%20Source--Available%20v1.0-yellow.svg)](https://github.com/runnerhq/runner/blob/main/LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
@@ -148,8 +148,8 @@ Existing self-hosted runners fail at this because:
 
 9. **Forge Federation & Device-Code Auth**:
    - One daemonless login per forge: `runner auth login [github|gitlab]` runs the RFC 8628 browser-code flow (GitHub plus gitlab.com and self-hosted GitLab); tokens live in a host-keyed, file-locked store with legacy migration, and `runner auth status` / `logout` manage every connected forge.
-   - Native git password fill: `runner auth git-credential` answers `https` password prompts from stored device tokens (enable with `git config --global credential.helper '!runner auth git-credential'`); misses stay silent so git falls through, and tokens never emit over non-loopback cleartext HTTP.
-   - Daemonless OCI cross-auth: `runner image pull` authenticates private registries (ghcr.io, GitLab, colocated self-hosted) with the mapped forge token; token realms pass SSRF validation (HTTPS, host pairing, no intranet targets, no redirects) with anonymous fallback, and every manifest's bytes hash against its digest before layers download.
+   - Native git password fill: `runner auth git-credential` answers `https` password prompts from stored device tokens (enable with `git config --global credential.helper '!runner auth git-credential'`); misses stay silent so git falls through, and tokens never emit over non-loopback cleartext HTTP. Multi-tenant sub-path logins additionally require `git config --global credential.useHttpPath true` (git omits the path attribute by default).
+   - Daemonless OCI cross-auth: `runner image pull` authenticates private registries (ghcr.io, GitLab, colocated self-hosted) with the mapped forge token; realm validation enforces HTTPS and host pairing while rejecting IP literals (loopback-to-loopback excepted), follows no redirects, and falls back to anonymous exactly once on rejected credentials. Manifest bytes hash against their digest before layers download — including unpinned tagged pulls without `Docker-Content-Digest`, which verify against a hash of the downloaded bytes.
 
 **v2.14.0 auth capability matrix:**
 

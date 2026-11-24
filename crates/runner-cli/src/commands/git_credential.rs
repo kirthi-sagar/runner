@@ -149,11 +149,20 @@ pub fn git_credential_lookup<'a>(
 }
 
 /// Render a `get` answer: username + password in credential block
-/// format (blank-line terminated, per the git I/O spec). Never emits
-/// `quit`: misses answer with nothing at all so git falls through to
-/// the next helper.
-pub fn render_credential_answer(username: &str, password: &str) -> String {
-    format!("username={username}\npassword={password}\n\n")
+/// format (blank-line terminated, per the git I/O spec). Returns
+/// `None` when either value contains a line break or NUL:
+/// forge-supplied identity strings must never inject raw lines
+/// (e.g. `host=...`, `quit=true`) into git's line-oriented
+/// protocol. Never emits `quit`: misses answer with nothing at all
+/// so git falls through to the next helper.
+pub fn render_credential_answer(username: &str, password: &str) -> Option<String> {
+    fn clean(value: &str) -> bool {
+        !value.chars().any(|c| c == '\r' || c == '\n' || c == '\0')
+    }
+    if !clean(username) || !clean(password) {
+        return None;
+    }
+    Some(format!("username={username}\npassword={password}\n\n"))
 }
 
 #[cfg(test)]
@@ -359,11 +368,27 @@ mod tests {
     #[test]
     fn answer_renders_exact_credential_block() {
         assert_eq!(
-            render_credential_answer("octocat", "gho_x"),
-            "username=octocat\npassword=gho_x\n\n"
+            render_credential_answer("octocat", "gho_x").as_deref(),
+            Some("username=octocat\npassword=gho_x\n\n")
         );
         // Never a chain-killing `quit` attribute (line-anchored).
-        let hostile = render_credential_answer("quit", "quit=true");
+        let hostile = render_credential_answer("quit", "quit=true").unwrap();
         assert!(hostile.lines().all(|line| !line.starts_with("quit=")));
+    }
+
+    #[test]
+    fn answer_rejects_line_breaks_and_nul() {
+        // Every injection shape refuses to render: no raw lines can
+        // reach git's line-oriented protocol.
+        for (user, pass) in [
+            ("octo\nquit=true", "gho_x"),
+            ("octocat", "gho_x\nquit=true"),
+            ("octo\rquit=true", "gho_x"),
+            ("octocat", "gho_x\r\nhost=evil.example.com"),
+            ("octo\0cat", "gho_x"),
+            ("octocat", "gho\0x"),
+        ] {
+            assert_eq!(render_credential_answer(user, pass), None, "{user:?}");
+        }
     }
 }

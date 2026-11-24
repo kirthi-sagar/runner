@@ -314,7 +314,10 @@ enum AuthCommands {
     /// username and device token for known forge hosts (silently
     /// empty otherwise, so git falls through to the next helper);
     /// `store` and `erase` are accepted and ignored (logins are
-    /// managed by `runner auth login`).
+    /// managed by `runner auth login`). Multi-tenant sub-path logins
+    /// additionally require `git config --global
+    /// credential.useHttpPath true` (git omits the path attribute
+    /// by default, so tenants would never match).
     GitCredential {
         /// Helper operation from git (`get`, `store`, or `erase`)
         operation: String,
@@ -1053,10 +1056,13 @@ fn cmd_auth_git_credential(operation: &str) -> Result<()> {
     };
     let request = parse_credential_request(&input);
     if let Some(credential) = git_credential_lookup(&store.load_all(), &request) {
-        print!(
-            "{}",
+        // Unrenderable values (line breaks) answer empty, exactly
+        // like a miss: git falls through to the next helper.
+        if let Some(answer) =
             render_credential_answer(&credential.username, &credential.access_token)
-        );
+        {
+            print!("{answer}");
+        }
     }
     Ok(())
 }

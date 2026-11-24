@@ -401,8 +401,20 @@ impl AuthStore {
     }
 
     /// Credentials for one host (`None` when that forge is signed out).
+    /// Load one forge credential by store key. On a miss, retries
+    /// once with a default-port suffix (`:443`/`:80`) stripped:
+    /// store keys collapse default ports, but lookups assembled
+    /// from registry references can carry them explicitly
+    /// (`myregistry:443/…`). Exact hits always win.
     pub fn load_forge(&self, host: &str) -> Option<DeviceCredential> {
-        self.load_map().remove(host)
+        let mut map = self.load_map();
+        if let Some(credential) = map.remove(host) {
+            return Some(credential);
+        }
+        let bare = host
+            .strip_suffix(":443")
+            .or_else(|| host.strip_suffix(":80"))?;
+        map.remove(bare)
     }
 
     /// All stored credentials, sorted by host for stable display.
@@ -800,6 +812,21 @@ mod tests {
         // Read failure surfaces loudly; the entry survives.
         assert!(store.clear_forge("github.com").is_err());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn load_forge_strips_default_ports_on_miss() {
+        let dir = crate::test_support::TempDir::new("auth-port-fallback").unwrap();
+        let path = dir.path().join("auth.json");
+        let store = AuthStore::new(path);
+        store.save(&credential()).unwrap();
+        // Keys collapse default ports; explicit-default lookups hit.
+        assert!(store.load_forge("github.com").is_some());
+        assert!(store.load_forge("github.com:443").is_some());
+        assert!(store.load_forge("github.com:80").is_some());
+        // Non-default ports stay distinct instances.
+        assert!(store.load_forge("github.com:8443").is_none());
+        assert!(store.load_forge("other.example.com:443").is_none());
     }
 
     #[test]

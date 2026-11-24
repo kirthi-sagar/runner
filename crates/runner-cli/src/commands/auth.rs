@@ -17,18 +17,20 @@ pub fn browser_command() -> (&'static str, &'static [&'static str]) {
     }
 }
 
-/// Shell metacharacters that must never reach a command line.
-/// (`%` covers `cmd.exe` `%VAR%` expansion, `!` its delayed
-/// expansion, and `;` sh-style chaining; all are legal in URLs, but
-/// forge verification URIs never need any of them, so all fail
-/// closed.)
-const URL_FORBIDDEN: [char; 11] = ['&', '|', ';', '<', '>', '^', '%', '"', '\'', ' ', '!'];
+/// Characters that must never appear in a forge-supplied URL.
+/// No shell exists in any opener transport (unix `execvp` argv,
+/// Windows `ShellExecuteW`), so shell metacharacters (`&`, `%`, `|`
+/// …) are inert — and real OAuth URLs need `&` query separators
+/// and `%` escapes. Only characters that are never valid raw in a
+/// URL fail closed: quotes, backslashes, and whitespace.
+const URL_FORBIDDEN: [char; 3] = ['"', '\'', '\\'];
 
 /// Validate a forge-supplied URL before handing it to the OS
-/// opener: strict `http(s)` shape, non-empty host, and no shell
-/// metacharacters or whitespace (a compromised forge must not turn
-/// `cmd /C start` into command execution). Tab/newline control
-/// characters fail closed alongside spaces.
+/// opener: strict `http(s)` shape, non-empty host, and no quotes,
+/// backslashes, or whitespace (injection defense now rests on the
+/// shell-free transports; this gate keeps malformed URLs out with
+/// a clear error). Tab/newline control characters fail closed
+/// alongside spaces.
 pub fn validate_browser_url(url: &str) -> Result<(), String> {
     let rest = url
         .strip_prefix("https://")
@@ -42,7 +44,7 @@ pub fn validate_browser_url(url: &str) -> Result<(), String> {
         .chars()
         .any(|c| c.is_whitespace() || URL_FORBIDDEN.contains(&c))
     {
-        return Err("verification URL contains shell metacharacters".to_string());
+        return Err("verification URL contains forbidden characters".to_string());
     }
     Ok(())
 }
@@ -154,25 +156,39 @@ pub fn normalize_forge(forge: &str) -> Result<String, String> {
     }
 }
 
+/// Split a store key (or logout argument) at its sub-path:
+/// `git.corp.com/Team-A` → (`git.corp.com`, `/Team-A`); bare hosts
+/// carry an empty path.
+fn split_key(key: &str) -> (&str, &str) {
+    match key.find('/') {
+        Some(i) => (&key[..i], &key[i..]),
+        None => (key, ""),
+    }
+}
+
 /// Resolve a logout target against connected forges: an exact host
 /// wins outright; otherwise a forge name must match exactly one
 /// entry (ambiguous names list their hosts; unknown names fail
-/// closed). Matching is case-insensitive; the returned host keeps
-/// store casing.
+/// closed). Host matching is case-insensitive but sub-paths compare
+/// byte-exact; the returned host keeps store casing.
 pub fn resolve_logout_target<'a>(
     entries: &'a [(String, DeviceCredential)],
     arg: &str,
 ) -> Result<&'a str, String> {
-    let want = arg.trim().to_ascii_lowercase();
-    if let Some((host, _)) = entries
-        .iter()
-        .find(|(host, _)| host.to_ascii_lowercase() == want)
-    {
+    // Hosts fold case; sub-paths are byte-exact (`Team-A` and
+    // `team-a` are distinct tenants on one domain).
+    let want = arg.trim();
+    let (want_host, want_path) = split_key(want);
+    if let Some((host, _)) = entries.iter().find(|(host, _)| {
+        let (host_part, path_part) = split_key(host);
+        host_part.eq_ignore_ascii_case(want_host) && path_part == want_path
+    }) {
         return Ok(host);
     }
+    let want_lower = want.to_ascii_lowercase();
     let named: Vec<&str> = entries
         .iter()
-        .filter(|(_, creds)| creds.forge.to_ascii_lowercase() == want)
+        .filter(|(_, creds)| creds.forge.to_ascii_lowercase() == want_lower)
         .map(|(host, _)| host.as_str())
         .collect();
     match named.as_slice() {
@@ -279,22 +295,21 @@ mod tests {
         for ok in [
             "https://github.com/login/device",
             "https://git.example.com/oauth/authorize?x=1",
+            // Real device-verification shape: query separators and
+            // percent-escapes must open (shell-free transports make
+            // them inert).
+            "https://gitlab.example.com/activate?flow=device&client_id=123",
+            "https://h/callback?code=a%20b&state=x%2Fy",
             "http://127.0.0.1:9/activate",
         ] {
             assert!(validate_browser_url(ok).is_ok(), "{ok}");
         }
-        // Every command separator / substitution vector fails closed.
+        // Only never-valid-raw characters fail closed now (the
+        // shell-free transports neutralize the rest).
         for evil in [
-            "https://h/x&whoami",
-            "https://evil.com/&calc.exe",
-            "https://h/x|whoami",
-            "https://h/x;whoami",
-            "https://h/<x",
-            "https://h/x>y",
-            "https://h/^x",
-            "https://h/%PATH%",
             "https://h/\"x\"",
-            "https://h/x!y",
+            "https://h/x'y",
+            "https://h/x\\y",
             "https://h/x y",
             "https://h/x\ty",
             "https://h/x\ny",
@@ -307,7 +322,7 @@ mod tests {
             assert!(validate_browser_url(evil).is_err(), "{evil:?}");
         }
         // The opener itself enforces validation (never spawns junk).
-        assert!(open_browser("https://h/x&whoami").is_err());
+        assert!(open_browser("https://h/x y").is_err());
     }
 
     #[test]
@@ -394,5 +409,26 @@ mod tests {
         assert!(err.contains("gitlab.com"), "{err}");
         // Unknown names fail closed.
         assert!(resolve_logout_target(&entries, "gitea").is_err());
+    }
+
+    #[test]
+    fn logout_target_folds_host_case_but_not_path_case() {
+        let entries = vec![
+            entry("git.corp.com/Team-A", "gitlab"),
+            entry("git.corp.com/team-b", "gitlab"),
+        ];
+        // Host case folds; the path must match byte-exact.
+        assert_eq!(
+            resolve_logout_target(&entries, "GIT.CORP.COM/Team-A").unwrap(),
+            "git.corp.com/Team-A"
+        );
+        assert_eq!(
+            resolve_logout_target(&entries, "git.corp.com/team-b").unwrap(),
+            "git.corp.com/team-b"
+        );
+        // Wrong path case is a different tenant: no match.
+        assert!(resolve_logout_target(&entries, "git.corp.com/team-a").is_err());
+        // Bare host matches neither sub-path entry.
+        assert!(resolve_logout_target(&entries, "git.corp.com").is_err());
     }
 }

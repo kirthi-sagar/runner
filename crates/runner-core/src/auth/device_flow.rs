@@ -55,7 +55,11 @@ pub fn forge_key_from_url(url: &str) -> Result<String, String> {
     // rather than stripping (which would silently launder
     // `user:pass@host` into a clean-looking key).
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(format!("forge URL must not contain credentials: '{url}'"));
+        // Static message: echoing the URL would print the embedded
+        // password into terminal output and logs.
+        return Err(
+            "forge URL must not contain user credentials (username or password)".to_string(),
+        );
     }
     match parsed.scheme() {
         "https" => {}
@@ -832,10 +836,15 @@ mod tests {
             "http://user@localhost:9/x",
         ] {
             let err = forge_key_from_url(evil).unwrap_err();
-            assert!(
-                err.contains("must not contain credentials"),
-                "{evil}: {err}"
+            assert_eq!(
+                err, "forge URL must not contain user credentials (username or password)",
+                "{evil}"
             );
+            // The rejection carries neither the secret nor the URL.
+            assert!(!err.contains("user:pass"), "{evil}: {err}");
+            assert!(!err.contains('@'), "{evil}: {err}");
+            assert!(!err.contains("example.com"), "{evil}: {err}");
+            assert!(!err.contains("localhost"), "{evil}: {err}");
         }
     }
 

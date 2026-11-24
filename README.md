@@ -3,14 +3,14 @@
 [![CI](https://github.com/runnerhq/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/runnerhq/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/runnerhq/runner?color=blue&label=release)](https://github.com/runnerhq/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/runnerhq/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-712%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-733%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
 [![License: Runner Commercial Source-Available v1.0](https://img.shields.io/badge/License-Runner%20Commercial%20Source--Available%20v1.0-yellow.svg)](https://github.com/runnerhq/runner/blob/main/LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Generally Available (v2.12.1) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Generally Available (v2.13.0) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -140,6 +140,12 @@ Existing self-hosted runners fail at this because:
    - Dynamic 0ms capacity handover between agents, priority preemption (higher preempts lower, equals queue FIFO), aggregated spend ledger with `[swarm]` budget caps, and a real-time event bus (`status_changed`, `capacity_yielded`, `agent_preempted`, `budget_updated`).
    - Operate swarms with `runner swarm list` (status, members, pool usage, spend vs cap) and `runner swarm kill <swarm_id>` (terminate, reclaim slices, abandon jobs); `runner doctor` reports swarm readiness and event-bus integrity.
 
+8. **Disk Pressure-Gated Cache Eviction & Safety Signpost**:
+   - Every layer cache root carries a self-healing `README_SAFE_TO_DELETE.txt` explaining the directory is 100% safe to delete anytime (runner re-downloads on demand).
+   - `runner image rm <image...>` (`rmi` alias, `-f` to skip confirmation) removes cached images with shared-layer reference counting — only exclusive blobs are deleted, with per-image reclamation summaries.
+   - Two-tier storage governor (`[storage.gc]`): past 90% utilization or under 10 GB free, the oldest cold layers (30+ days unaccessed) evict down to 80% / 15 GB free; plentiful disks preserve everything indefinitely. Eviction runs opportunistically before pulls (fail-open) with a stderr notice, and `runner image prune --dry-run` previews reclamation.
+   - `runner doctor` reports cache volume utilization, free space, and pressure status via the `storage` check.
+
 ---
 
 ## 3. Comprehensive Comparison: `runner` vs. Alternatives
@@ -188,7 +194,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)), or Windows via WSL2 (see [`docs/windows.md`](docs/windows.md)).
 
-Zero-dependency install (downloads the prebuilt v2.12.1 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v2.13.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runnerhq/runner/main/install.sh | sh
@@ -225,7 +231,7 @@ runner top
 ```
 
 ```text
-runner top v2.12.1  (q quit, live cadence)
+runner top v2.13.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -353,7 +359,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "2.12.1", "governor": "normal",
+{"status": "healthy", "version": "2.13.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 

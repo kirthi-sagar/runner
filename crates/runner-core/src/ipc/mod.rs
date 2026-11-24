@@ -469,6 +469,45 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
             let v = crate::mcp::tools::fleet_topology_value(state).await;
             serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": v })
         }
+        "swarm_list" => {
+            let guard = state.read().await;
+            let mut swarms: Vec<crate::mcp::swarm::SwarmSummary> =
+                guard.swarms().values().map(|s| s.summarize()).collect();
+            swarms.sort_by(|a, b| a.swarm_id.cmp(&b.swarm_id));
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "swarms": swarms,
+            } })
+        }
+        "swarm_kill" => {
+            let swarm_id = value
+                .get("params")
+                .and_then(|p| p.get("swarm_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if swarm_id.trim().is_empty() {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "swarm_id must not be empty" } });
+            }
+            let mut guard = state.write().await;
+            match crate::mcp::swarm::terminate_swarm(
+                guard.swarms_mut(),
+                &swarm_id,
+                std::time::Instant::now(),
+            ) {
+                Ok(outcome) => serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "result": outcome }),
+                Err(crate::mcp::swarm::SwarmError::Invalid(message))
+                | Err(crate::mcp::swarm::SwarmError::BudgetExceeded(message)) => {
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": message } })
+                }
+                Err(internal @ crate::mcp::swarm::SwarmError::Internal(_)) => {
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32603, "message": internal.to_string() } })
+                }
+            }
+        }
         _ => serde_json::json!({ "jsonrpc": "2.0", "id": id,
             "error": { "code": -32601, "message": format!("method not found: {method}") } }),
     }
@@ -735,6 +774,58 @@ mod tests {
 
     fn cloud_req(method: &str, params: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+    }
+
+    #[tokio::test]
+    async fn swarm_list_and_kill_roundtrip() {
+        use crate::mcp::swarm;
+        use std::time::Instant;
+
+        let state = new_shared_state();
+        // Empty table lists clean.
+        let res = handle_ipc_request(cloud_req("swarm_list", serde_json::json!({})), &state).await;
+        assert_eq!(res["result"]["swarms"].as_array().unwrap().len(), 0);
+        // Seed two sessions through the protocol (one drained).
+        {
+            let mut guard = state.write().await;
+            let now = Instant::now();
+            swarm::register_agent(guard.swarms_mut(), "beta", "a", "builder", 0, now).unwrap();
+            swarm::register_agent(guard.swarms_mut(), "alpha", "b", "tester", 0, now).unwrap();
+            swarm::transition_swarm_status(
+                guard.swarms_mut(),
+                "beta",
+                swarm::SwarmStatus::Draining,
+                now,
+            )
+            .unwrap();
+        }
+        let res = handle_ipc_request(cloud_req("swarm_list", serde_json::json!({})), &state).await;
+        let swarms = res["result"]["swarms"].as_array().unwrap();
+        assert_eq!(swarms.len(), 2);
+        assert_eq!(swarms[0]["swarm_id"], "alpha");
+        assert_eq!(swarms[0]["status"], "active");
+        assert_eq!(swarms[0]["member_count"], 1);
+        assert_eq!(swarms[1]["status"], "draining");
+        // Kill reclaims and reports; unknown ids fail closed.
+        let res = handle_ipc_request(
+            cloud_req("swarm_kill", serde_json::json!({ "swarm_id": "alpha" })),
+            &state,
+        )
+        .await;
+        assert_eq!(res["result"]["status"], "terminated");
+        assert_eq!(res["result"]["slices_reclaimed"], 1);
+        let res = handle_ipc_request(
+            cloud_req("swarm_kill", serde_json::json!({ "swarm_id": "ghost" })),
+            &state,
+        )
+        .await;
+        assert_eq!(res["error"]["code"], -32602);
+        let res = handle_ipc_request(
+            cloud_req("swarm_kill", serde_json::json!({ "swarm_id": "  " })),
+            &state,
+        )
+        .await;
+        assert_eq!(res["error"]["code"], -32602);
     }
 
     async fn seeded_state() -> crate::governor::supervisor::SharedState {

@@ -438,6 +438,11 @@ impl SupervisorState {
         &mut self.swarms
     }
 
+    /// Read-only swarm table for the list surface.
+    pub fn swarms(&self) -> &HashMap<String, crate::mcp::swarm::SwarmSession> {
+        &self.swarms
+    }
+
     /// Subscribe to one session's lifecycle event bus (`None` for
     /// unknown swarms). Receivers never stall the sender.
     pub fn swarm_event_stream(

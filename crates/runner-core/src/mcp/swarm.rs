@@ -30,6 +30,10 @@ pub const SWARM_LEASE_SECS: u64 = 1800;
 /// Per-session event bus buffer: lagging receivers drop old events,
 /// the sender never blocks (see [`SwarmEvent`]).
 pub const SWARM_EVENT_BUFFER: usize = 64;
+/// Maximum members per swarm session: holderless joins are cheap
+/// records, so an explicit ceiling (not pool exhaustion) bounds
+/// table memory against runaway registrants.
+pub const SWARM_MAX_MEMBERS: usize = 1024;
 
 /// Physical host capacity ceiling: logical CPUs plus total RAM, MiB.
 /// Detection failure fails the registration closed (unknown capacity
@@ -343,6 +347,23 @@ impl SwarmSession {
     fn dequeue(&mut self, agent_id: &str) {
         self.waiters.retain(|waiter| waiter != agent_id);
     }
+
+    /// Serializable snapshot of this session for IPC/CLI surfaces.
+    pub fn summarize(&self) -> SwarmSummary {
+        SwarmSummary {
+            swarm_id: self.swarm_id.clone(),
+            status: self.status,
+            member_count: self.members.len(),
+            waiting_count: self.waiters.len(),
+            active_jobs: self.active_jobs.len(),
+            cpu_weight_allocated: self.capacity_pool.cpu_weight_allocated,
+            cpu_weight_max: self.capacity_pool.cpu_weight_max,
+            memory_allocated_mb: self.capacity_pool.memory_allocated_mb,
+            memory_max_mb: self.capacity_pool.memory_max_mb,
+            spent_usd: self.budget.spent_usd,
+            spend_cap_usd: self.budget.cap_usd,
+        }
+    }
 }
 
 /// Registration confirmation: the member plus the pool state after
@@ -510,6 +531,11 @@ pub fn register_agent_with_budget(
     if session.members.contains_key(agent_id) {
         return Err(SwarmError::Invalid(format!(
             "agent '{agent_id}' is already registered in swarm '{swarm_id}'"
+        )));
+    }
+    if session.members.len() >= SWARM_MAX_MEMBERS {
+        return Err(SwarmError::Invalid(format!(
+            "swarm '{swarm_id}' is at member capacity ({SWARM_MAX_MEMBERS})"
         )));
     }
     // Joins draw execution capacity when it fits, so a blown budget
@@ -769,6 +795,33 @@ fn grant_front_waiter(session: &mut SwarmSession, now: Instant) -> Option<String
     None
 }
 
+/// Serializable session snapshot for the daemon IPC surface (the
+/// live session holds `Instant`s and a broadcast sender, neither
+/// of which crosses the wire).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmSummary {
+    pub swarm_id: String,
+    pub status: SwarmStatus,
+    pub member_count: usize,
+    pub waiting_count: usize,
+    pub active_jobs: usize,
+    pub cpu_weight_allocated: f64,
+    pub cpu_weight_max: f64,
+    pub memory_allocated_mb: u64,
+    pub memory_max_mb: u64,
+    pub spent_usd: f64,
+    pub spend_cap_usd: f64,
+}
+
+/// Outcome of a [`terminate_swarm`] call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminateOutcome {
+    pub swarm_id: String,
+    pub status: SwarmStatus,
+    pub slices_reclaimed: usize,
+    pub jobs_abandoned: usize,
+}
+
 /// Outcome of a [`dispatch_swarm_job`] call.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchOutcome {
@@ -907,6 +960,44 @@ pub fn transition_swarm_status(
         status,
     });
     Ok(())
+}
+
+/// Terminate a swarm: transition to `Terminated` (from `Active` or
+/// `Draining`), accrue and reclaim every held slice, abandon active
+/// jobs, and clear the wait queue. Membership and the spend ledger
+/// linger for audit. Idempotent: re-killing reports zeros.
+pub fn terminate_swarm(
+    sessions: &mut HashMap<String, SwarmSession>,
+    swarm_id: &str,
+    now: Instant,
+) -> Result<TerminateOutcome, SwarmError> {
+    transition_swarm_status(sessions, swarm_id, SwarmStatus::Terminated, now)?;
+    let session = sessions
+        .get_mut(swarm_id)
+        .expect("transition checked existence");
+    let holders: Vec<String> = session
+        .members
+        .values()
+        .filter(|agent| agent.holds_slice)
+        .map(|agent| agent.agent_id.clone())
+        .collect();
+    for id in &holders {
+        session.accrue(id, now);
+        if let Some(agent) = session.members.get_mut(id) {
+            agent.holds_slice = false;
+            agent.slice_acquired_at = None;
+        }
+        session.capacity_pool.dealloc_agent();
+    }
+    let jobs_abandoned = session.active_jobs.len();
+    session.active_jobs.clear();
+    session.waiters.clear();
+    Ok(TerminateOutcome {
+        swarm_id: session.swarm_id.clone(),
+        status: session.status,
+        slices_reclaimed: holders.len(),
+        jobs_abandoned,
+    })
 }
 
 #[cfg(test)]
@@ -1557,6 +1648,65 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn membership_ceiling_rejects_past_1024() {
+        let mut table = sessions();
+        // Pre-fill directly (same module): 1024 protocol joins
+        // would re-probe the host on every call.
+        let mut session = SwarmSession::new("s".to_string(), 1_000_000.0, 1 << 40);
+        for i in 0..SWARM_MAX_MEMBERS {
+            session.members.insert(
+                format!("a{i}"),
+                SwarmAgent {
+                    agent_id: format!("a{i}"),
+                    role: "builder".to_string(),
+                    priority: 0,
+                    lease_expires_at: Instant::now() + Duration::from_secs(3600),
+                    holds_slice: false,
+                    slice_acquired_at: None,
+                },
+            );
+        }
+        table.insert("s".to_string(), session);
+        let err =
+            register_agent(&mut table, "s", "overflow", "builder", 0, Instant::now()).unwrap_err();
+        assert!(matches!(err, SwarmError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("member capacity"), "{err}");
+        assert_eq!(table["s"].members.len(), SWARM_MAX_MEMBERS);
+    }
+
+    #[test]
+    fn terminate_reclaims_slices_jobs_and_waiters() {
+        let mut table = sessions();
+        tiny_session(&mut table, 2);
+        let now = Instant::now();
+        register_agent(&mut table, "s", "a", "builder", 0, now).unwrap();
+        register_agent(&mut table, "s", "b", "tester", 0, now).unwrap();
+        register_agent(&mut table, "s", "c", "auditor", 0, now).unwrap();
+        dispatch_swarm_job(&mut table, "s", "a", "process", 1.0, 512, now).unwrap();
+        let mut events = table["s"].subscribe();
+        let outcome = terminate_swarm(&mut table, "s", now).unwrap();
+        assert_eq!(outcome.status, SwarmStatus::Terminated);
+        assert_eq!(outcome.slices_reclaimed, 2);
+        assert_eq!(outcome.jobs_abandoned, 1);
+        let session = &table["s"];
+        assert_eq!(session.capacity_pool.cpu_weight_allocated, 0.0);
+        assert!(session.active_jobs.is_empty());
+        assert!(session.waiters.is_empty());
+        assert!(session.members.values().all(|m| !m.holds_slice));
+        // Membership lingers for audit; termination broadcasts.
+        assert_eq!(session.members.len(), 3);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SwarmEvent::StatusChanged { .. })
+        ));
+        // Re-killing is idempotent, unknown swarms fail closed.
+        let again = terminate_swarm(&mut table, "s", now).unwrap();
+        assert_eq!(again.slices_reclaimed, 0);
+        assert_eq!(again.jobs_abandoned, 0);
+        assert!(terminate_swarm(&mut table, "nope", now).is_err());
     }
 
     #[test]

@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod cache;
 pub mod cloud;
+pub mod commands;
 pub mod coordinator;
 pub mod doctor;
 pub mod hook;

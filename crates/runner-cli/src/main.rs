@@ -187,6 +187,11 @@ enum Commands {
         #[command(subcommand)]
         command: CacheCommands,
     },
+    /// Inspect and terminate agent swarms via the daemon
+    Swarm {
+        #[command(subcommand)]
+        command: SwarmCommands,
+    },
     /// Pull, list, and prune OCI container images in the local layer cache
     Image {
         #[command(subcommand)]
@@ -347,6 +352,21 @@ enum CacheCommands {
         /// Output format: text or json
         #[arg(long, default_value = "text")]
         format: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SwarmCommands {
+    /// List daemon swarms: status, members, pool usage, spend vs cap
+    List {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Terminate a swarm: reclaim slices, abandon jobs, emit events
+    Kill {
+        /// Swarm session id
+        swarm_id: String,
     },
 }
 
@@ -1304,6 +1324,36 @@ fn cmd_image_prune(config: &RunnerConfig) -> Result<()> {
     }
 }
 
+/// `runner swarm list`: daemon swarm sessions and pool usage.
+async fn cmd_swarm_list(format: &str) -> Result<()> {
+    use runner_cli::commands::swarm::{parse_list, render_list_json, render_list_text};
+
+    let result = daemon_call("swarm_list", None).await?;
+    let rows = parse_list(&result);
+    match format.trim().to_ascii_lowercase().as_str() {
+        "text" => print!("{}", render_list_text(&rows)),
+        "json" => println!("{}", render_list_json(&rows)),
+        other => anyhow::bail!("unsupported swarm list format {other:?}: want text|json"),
+    }
+    Ok(())
+}
+
+/// `runner swarm kill`: terminate a session, reclaiming its slices.
+async fn cmd_swarm_kill(swarm_id: &str) -> Result<()> {
+    use runner_cli::commands::swarm::{parse_kill, render_kill_text};
+
+    if swarm_id.trim().is_empty() {
+        anyhow::bail!("swarm_id must not be empty");
+    }
+    let result = daemon_call(
+        "swarm_kill",
+        Some(serde_json::json!({ "swarm_id": swarm_id })),
+    )
+    .await?;
+    print!("{}", render_kill_text(&parse_kill(&result)));
+    Ok(())
+}
+
 /// `runner hook uninstall`: remove the managed hook, restore backup.
 fn cmd_hook_uninstall() -> Result<()> {
     use runner_cli::hook::uninstall;
@@ -1817,6 +1867,14 @@ async fn main() -> Result<()> {
             }
             CacheCommands::Peers { format } => {
                 cmd_cache_peers(&format).await?;
+            }
+        },
+        Commands::Swarm { command } => match command {
+            SwarmCommands::List { format } => {
+                cmd_swarm_list(&format).await?;
+            }
+            SwarmCommands::Kill { swarm_id } => {
+                cmd_swarm_kill(&swarm_id).await?;
             }
         },
         Commands::Image { command } => match command {

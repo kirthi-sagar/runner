@@ -509,6 +509,84 @@ fn cache_verdict(facts: &CacheFacts) -> Check {
     )
 }
 
+/// Gathered swarm facts; verdict logic lives in [`swarm_verdict`].
+struct SwarmFacts {
+    spend_cap_usd: f64,
+    rate_usd: f64,
+    slots: Result<runner_core::governor::topology::SlotReport, String>,
+}
+
+/// Swarm supervisor readiness: the `[swarm]` budget posture plus
+/// live host execution slots and memory headroom. Slot detection
+/// failure warns (host-specific probe gap), never fails.
+fn swarm_verdict(facts: &SwarmFacts) -> Check {
+    let cap = if facts.spend_cap_usd > 0.0 {
+        format!("cap ${:.2}", facts.spend_cap_usd)
+    } else {
+        "cap unenforced".to_string()
+    };
+    match &facts.slots {
+        Err(e) => Check::warn("swarm", format!("host slots unreadable: {e}")),
+        Ok(report) => Check::pass(
+            "swarm",
+            format!(
+                "ready ({}, ${:.2}/core-hour; {} cores, {} avail, {} slots)",
+                cap,
+                facts.rate_usd,
+                report.topology.logical,
+                crate::cache::format_bytes(report.mem_avail_mb * 1024 * 1024),
+                report.slots,
+            ),
+        ),
+    }
+}
+
+fn check_swarm(config: &runner_core::config::RunnerConfig) -> Check {
+    swarm_verdict(&SwarmFacts {
+        spend_cap_usd: config.swarm.monthly_spend_cap_usd,
+        rate_usd: config.swarm.effective_rate(),
+        slots: runner_core::governor::topology::detect_slots(false).map_err(|e| e.to_string()),
+    })
+}
+
+/// Swarm event bus integrity: a live session round-trips a status
+/// transition through a subscribed receiver (no daemon needed —
+/// the bus is per-session in-memory).
+fn check_swarm_bus() -> Check {
+    use runner_core::mcp::swarm::{transition_swarm_status, SwarmSession, SwarmStatus};
+    use std::collections::HashMap;
+
+    let mut sessions: HashMap<String, SwarmSession> = HashMap::new();
+    sessions.insert(
+        "doctor-probe".to_string(),
+        SwarmSession::new("doctor-probe".to_string(), 1.0, 512),
+    );
+    let mut rx = match sessions.get("doctor-probe") {
+        Some(session) => session.subscribe(),
+        None => return Check::warn("swarm-events", "probe session missing".to_string()),
+    };
+    if transition_swarm_status(
+        &mut sessions,
+        "doctor-probe",
+        SwarmStatus::Draining,
+        std::time::Instant::now(),
+    )
+    .is_err()
+    {
+        return Check::warn("swarm-events", "probe transition failed".to_string());
+    }
+    match rx.try_recv() {
+        Ok(runner_core::mcp::swarm::SwarmEvent::StatusChanged {
+            status: SwarmStatus::Draining,
+            ..
+        }) => Check::pass(
+            "swarm-events",
+            "event bus live (status_changed roundtrip ok)".to_string(),
+        ),
+        _ => Check::warn("swarm-events", "event bus did not deliver".to_string()),
+    }
+}
+
 /// Real writability proof: permission bits lie under ACLs and
 /// overlays, so create the directory and round-trip a probe file.
 fn store_writable(dir: &std::path::Path) -> bool {
@@ -799,6 +877,8 @@ pub async fn run_all(
         check_container_runtime(&runner_sandbox::oci::probe_oci_runtime(
             config.sandbox.container.runtime_path.as_deref(),
         )),
+        check_swarm(config),
+        check_swarm_bus(),
         check_daemon().await,
         check_mcp(),
         check_cache(config),
@@ -1312,5 +1392,56 @@ mod tests {
         assert_eq!(json["checks"][0]["status"], "pass");
         assert_eq!(json["checks"][0]["name"], "container");
         assert_eq!(json["checks"][1]["status"], "warn");
+    }
+
+    #[test]
+    fn swarm_verdict_reports_readiness_and_slots() {
+        use runner_core::governor::topology::{CpuTopology, SlotReport};
+
+        let report = SlotReport {
+            topology: CpuTopology {
+                logical: 8,
+                physical: 4,
+            },
+            mem_total_mb: 16384,
+            mem_avail_mb: 8192,
+            slots: 2,
+            afk_boost: false,
+        };
+        let ready = swarm_verdict(&SwarmFacts {
+            spend_cap_usd: 25.0,
+            rate_usd: 0.05,
+            slots: Ok(report),
+        });
+        assert_eq!(ready.name, "swarm");
+        assert!(matches!(ready.status, Status::Pass));
+        assert!(ready.detail.contains("cap $25.00"), "{}", ready.detail);
+        assert!(ready.detail.contains("8 cores"), "{}", ready.detail);
+        assert!(ready.detail.contains("2 slots"), "{}", ready.detail);
+        let unenforced = swarm_verdict(&SwarmFacts {
+            spend_cap_usd: 0.0,
+            rate_usd: 0.05,
+            slots: Ok(report),
+        });
+        assert!(
+            unenforced.detail.contains("cap unenforced"),
+            "{}",
+            unenforced.detail
+        );
+        let blind = swarm_verdict(&SwarmFacts {
+            spend_cap_usd: 0.0,
+            rate_usd: 0.05,
+            slots: Err("no sysfs".to_string()),
+        });
+        assert!(matches!(blind.status, Status::Warn));
+        assert!(blind.detail.contains("unreadable"), "{}", blind.detail);
+    }
+
+    #[test]
+    fn swarm_bus_probe_roundtrips_live_event() {
+        let check = check_swarm_bus();
+        assert_eq!(check.name, "swarm-events");
+        assert!(matches!(check.status, Status::Pass), "{}", check.detail);
+        assert!(check.detail.contains("roundtrip ok"), "{}", check.detail);
     }
 }

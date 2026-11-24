@@ -261,13 +261,15 @@ fn registry_bare_host(registry: &str) -> &str {
     }
 }
 
-/// Realm/registry host pairing rule: exact equality, plus the two
-/// known split-host auth pairs (Hub serves auth from
-/// `auth.docker.io`; GitLab serves it from `gitlab.com` or a
-/// `gitlab.com` subdomain). No suffix slicing of any kind: naive
-/// registrable domains let `collector.attacker.co.uk` match
-/// `forge.company.co.uk`. Split-host self-hosted forges fail closed
-/// here (colocated instances match by equality).
+/// Realm/registry host pairing rule: exact equality, plus known
+/// split-host auth pairs (Hub serves auth from `auth.docker.io`;
+/// GitLab from `gitlab.com` or a `gitlab.com` subdomain; Alibaba
+/// ACR from a regional sibling — see [`aliyun_auth_pair`]). No
+/// suffix slicing of any kind: naive registrable domains let
+/// `collector.attacker.co.uk` match `forge.company.co.uk`.
+/// Split-host self-hosted forges fail closed here. Callers pass
+/// port-stripped hosts, so colocated instances (`gitlab.corp:5050`
+/// vs a `gitlab.corp` realm) match by equality.
 fn realm_host_allowed(realm_host: &str, reg_host: &str) -> bool {
     if realm_host.eq_ignore_ascii_case(reg_host) {
         return true;
@@ -278,6 +280,27 @@ fn realm_host_allowed(realm_host: &str, reg_host: &str) -> bool {
         (reg.as_str(), realm.as_str()),
         ("registry-1.docker.io", "auth.docker.io") | ("registry.gitlab.com", "gitlab.com")
     ) || (reg == "registry.gitlab.com" && realm.ends_with(".gitlab.com"))
+        || aliyun_auth_pair(&realm, &reg)
+}
+
+/// Alibaba Cloud ACR serves token auth from a regional sibling host
+/// (`dockerauth.<region>.aliyuncs.com` for
+/// `registry.<region>.aliyuncs.com`). Regions must match exactly:
+/// cross-region realms fail closed like any foreign host. Inputs
+/// arrive lowercased.
+fn aliyun_auth_pair(realm: &str, reg: &str) -> bool {
+    const SUFFIX: &str = ".aliyuncs.com";
+    let (Some(regional), Some(auth)) = (reg.strip_suffix(SUFFIX), realm.strip_suffix(SUFFIX))
+    else {
+        return false;
+    };
+    match (
+        regional.strip_prefix("registry."),
+        auth.strip_prefix("dockerauth."),
+    ) {
+        (Some(a), Some(b)) => !a.is_empty() && a == b,
+        _ => false,
+    }
 }
 
 /// Validate a challenge realm before any fetch (SSRF defense): the
@@ -345,6 +368,9 @@ fn verify_manifest_bytes(bytes: &[u8], expected: &str) -> Result<(), String> {
     let want = expected
         .strip_prefix("sha256:")
         .ok_or_else(|| format!("invalid manifest digest '{expected}' (want sha256:<64 hex>)"))?;
+    // Pins may carry uppercase hex (valid per digest shape rules);
+    // hashing always renders lowercase, so fold before comparing.
+    let want = want.to_ascii_lowercase();
     let actual = format!("{:x}", sha2::Sha256::digest(bytes));
     if actual != want {
         return Err(format!(
@@ -935,6 +961,14 @@ mod tests {
             ("https://auth.docker.io/token", "registry-1.docker.io"),
             ("https://gitlab.com/jwt/auth", "registry.gitlab.com"),
             ("https://jwt.gitlab.com/jwt/auth", "registry.gitlab.com"),
+            // Self-hosted GitLab on :5050 serves its realm from the
+            // bare host (ports strip before comparison).
+            ("https://gitlab.corp/jwt/auth", "gitlab.corp:5050"),
+            // Alibaba ACR: regional auth sibling, same region.
+            (
+                "https://dockerauth.cn-hangzhou.aliyuncs.com/token",
+                "registry.cn-hangzhou.aliyuncs.com",
+            ),
             (
                 "https://registry.corp.com:8443/token",
                 "registry.corp.com:8443",
@@ -965,6 +999,16 @@ mod tests {
             // Split-host self-hosted forges fail closed (colocated
             // instances match by equality instead).
             ("https://gitlab.corp.com/jwt/auth", "registry.corp.com"),
+            // Alibaba ACR: cross-region realms and lookalike
+            // suffixes fail closed.
+            (
+                "https://dockerauth.cn-beijing.aliyuncs.com/token",
+                "registry.cn-hangzhou.aliyuncs.com",
+            ),
+            (
+                "https://dockerauth.cn-hangzhou.aliyuncs.com.evil.com/token",
+                "registry.cn-hangzhou.aliyuncs.com",
+            ),
             (
                 "https://registry.gitlab.com.evil.com/jwt/auth",
                 "registry.gitlab.com",
@@ -1318,6 +1362,14 @@ mod tests {
         let bytes = br#"{"schemaVersion":2}"#;
         let digest = sha256_digest(bytes);
         assert!(verify_manifest_bytes(bytes, &digest).is_ok());
+        // Uppercase and mixed-case hex verify identically (the
+        // `sha256:` scheme itself stays lowercase).
+        let mut upper = digest.clone();
+        upper.replace_range(7.., &digest[7..].to_ascii_uppercase());
+        assert!(verify_manifest_bytes(bytes, &upper).is_ok());
+        let mut mixed = digest.clone();
+        mixed.replace_range(7..9, &digest[7..9].to_ascii_uppercase());
+        assert!(verify_manifest_bytes(bytes, &mixed).is_ok());
         let err = verify_manifest_bytes(br#"{"schemaVersion":3}"#, &digest).unwrap_err();
         assert!(err.contains("mismatch"), "{err}");
         assert!(verify_manifest_bytes(bytes, "md5:abc").is_err());

@@ -307,6 +307,18 @@ enum AuthCommands {
         /// Forge name or host to sign out of (all when omitted)
         forge: Option<String>,
     },
+    /// Answer git credential requests from device-flow logins.
+    ///
+    /// Enable with `git config --global credential.helper
+    /// '!runner auth git-credential'`. `get` prints the stored
+    /// username and device token for known forge hosts (silently
+    /// empty otherwise, so git falls through to the next helper);
+    /// `store` and `erase` are accepted and ignored (logins are
+    /// managed by `runner auth login`).
+    GitCredential {
+        /// Helper operation from git (`get`, `store`, or `erase`)
+        operation: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1013,6 +1025,39 @@ fn cmd_auth_logout(forge: Option<&str>) -> Result<()> {
     }
     .map_err(|e| anyhow::anyhow!(e))?;
     println!("{message}");
+    Ok(())
+}
+
+/// `runner auth git-credential`: speak the git helper protocol.
+/// Reads one credential block first (blank-line terminated — never
+/// to EOF, which would deadlock `git fill`); every runtime path
+/// then exits 0, since nonzero aborts git's whole helper chain.
+/// Misses and unreadable stores answer empty — the latter with a
+/// stderr warning, never silence.
+fn cmd_auth_git_credential(operation: &str) -> Result<()> {
+    use runner_cli::commands::git_credential::{
+        git_credential_lookup, parse_credential_request, read_credential_block,
+        render_credential_answer,
+    };
+
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let input = read_credential_block(&mut handle);
+    // `store`, `erase`, and future operations: read-only helper.
+    if operation != "get" {
+        return Ok(());
+    }
+    let Some(store) = runner_core::auth::store::AuthStore::default_store() else {
+        eprintln!("[runner::auth] git-credential: no HOME for secrets file; answering empty");
+        return Ok(());
+    };
+    let request = parse_credential_request(&input);
+    if let Some(credential) = git_credential_lookup(&store.load_all(), &request) {
+        print!(
+            "{}",
+            render_credential_answer(&credential.username, &credential.access_token)
+        );
+    }
     Ok(())
 }
 
@@ -2005,6 +2050,7 @@ async fn main() -> Result<()> {
                 cmd_auth_login(&config, &forge, url.as_deref(), no_browser).await?;
             }
             AuthCommands::Logout { forge } => cmd_auth_logout(forge.as_deref())?,
+            AuthCommands::GitCredential { operation } => cmd_auth_git_credential(&operation)?,
         },
         Commands::Audit { command } => match command {
             AuditCommands::Verify { file } => cmd_audit_verify(file)?,
@@ -2238,6 +2284,29 @@ mod tests {
             Commands::Auth {
                 command: AuthCommands::Logout { forge },
             } => assert_eq!(forge.as_deref(), Some("gitlab")),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_git_credential_parse() {
+        use clap::Parser;
+        // The operation is a free string (unknown future operations
+        // must parse so the helper can silently ignore them).
+        for op in ["get", "store", "erase", "capability"] {
+            let cli = Cli::try_parse_from(["runner", "auth", "git-credential", op]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Auth {
+                    command: AuthCommands::GitCredential { .. }
+                }
+            ));
+        }
+        let cli = Cli::try_parse_from(["runner", "auth", "git-credential", "get"]).unwrap();
+        match cli.command {
+            Commands::Auth {
+                command: AuthCommands::GitCredential { operation },
+            } => assert_eq!(operation, "get"),
             other => panic!("unexpected command: {other:?}"),
         }
     }

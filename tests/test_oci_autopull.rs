@@ -215,7 +215,7 @@ async fn agent_exec_auto_pulls_through_mock_registry() {
 /// nothing.
 #[tokio::test]
 async fn image_pull_list_prune_roundtrip() {
-    use runner_cli::image::{list_images, open_store, prune_cache, pull_image};
+    use runner_cli::commands::image::{list_images, open_store, prune_cache, pull_image};
 
     let registry = spawn_mock_registry().await;
     let dir = runner_core::test_support::TempDir::new("oci-image-cli").unwrap();
@@ -235,10 +235,10 @@ async fn image_pull_list_prune_roundtrip() {
     assert_eq!(listed[0].layers.len(), 2);
     assert!(listed[0].layers.iter().all(|layer| layer.present));
     assert_eq!(listed[0].size_bytes, outcome.bytes);
-    let text = runner_cli::image::render_list_text(&listed);
+    let text = runner_cli::commands::image::render_list_text(&listed);
     assert!(text.contains("e2e"), "{text}");
     let json: serde_json::Value =
-        serde_json::from_str(&runner_cli::image::render_list_json(&listed)).unwrap();
+        serde_json::from_str(&runner_cli::commands::image::render_list_json(&listed)).unwrap();
     assert_eq!(json[0]["layers"].as_array().unwrap().len(), 2);
 
     // Prune with a live record: nothing referenced goes.
@@ -258,7 +258,7 @@ async fn image_pull_list_prune_roundtrip() {
 /// Bad references fail closed before any network traffic.
 #[tokio::test]
 async fn image_pull_rejects_bad_reference() {
-    use runner_cli::image::{open_store, pull_image};
+    use runner_cli::commands::image::{open_store, pull_image};
 
     let registry = spawn_mock_registry().await;
     let dir = runner_core::test_support::TempDir::new("oci-image-badref").unwrap();

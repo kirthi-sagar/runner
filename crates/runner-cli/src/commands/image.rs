@@ -117,14 +117,14 @@ pub fn render_list_text(images: &[ListedImage]) -> String {
             "{} ({}, {})\n",
             image.reference,
             image.manifest_digest,
-            super::cache::format_bytes(image.size_bytes),
+            crate::cache::format_bytes(image.size_bytes),
         ));
         for layer in &image.layers {
             out.push_str(&format!(
                 "  {} {} {}\n",
                 if layer.present { "cached" } else { "missing" },
                 layer.digest,
-                super::cache::format_bytes(layer.size),
+                crate::cache::format_bytes(layer.size),
             ));
         }
     }
@@ -184,6 +184,56 @@ pub fn prune_cache(
         return Err(error);
     }
     Ok(outcome)
+}
+
+/// One image removal result inside a multi-target `rm`.
+pub struct RemoveReport {
+    pub reference: String,
+    pub outcome: Result<runner_sandbox::oci::cache::RemoveOutcome, String>,
+}
+
+/// Remove each image in order, continuing past failures (docker
+/// `rmi` semantics: every target attempted, the caller decides the
+/// exit code from the collected errors).
+pub fn remove_images(
+    store: &ImageStore,
+    cache: &LayerCache,
+    references: &[String],
+) -> Vec<RemoveReport> {
+    references
+        .iter()
+        .map(|reference| RemoveReport {
+            outcome: store.remove_image(cache, reference),
+            reference: reference.clone(),
+        })
+        .collect()
+}
+
+/// Human-readable per-image removal line.
+pub fn render_remove_text(report: &RemoveReport) -> String {
+    match &report.outcome {
+        Ok(outcome) => {
+            let layers = if outcome.shared_preserved == 1 {
+                "1 shared layer".to_string()
+            } else {
+                format!("{} shared layers", outcome.shared_preserved)
+            };
+            format!(
+                "Removed image '{}' (reclaimed {}, preserved {}).\n",
+                report.reference,
+                crate::cache::format_bytes(outcome.bytes_reclaimed),
+                layers,
+            )
+        }
+        Err(e) => format!("Cannot remove '{}': {e}\n", report.reference),
+    }
+}
+
+/// Interactive confirmation predicate: `y`/`yes` (any case,
+/// surrounding whitespace ignored) proceed; anything else —
+/// including EOF on piped stdin — skips (fail-closed default).
+pub fn confirm_remove_line(line: &str) -> bool {
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 #[cfg(test)]
@@ -301,5 +351,61 @@ mod tests {
         let outcome = prune_cache(&store, &cache, std::time::Duration::from_secs(3600)).unwrap();
         assert_eq!(outcome.tmps_removed, 0);
         assert!(cache.dir().join("live.tmp").exists());
+    }
+
+    #[test]
+    fn remove_multi_attempts_all_and_reports_each() {
+        use runner_sandbox::oci::cache::{StoredLayer, StoredManifest};
+        let (_dir, cache, store) = test_store("img-rm-multi");
+        std::fs::create_dir_all(cache.dir()).unwrap();
+        std::fs::write(cache.dir().join("a".repeat(64)), vec![1u8; 8]).unwrap();
+        for reference in ["gone:1", "also-gone:1"] {
+            store
+                .write_manifest(
+                    reference,
+                    &StoredManifest {
+                        reference: reference.to_string(),
+                        manifest_digest: "sha256:eeee".to_string(),
+                        layers: vec![StoredLayer {
+                            digest: format!("sha256:{}", "a".repeat(64)),
+                            size: 8,
+                        }],
+                        pulled_at_secs: 1,
+                    },
+                )
+                .unwrap();
+        }
+        // Two hits plus one miss: every target attempted in order.
+        let reports = remove_images(
+            &store,
+            &cache,
+            &[
+                "gone:1".to_string(),
+                "ghost:1".to_string(),
+                "also-gone:1".to_string(),
+            ],
+        );
+        assert_eq!(reports.len(), 3);
+        assert!(reports[0].outcome.is_ok());
+        assert!(reports[1].outcome.is_err());
+        assert!(reports[2].outcome.is_ok());
+        // First removal preserved the shared blob; the second
+        // reclaimed it (nothing references it anymore).
+        assert!(!cache.dir().join("a".repeat(64)).exists());
+        let ok = render_remove_text(&reports[0]);
+        assert!(ok.contains("Removed image 'gone:1'"), "{ok}");
+        assert!(ok.contains("preserved 1 shared layer"), "{ok}");
+        let err = render_remove_text(&reports[1]);
+        assert!(err.contains("Cannot remove 'ghost:1'"), "{err}");
+    }
+
+    #[test]
+    fn confirm_accepts_only_affirmative() {
+        for yes in ["y", "Y", "yes", "YES", "  y  "] {
+            assert!(confirm_remove_line(yes), "{yes:?}");
+        }
+        for no in ["", "n", "no", "yep", "ye", "yy"] {
+            assert!(!confirm_remove_line(no), "{no:?}");
+        }
     }
 }

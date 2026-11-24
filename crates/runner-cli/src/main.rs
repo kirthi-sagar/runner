@@ -385,6 +385,16 @@ enum ImageCommands {
     },
     /// Remove unreferenced layer blobs and stale staging files
     Prune,
+    /// Remove cached images, keeping blobs shared with survivors
+    #[command(alias = "rmi")]
+    Rm {
+        /// Image references to remove (repeatable)
+        #[arg(required = true)]
+        image: Vec<String>,
+        /// Skip interactive confirmation
+        #[arg(short, long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1266,7 +1276,7 @@ async fn cmd_cache_clear(all: bool, older_than: Option<u64>) -> Result<()> {
 
 /// `runner image pull`: resolve, download, verify, and record one image.
 async fn cmd_image_pull(config: &RunnerConfig, image: &str) -> Result<()> {
-    use runner_cli::image::{open_store, pull_image};
+    use runner_cli::commands::image::{open_store, pull_image};
 
     let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
     match pull_image(&cache, &store, image).await {
@@ -1289,7 +1299,9 @@ async fn cmd_image_pull(config: &RunnerConfig, image: &str) -> Result<()> {
 
 /// `runner image list`: cached images, layer digests, and disk usage.
 fn cmd_image_list(config: &RunnerConfig, format: &str) -> Result<()> {
-    use runner_cli::image::{list_images, open_store, render_list_json, render_list_text};
+    use runner_cli::commands::image::{
+        list_images, open_store, render_list_json, render_list_text,
+    };
 
     let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
     let images = list_images(&store, &cache);
@@ -1303,7 +1315,7 @@ fn cmd_image_list(config: &RunnerConfig, format: &str) -> Result<()> {
 
 /// `runner image prune`: drop unreferenced blobs and stale staging files.
 fn cmd_image_prune(config: &RunnerConfig) -> Result<()> {
-    use runner_cli::image::{open_store, prune_cache, PRUNE_TMP_GRACE};
+    use runner_cli::commands::image::{open_store, prune_cache, PRUNE_TMP_GRACE};
 
     let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
     match prune_cache(&store, &cache, PRUNE_TMP_GRACE) {
@@ -1322,6 +1334,46 @@ fn cmd_image_prune(config: &RunnerConfig) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// `runner image rm`: remove cached images (shared blobs survive).
+/// Without `--force`, each target needs an interactive `y`
+/// (piped stdin fails closed: EOF skips). Every target is
+/// attempted; any failure exits nonzero after the last report.
+fn cmd_image_rm(config: &RunnerConfig, images: &[String], force: bool) -> Result<()> {
+    use runner_cli::commands::image::{
+        confirm_remove_line, open_store, remove_images, render_remove_text,
+    };
+
+    let (cache, store) = open_store(config.sandbox.container.cache_dir.as_deref());
+    let mut targets = Vec::with_capacity(images.len());
+    for image in images {
+        if force {
+            targets.push(image.clone());
+            continue;
+        }
+        print!("Remove image '{image}'? [y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let confirmed = std::io::stdin().read_line(&mut line).is_ok() && confirm_remove_line(&line);
+        if confirmed {
+            targets.push(image.clone());
+        } else {
+            println!("skipped '{image}'");
+        }
+    }
+    let mut failed = false;
+    for report in remove_images(&store, &cache, &targets) {
+        if report.outcome.is_err() {
+            failed = true;
+        }
+        print!("{}", render_remove_text(&report));
+    }
+    if failed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// `runner swarm list`: daemon swarm sessions and pool usage.
@@ -1886,6 +1938,9 @@ async fn main() -> Result<()> {
             }
             ImageCommands::Prune => {
                 cmd_image_prune(&config)?;
+            }
+            ImageCommands::Rm { image, force } => {
+                cmd_image_rm(&config, &image, force)?;
             }
         },
         Commands::Exec {

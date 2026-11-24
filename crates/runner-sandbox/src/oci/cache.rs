@@ -185,6 +185,18 @@ pub struct StoredManifest {
     pub pulled_at_secs: u64,
 }
 
+/// Outcome of removing one cached image record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveOutcome {
+    pub reference: String,
+    /// Exclusive blobs deleted from disk.
+    pub blobs_removed: usize,
+    /// Bytes freed by those deletions.
+    pub bytes_reclaimed: u64,
+    /// Removed-image layers still referenced by other images.
+    pub shared_preserved: usize,
+}
+
 /// Per-image manifest records under `<cache>/images/`, keyed by
 /// percent-escaped reference (injective: distinct refs never share
 /// a file).
@@ -256,6 +268,73 @@ impl ImageStore {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Remove one image record, deleting only its exclusive blobs:
+    /// layers still referenced by remaining manifests are preserved
+    /// (reference-counted after the unlink). Unknown references fail
+    /// closed naming the list command.
+    pub fn remove_image(
+        &self,
+        cache: &LayerCache,
+        reference: &str,
+    ) -> Result<RemoveOutcome, String> {
+        let manifest = self
+            .read_manifest(reference)
+            .ok_or_else(|| format!("unknown image '{reference}' (see `runner image list`)"))?;
+        std::fs::remove_file(self.manifest_path(reference))
+            .map_err(|e| format!("cannot remove image '{reference}': {e}"))?;
+        // Reference-count the removed layers against every REMAINING
+        // manifest: only zero-count blobs are deleted.
+        let mut referenced = std::collections::HashSet::new();
+        for (_, live) in self.list_manifests() {
+            for layer in live.layers {
+                referenced.insert(layer.digest);
+            }
+        }
+        let mut outcome = RemoveOutcome {
+            reference: reference.to_string(),
+            blobs_removed: 0,
+            bytes_reclaimed: 0,
+            shared_preserved: 0,
+        };
+        let mut first_error: Option<String> = None;
+        for layer in manifest.layers {
+            if referenced.contains(&layer.digest) {
+                outcome.shared_preserved += 1;
+                continue;
+            }
+            let path = match cache.path_for(&layer.digest) {
+                Ok(path) => path,
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    continue;
+                }
+            };
+            // Missing blobs (partial cache) are already gone: no
+            // bytes, no error, no double count.
+            let bytes = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(_) => continue,
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    outcome.blobs_removed += 1;
+                    outcome.bytes_reclaimed += bytes;
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(format!("cannot remove layer {}: {e}", path.display()));
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(outcome)
     }
 
     /// Layer blobs on disk that no manifest record references.
@@ -392,6 +471,86 @@ mod tests {
         std::fs::write(&signpost, "operator note").unwrap();
         cache.ensure_dir().unwrap();
         assert_eq!(std::fs::read_to_string(&signpost).unwrap(), "operator note");
+    }
+
+    fn write_blob(cache: &LayerCache, hex: &str, bytes: &[u8]) -> String {
+        std::fs::create_dir_all(cache.dir()).unwrap();
+        std::fs::write(cache.dir().join(hex), bytes).unwrap();
+        format!("sha256:{hex}")
+    }
+
+    fn write_record(store: &ImageStore, reference: &str, layers: Vec<(String, u64)>) {
+        store
+            .write_manifest(
+                reference,
+                &StoredManifest {
+                    reference: reference.to_string(),
+                    manifest_digest: "sha256:bbbb".to_string(),
+                    layers: layers
+                        .into_iter()
+                        .map(|(digest, size)| StoredLayer { digest, size })
+                        .collect(),
+                    pulled_at_secs: 1,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn remove_image_keeps_shared_blobs_deletes_exclusive() {
+        let dir = runner_core::test_support::TempDir::new("layer-rm").unwrap();
+        let cache = LayerCache::new(dir.path().join("layers"));
+        let store = ImageStore::new(cache.dir());
+        let shared = write_blob(&cache, &"a".repeat(64), &[1u8; 16]);
+        let only_b = write_blob(&cache, &"b".repeat(64), &[2u8; 32]);
+        write_record(&store, "img-a:1", vec![(shared.clone(), 16)]);
+        write_record(
+            &store,
+            "img-b:1",
+            vec![(shared.clone(), 16), (only_b.clone(), 32)],
+        );
+        let outcome = store.remove_image(&cache, "img-b:1").unwrap();
+        assert_eq!(
+            outcome,
+            RemoveOutcome {
+                reference: "img-b:1".to_string(),
+                blobs_removed: 1,
+                bytes_reclaimed: 32,
+                shared_preserved: 1,
+            }
+        );
+        // Exclusive blob gone, shared blob and survivor record stay.
+        assert!(!cache.path_for(&only_b).unwrap().exists());
+        assert!(cache.path_for(&shared).unwrap().exists());
+        assert!(store.read_manifest("img-a:1").is_some());
+        assert!(store.read_manifest("img-b:1").is_none());
+    }
+
+    #[test]
+    fn remove_image_missing_reference_fails_gracefully() {
+        let dir = runner_core::test_support::TempDir::new("layer-rm-missing").unwrap();
+        let cache = LayerCache::new(dir.path().join("layers"));
+        let store = ImageStore::new(cache.dir());
+        let err = store.remove_image(&cache, "ghost:latest").unwrap_err();
+        assert!(err.contains("unknown image 'ghost:latest'"), "{err}");
+        assert!(err.contains("runner image list"), "{err}");
+    }
+
+    #[test]
+    fn remove_image_tolerates_partial_cache() {
+        let dir = runner_core::test_support::TempDir::new("layer-rm-partial").unwrap();
+        let cache = LayerCache::new(dir.path().join("layers"));
+        let store = ImageStore::new(cache.dir());
+        // Record references a blob never downloaded: removal still
+        // succeeds, reclaiming nothing.
+        write_record(
+            &store,
+            "thin:1",
+            vec![(format!("sha256:{}", "d".repeat(64)), 64)],
+        );
+        let outcome = store.remove_image(&cache, "thin:1").unwrap();
+        assert_eq!(outcome.blobs_removed, 0);
+        assert_eq!(outcome.bytes_reclaimed, 0);
     }
 
     #[test]

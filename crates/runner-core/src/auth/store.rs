@@ -768,6 +768,18 @@ mod tests {
     }
 
     #[test]
+    fn clear_forge_on_unreadable_unlinks_without_reading() {
+        let dir = crate::test_support::TempDir::new("auth-clear-corrupt").unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, "{junk").unwrap();
+        let store = AuthStore::new(path.clone());
+        // Logout revokes unknown secrets instead of stranding them.
+        assert!(store.clear_forge("github.com").unwrap());
+        assert!(!path.exists());
+        assert!(!store.clear_forge("github.com").unwrap());
+    }
+
+    #[test]
     fn auth_store_migrates_legacy_single_token() {
         let dir = crate::test_support::TempDir::new("auth-migrate").unwrap();
         let path = dir.path().join("auth.json");

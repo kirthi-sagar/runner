@@ -22,9 +22,41 @@ pub fn browser_command() -> (&'static str, &'static [&'static str]) {
     }
 }
 
+/// Shell metacharacters that must never reach a command line.
+/// (`%` covers `cmd.exe` `%VAR%` expansion and `;` sh-style chaining;
+/// both are legal in URLs, but forge verification URIs never need
+/// either, so both fail closed.)
+const URL_FORBIDDEN: [char; 10] = ['&', '|', ';', '<', '>', '^', '%', '"', '\'', ' '];
+
+/// Validate a forge-supplied URL before handing it to the OS
+/// opener: strict `http(s)` shape, non-empty host, and no shell
+/// metacharacters or whitespace (a compromised forge must not turn
+/// `cmd /C start` into command execution). Tab/newline control
+/// characters fail closed alongside spaces.
+pub fn validate_browser_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| format!("verification URL is not http(s): '{url}'"))?;
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() {
+        return Err(format!("verification URL has no host: '{url}'"));
+    }
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || URL_FORBIDDEN.contains(&c))
+    {
+        return Err("verification URL contains shell metacharacters".to_string());
+    }
+    Ok(())
+}
+
 /// Best-effort browser launch (callers fall back to printing the
-/// URL when this fails — headless hosts, missing opener).
+/// URL when this fails — headless hosts, missing opener). The URL
+/// is validated first so a hostile forge response can never become
+/// command execution.
 pub fn open_browser(url: &str) -> std::io::Result<()> {
+    validate_browser_url(url).map_err(std::io::Error::other)?;
     let (program, prefix) = browser_command();
     let status = std::process::Command::new(program)
         .args(prefix)
@@ -194,6 +226,40 @@ mod tests {
         )]);
         assert!(bare.contains("no scopes granted"), "{bare}");
         assert!(render_multi_status(&[]).contains("not signed in"));
+    }
+
+    #[test]
+    fn browser_urls_reject_commands_and_accept_forges() {
+        for ok in [
+            "https://github.com/login/device",
+            "https://git.example.com/oauth/authorize?x=1",
+            "http://127.0.0.1:9/activate",
+        ] {
+            assert!(validate_browser_url(ok).is_ok(), "{ok}");
+        }
+        // Every command separator / substitution vector fails closed.
+        for evil in [
+            "https://h/x&whoami",
+            "https://h/x|whoami",
+            "https://h/x;whoami",
+            "https://h/<x",
+            "https://h/x>y",
+            "https://h/^x",
+            "https://h/%PATH%",
+            "https://h/\"x\"",
+            "https://h/x y",
+            "https://h/x\ty",
+            "https://h/x\ny",
+            "calc.exe",
+            "",
+            "https://",
+            "file:///etc/passwd",
+            "ftp://h/x",
+        ] {
+            assert!(validate_browser_url(evil).is_err(), "{evil:?}");
+        }
+        // The opener itself enforces validation (never spawns junk).
+        assert!(open_browser("https://h/x&whoami").is_err());
     }
 
     #[test]

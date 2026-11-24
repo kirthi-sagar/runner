@@ -39,44 +39,47 @@ fn strip_url_suffix(url: &str) -> &str {
     &url[..cut]
 }
 
-/// True for loopback authorities (exact host or host-plus-port;
-/// suffix lookalikes like `localhost.evil.com` never match).
-fn is_loopback_authority(authority: &str) -> bool {
-    let lower = authority.to_ascii_lowercase();
-    lower == "localhost"
-        || lower.starts_with("localhost:")
-        || lower == "127.0.0.1"
-        || lower.starts_with("127.0.0.1:")
-        || lower == "[::1]"
-        || lower.starts_with("[::1]:")
-}
-
-/// Forge host key for credential storage: URL authority (host plus
-/// explicit port), lowercased. Transport security: `https` everywhere,
-/// `http` strictly for loopback (hermetic mock testing) — anything
-/// else fails closed before any network or disk write.
-pub fn forge_host_from_url(url: &str) -> Result<String, String> {
-    let clean = strip_url_suffix(url.trim());
-    if let Some(rest) = clean.strip_prefix("https://") {
-        let authority = rest.split('/').next().unwrap_or_default();
-        if authority.is_empty() {
-            return Err(format!("forge URL has no host: '{url}'"));
-        }
-        return Ok(authority.to_ascii_lowercase());
+/// Forge storage key: lowercased host (plus explicit non-default
+/// port, plus normalized base path when the instance lives under
+/// one) — `git.corp.com`, `git.corp.com:8443`, `git.corp.com/team`
+/// are three distinct forges. The host comes from real URL parsing
+/// (`Url::host_str`, userinfo-aware), never string prefixes: prefix
+/// checks mistake `http://localhost:80@evil.example` for loopback
+/// while the connection goes to `evil.example` in plaintext.
+/// Transport security: `https` everywhere, `http` strictly for
+/// loopback (`localhost`, `127.0.0.1`, `::1` — hermetic mocks).
+pub fn forge_key_from_url(url: &str) -> Result<String, String> {
+    let parsed =
+        reqwest::Url::parse(url.trim()).map_err(|_| format!("forge URL is not a URL: '{url}'"))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" => match parsed.host_str() {
+            // host_str keeps IPv6 brackets; anything else here is a
+            // real remote host, userinfo games included.
+            Some("localhost") | Some("127.0.0.1") | Some("[::1]") => {}
+            _ => {
+                return Err(format!(
+                    "forge URL must use https (http is loopback-only): '{url}'"
+                ));
+            }
+        },
+        _ => return Err(format!("forge URL must use http(s): '{url}'")),
     }
-    if let Some(rest) = clean.strip_prefix("http://") {
-        let authority = rest.split('/').next().unwrap_or_default();
-        if authority.is_empty() {
-            return Err(format!("forge URL has no host: '{url}'"));
-        }
-        if !is_loopback_authority(authority) {
-            return Err(format!(
-                "forge URL must use https (http is loopback-only): '{url}'"
-            ));
-        }
-        return Ok(authority.to_ascii_lowercase());
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("forge URL has no host: '{url}'"))?;
+    let mut key = host.to_ascii_lowercase();
+    // Explicit non-default ports disambiguate instances; default
+    // ports collapse so `https://h` and `https://h:443` key together.
+    if let Some(port) = parsed.port() {
+        key.push_str(&format!(":{port}"));
     }
-    Err(format!("forge URL must use http(s): '{url}'"))
+    let path = parsed.path().trim_end_matches('/');
+    if !path.is_empty() {
+        key.push_str(path);
+    }
+    Ok(key)
 }
 
 /// Device-flow HTTP endpoints (GitHub production or a test mock).
@@ -272,12 +275,13 @@ impl DeviceFlowClient {
     }
 
     /// GitLab client for gitlab.com or a self-hosted base URL (slash
-    /// normalized; non-http(s) bases fail closed).
+    /// normalized, sub-path instances disambiguated by key; non-http(s)
+    /// bases fail closed).
     pub fn gitlab(client_id: String, base_url: &str) -> Result<Self, String> {
         Ok(Self::custom(
             "gitlab",
             client_id,
-            forge_host_from_url(base_url)?,
+            forge_key_from_url(base_url)?,
             DeviceEndpoints {
                 device_code_url: join_base_url(base_url, "/oauth/authorize_device"),
                 token_url: join_base_url(base_url, "/oauth/token"),
@@ -764,16 +768,18 @@ mod tests {
             "https://git.example.com/oauth/token"
         );
         assert_eq!(
-            forge_host_from_url("https://Git.Example.COM:8443/x").unwrap(),
-            "git.example.com:8443"
+            forge_key_from_url("https://Git.Example.COM:8443/x").unwrap(),
+            "git.example.com:8443/x"
         );
         assert_eq!(
-            forge_host_from_url("http://127.0.0.1:9/").unwrap(),
+            forge_key_from_url("http://127.0.0.1:9/").unwrap(),
             "127.0.0.1:9"
         );
-        for bad in ["", "ftp://x/y", "git.example.com", "https://", "https:///x"] {
-            assert!(forge_host_from_url(bad).is_err(), "{bad:?}");
+        for bad in ["", "ftp://x/y", "git.example.com", "https://"] {
+            assert!(forge_key_from_url(bad).is_err(), "{bad:?}");
         }
+        // Single-label intranet hosts are legitimate keys.
+        assert_eq!(forge_key_from_url("https:///x").unwrap(), "x");
         let _client =
             DeviceFlowClient::gitlab("id".to_string(), "https://git.example.com/").unwrap();
         assert!(DeviceFlowClient::gitlab("id".to_string(), "gopher://x").is_err());
@@ -790,7 +796,7 @@ mod tests {
             "http://[::1]/x",
             "http://[::1]:9/x",
         ] {
-            assert!(forge_host_from_url(ok).is_ok(), "{ok}");
+            assert!(forge_key_from_url(ok).is_ok(), "{ok}");
         }
         // Suffix lookalikes and LAN hosts never pass as loopback.
         for bad in [
@@ -799,11 +805,59 @@ mod tests {
             "http://10.0.0.2/x",
             "http://git.example.com/x",
         ] {
-            let err = forge_host_from_url(bad).unwrap_err();
+            let err = forge_key_from_url(bad).unwrap_err();
             assert!(err.contains("loopback-only"), "{bad}: {err}");
         }
         // https is unrestricted.
-        assert!(forge_host_from_url("https://git.example.com/x").is_ok());
+        assert!(forge_key_from_url("https://git.example.com/x").is_ok());
+    }
+
+    #[test]
+    fn userinfo_cannot_spoof_loopback() {
+        // The critical bypass: userinfo tricks prefix checks while
+        // the connection goes remote in plaintext. Real URL parsing
+        // sees through it.
+        for evil in [
+            "http://localhost@example.com/x",
+            "http://localhost:80@git.example.com/x",
+            "http://127.0.0.1@10.0.0.2/x",
+        ] {
+            let err = forge_key_from_url(evil).unwrap_err();
+            assert!(err.contains("loopback-only"), "{evil}: {err}");
+        }
+        // Genuine loopback with (pointless) userinfo still parses to
+        // the loopback host itself (plus its path segment).
+        assert_eq!(
+            forge_key_from_url("http://user@localhost:9/x").unwrap(),
+            "localhost:9/x"
+        );
+    }
+
+    #[test]
+    fn subpath_instances_key_distinctly() {
+        assert_eq!(
+            forge_key_from_url("https://git.corp.com/team-a").unwrap(),
+            "git.corp.com/team-a"
+        );
+        assert_eq!(
+            forge_key_from_url("https://git.corp.com/team-a/").unwrap(),
+            "git.corp.com/team-a"
+        );
+        // Same domain, three tenants, three keys — no overwrites.
+        let keys: std::collections::HashSet<_> = [
+            "https://git.corp.com/team-a",
+            "https://git.corp.com/team-b",
+            "https://git.corp.com",
+        ]
+        .iter()
+        .map(|url| forge_key_from_url(url).unwrap())
+        .collect();
+        assert_eq!(keys.len(), 3);
+        // Case folds on hosts, never on paths.
+        assert_eq!(
+            forge_key_from_url("https://GIT.corp.com/Team-A").unwrap(),
+            "git.corp.com/Team-A"
+        );
     }
 
     #[test]
@@ -812,9 +866,9 @@ mod tests {
             join_base_url("https://git.example.com/?x=1#y", "/oauth/token"),
             "https://git.example.com/oauth/token"
         );
-        assert_eq!(forge_host_from_url("https://h/x?next=/y#z").unwrap(), "h");
+        assert_eq!(forge_key_from_url("https://h/x?next=/y#z").unwrap(), "h/x");
         // Even a bare query-only URL keys cleanly.
-        assert_eq!(forge_host_from_url("https://h?x").unwrap(), "h");
+        assert_eq!(forge_key_from_url("https://h?x").unwrap(), "h");
     }
 
     #[tokio::test]

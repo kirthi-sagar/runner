@@ -415,13 +415,14 @@ function actionStatus(msg, isErr) {
 function authHeader() {
   return { "Authorization": "Bearer " + streamState.token };
 }
-async function fetchRole(token) {
+async function fetchRole(token, myId) {
   try {
     var res = await fetch("/api/v1/whoami", {
       headers: { "Authorization": "Bearer " + token }
     });
     if (!res.ok) return null;
     var me = await res.json();
+    if (isStale(token, myId)) return null;
     return (me && me.role) || null;
   } catch (e) { return null; }
 }
@@ -504,7 +505,7 @@ function renderJobs(jobs) {
     return;
   }
   if (!jobs.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no active jobs — the fleet is idle</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no active jobs on this host</td></tr>';
     return;
   }
   var now = Date.now();
@@ -671,8 +672,10 @@ async function consumeStream(token, myId) {
   }
   clearTimeout(connectTimer);
   if (res.status === 401) {
+    if (isStale(token, myId)) return;
+    streamState.live = false;
     setBadge("stream", "unauthorized", "bad");
-    streamBanner("token rejected (tokens rotate every restart) — paste the fresh console token, then Connect");
+    streamBanner("session rejected or expired — paste a fresh console token and Connect, or sign in via SSO");
     clearToken();
     streamState.token = null;
     streamState.role = null;
@@ -682,6 +685,8 @@ async function consumeStream(token, myId) {
     return;
   }
   if (res.status === 403) {
+    if (isStale(token, myId)) return;
+    streamState.live = false;
     setBadge("stream", "forbidden", "bad");
     streamBanner("this token needs the operator role");
     return;
@@ -734,13 +739,14 @@ function connect(token) {
   // buttons never linger enabled for a weaker grant.
   streamState.role = null;
   paintStaticButtons();
-  fetchRole(token).then(function (role) {
-    if (token !== streamState.token) return;
+  var myId = streamState.activeId;
+  fetchRole(token, myId).then(function (role) {
+    if (isStale(token, myId)) return;
     streamState.role = role || "viewer";
     paintStaticButtons();
     if (streamState.lastEvent) renderTables(streamState.lastEvent);
   });
-  consumeStream(token, streamState.activeId);
+  consumeStream(token, myId);
 }
 function disconnect(silent) {
   streamState.token = null;

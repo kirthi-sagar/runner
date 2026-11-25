@@ -27,10 +27,14 @@ microVMs (no Firecracker/KVM).
 
 ### Egress filtering (WFP, v2.6.0)
 
-Native enforcement of the shared egress contract: RFC 1918,
-link-local, and ULA destinations are dropped; only DNS (UDP 53)
-and public HTTPS (TCP 443) are allowed; everything else drops —
-parity with the Linux eBPF boundary. Filters attach at the
+Native enforcement of the shared egress contract: RFC 1918
+(`10/8`, `172.16/12`, `192.168/16`), IPv4 link-local
+(`169.254.0.0/16`, including cloud metadata), and IPv6 ULA
+(`fc00::/7`) destinations are dropped; only DNS (UDP 53) and
+HTTPS (TCP 443) are allowed; everything else drops — the
+identical contract Linux enforces, `fe80::/10` included: neither
+side blocks IPv6 link-local, so it stays reachable on the
+permitted ports and drops everywhere else. Filters attach at the
 outbound-connect authorize layers
 (`FWPM_LAYER_ALE_AUTH_CONNECT_V4`/`_V6`) via user-mode `fwpuclnt`
 APIs only (no callout driver), optionally scoped to one image via
@@ -79,7 +83,13 @@ filesystem).
 ## Windows governor (Job Objects, v2.0.0)
 
 Unprivileged Win32 throughout: no entitlements, no drivers, no
-hypervisor. Three layers, mirroring the Linux governor:
+hypervisor — with one exception. Filtered jobs
+(`security.network_egress_filtering = true`, the default) need
+WFP permissions (Administrator rights) to install their egress
+filters; without them the job fails closed (`Access is denied (os
+error 5)`), so unprivileged runs must set
+`network_egress_filtering = false` in config. Three layers,
+mirroring the Linux governor:
 
 - **Sensor.** Memory pressure from `GlobalMemoryStatusEx` (load
   percentage plus commit-limit headroom); CPU utilization from

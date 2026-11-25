@@ -98,6 +98,20 @@ fn asset_pattern_matches_release_matrix() {
 }
 
 #[test]
+fn windows_installer_pins_runnerhq_repo() {
+    let ps1 = read("install.ps1");
+    // The native installer must fetch releases from this repo.
+    assert!(
+        ps1.contains("$repo = 'runnerhq/runner'"),
+        "install.ps1 repo pin drifted"
+    );
+    assert!(
+        ps1.contains("https://raw.githubusercontent.com/runnerhq/runner/main/install.ps1"),
+        "install.ps1 bootstrap URL drifted"
+    );
+}
+
+#[test]
 fn checksum_verifies_before_extract() {
     let sh = read("install.sh");
     let fetch_sum = sh

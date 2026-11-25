@@ -5,94 +5,276 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
 <title>runner fleet dashboard</title>
+<script>
+"use strict";
+/* Paint the saved theme before first render (no flash). */
+try {
+  var t = localStorage.getItem("runner.theme");
+  if (t !== "light" && t !== "dark") {
+    t = (window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches)
+      ? "light" : "dark";
+  }
+  document.documentElement.dataset.theme = t;
+} catch (e) { document.documentElement.dataset.theme = "dark"; }
+</script>
 <style>
   :root {
-    --bg: #0d1117; --panel: #161b22; --border: #30363d;
-    --fg: #e6edf3; --muted: #8b949e;
-    --green: #3fb950; --yellow: #d29922; --red: #f85149; --accent: #58a6ff;
+    --bg0: #05080f; --bg1: #0a1120;
+    --panel: rgba(148, 163, 184, 0.055);
+    --panel-solid: #0c1424; --border: rgba(148, 163, 184, 0.16);
+    --fg: #e9eff8; --muted: #8fa0b5; --faint: #5b6b82;
+    --green: #3ddc84; --yellow: #f5b83d; --red: #ff6b6b;
+    --accent: #38e0c8; --accent2: #7aa8ff;
+    --radius: 14px;
+    color-scheme: dark;
   }
+  /* Runner design system: light theme mirrors every dark token so
+     components never branch on theme. Toggle persists to localStorage. */
+  [data-theme="light"] {
+    --bg0: #e9eef6; --bg1: #f7fafd;
+    --panel: rgba(255, 255, 255, 0.78);
+    --panel-solid: #ffffff; --border: rgba(15, 35, 70, 0.13);
+    --fg: #0e1626; --muted: #54667e; --faint: #93a3b8;
+    --green: #0d9d61; --yellow: #b97a0c; --red: #d64545;
+    --accent: #0e9f85; --accent2: #2f6fed;
+    color-scheme: light;
+  }
+  [data-theme="light"] body {
+    background:
+      radial-gradient(1100px 420px at 12% -8%, rgba(14, 159, 133, 0.10), transparent 60%),
+      radial-gradient(900px 380px at 88% -6%, rgba(47, 111, 237, 0.10), transparent 60%),
+      linear-gradient(var(--bg1), var(--bg0));
+  }
+  [data-theme="light"] header { background: rgba(255, 255, 255, 0.82); }
+  [data-theme="light"] .badge { background: rgba(15, 35, 70, 0.04); }
+  [data-theme="light"] header input { background: rgba(255, 255, 255, 0.9); }
+  [data-theme="light"] header button {
+    background: linear-gradient(135deg,
+      rgba(14, 159, 133, 0.12), rgba(47, 111, 237, 0.12)); }
+  [data-theme="light"] thead th { background: rgba(247, 250, 253, 0.95); }
+  [data-theme="light"] tbody tr:hover { background: rgba(15, 35, 70, 0.035); }
+  [data-theme="light"] .bar { background: rgba(15, 35, 70, 0.08); }
+  [data-theme="light"] .card { box-shadow: 0 1px 2px rgba(15, 35, 70, 0.06),
+    0 8px 24px rgba(15, 35, 70, 0.06); }
+  [data-theme="light"] .badge.ok { background: rgba(13, 157, 97, 0.10); }
+  [data-theme="light"] .badge.bad { background: rgba(214, 69, 69, 0.10); }
+  [data-theme="light"] .badge.warn { background: rgba(185, 122, 12, 0.12); }
+  [data-theme="light"] .pill { background: rgba(14, 159, 133, 0.12); }
+  [data-theme="light"] main button.btn-danger { color: #b33737; }
+  [data-theme="light"] main button { background: rgba(255, 255, 255, 0.9); }
+  [data-theme="light"] .empty { color: var(--muted); }
+  [data-theme="light"] #conn { background: linear-gradient(90deg, #b3402e, #d6543c, #b3402e); }
+  #theme-toggle { padding: 6px 10px; }
+  #theme-toggle .icon-sun { display: none; }
+  [data-theme="light"] #theme-toggle .icon-sun { display: inline; }
+  [data-theme="light"] #theme-toggle .icon-moon { display: none; }
+  #theme-toggle svg { vertical-align: -2px; }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-    font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; align-items: center; gap: 12px;
-    padding: 12px 20px; border-bottom: 1px solid var(--border);
-    background: var(--panel); }
-  header .logo { font-size: 20px; font-weight: 700; }
-  .badge { font-size: 12px; padding: 2px 10px; border-radius: 999px;
-    border: 1px solid var(--border); color: var(--muted); }
-  .badge.ok { color: var(--green); border-color: var(--green); }
-  .badge.bad { color: var(--red); border-color: var(--red); }
+  body { margin: 0; color: var(--fg);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Inter, Roboto, "Helvetica Neue", sans-serif;
+    background:
+      radial-gradient(1100px 420px at 12% -8%, rgba(56, 224, 200, 0.10), transparent 60%),
+      radial-gradient(900px 380px at 88% -6%, rgba(122, 168, 255, 0.12), transparent 60%),
+      radial-gradient(700px 500px at 50% 110%, rgba(61, 220, 132, 0.06), transparent 60%),
+      linear-gradient(var(--bg1), var(--bg0));
+    background-attachment: fixed;
+    min-height: 100vh; }
+  header { position: sticky; top: 0; z-index: 20;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 22px; border-bottom: 1px solid var(--border);
+    background: rgba(7, 11, 20, 0.82);
+    -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); }
+  header .logo { display: flex; align-items: center; gap: 10px;
+    font-size: 19px; font-weight: 800; letter-spacing: -0.01em; }
+  header .logo .mark { width: 30px; height: 30px; border-radius: 9px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: #05080f;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    box-shadow: 0 2px 14px rgba(56, 224, 200, 0.35); }
+  .hero { display: block; width: 150px; height: auto; margin: 0 auto 4px;
+    color: var(--fg); }
+  .hero-disc { fill: var(--accent); opacity: 0.14; }
+  .hero-lines { fill: none; stroke: var(--accent); stroke-width: 3;
+    stroke-linecap: round; opacity: 0.7; }
+  .hero-ground { fill: none; stroke: var(--faint); stroke-width: 2;
+    stroke-linecap: round; opacity: 0.6; }
+  header .logo small { display: block; font-size: 10px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.14em; }
+  .badge { display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; font-weight: 600; padding: 3px 12px 3px 9px;
+    border-radius: 999px; border: 1px solid var(--border);
+    color: var(--muted); background: rgba(148, 163, 184, 0.06);
+    white-space: nowrap; }
+  .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--faint); flex: none; }
+  .badge.ok { color: var(--green); border-color: rgba(61, 220, 132, 0.45); }
+  .badge.ok::before { background: var(--green);
+    box-shadow: 0 0 8px var(--green); }
+  .badge.bad { color: var(--red); border-color: rgba(255, 107, 107, 0.5); }
+  .badge.bad::before { background: var(--red);
+    box-shadow: 0 0 8px var(--red); }
+  .badge.warn { color: var(--yellow); border-color: rgba(245, 184, 61, 0.45); }
+  .badge.warn::before { background: var(--yellow);
+    box-shadow: 0 0 8px var(--yellow); }
+  #stream.ok::before { animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
   header .spacer { flex: 1; }
-  header a.sso { color: var(--accent); text-decoration: none; font-size: 13px; }
-  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
-  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
-  .card { background: var(--panel); border: 1px solid var(--border);
-    border-radius: 8px; padding: 14px 16px; }
-  .card .label { font-size: 12px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 0.04em; }
-  .card .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
-  section { margin-top: 20px; }
-  section h2 { font-size: 15px; margin: 0 0 10px; color: var(--muted);
-    text-transform: uppercase; letter-spacing: 0.04em; }
-  .gauge { margin: 8px 0; }
+  header .auth { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  header a.sso { color: var(--accent); text-decoration: none; font-size: 13px;
+    font-weight: 600; padding: 4px 6px; border-radius: 6px; }
+  header a.sso:hover { text-decoration: underline; }
+  main { padding: 26px 22px 40px; max-width: 1180px; margin: 0 auto; }
+  .kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+  .card { position: relative; background: var(--panel);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 16px 18px; overflow: hidden; }
+  .kpis .card::after, .meters .card::after { content: ""; position: absolute;
+    top: 0; left: 18px; right: 18px; height: 2px; border-radius: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0.55; }
+  .card .label { display: flex; align-items: center; gap: 7px;
+    font-size: 11px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.09em; }
+  .card .label svg { opacity: 0.75; flex: none; }
+  .card .value { font-size: 29px; font-weight: 800; letter-spacing: -0.02em;
+    margin-top: 6px; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  section { margin-top: 26px; }
+  section h2 { display: flex; align-items: baseline; gap: 10px;
+    font-size: 13px; font-weight: 700; margin: 0 0 12px; color: var(--fg);
+    text-transform: uppercase; letter-spacing: 0.1em; }
+  section h2::after { content: ""; flex: 1; height: 1px;
+    background: linear-gradient(90deg, var(--border), transparent); }
+  .gauge { margin: 10px 0; }
   .gauge .row { display: flex; justify-content: space-between;
-    font-size: 13px; margin-bottom: 4px; }
-  .bar { height: 10px; border-radius: 999px; background: #21262d; }
-  .bar > div { height: 100%; border-radius: 999px; background: var(--green);
-    transition: width 0.5s; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 10px;
+    font-size: 13px; margin-bottom: 6px; color: var(--muted); }
+  .gauge .row span:last-child { color: var(--fg); font-weight: 700;
+    font-variant-numeric: tabular-nums; }
+  .bar { height: 12px; border-radius: 999px; padding: 2px;
+    background: rgba(5, 8, 15, 0.7);
+    border: 1px solid var(--border); }
+  .bar > div { height: 100%; border-radius: 999px;
+    background: var(--fill, var(--faint));
+    box-shadow: 0 0 10px var(--fill, transparent);
+    transition: width 0.5s ease; min-width: 0; }
+  .table-card { padding: 6px 0; overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px;
+    min-width: 560px; }
+  th, td { text-align: left; padding: 10px 18px;
     border-bottom: 1px solid var(--border); }
-  th { color: var(--muted); font-weight: 600; }
-  .empty { color: var(--muted); padding: 16px; text-align: center; }
-  #conn { display: none; background: var(--red); color: #fff; text-align: center;
-    padding: 6px; font-size: 13px; }
-  header input { background: #0d1117; border: 1px solid var(--border);
-    color: var(--fg); border-radius: 6px; padding: 4px 10px;
-    font-size: 13px; width: 200px; }
-  header button { background: var(--panel); border: 1px solid var(--border);
-    color: var(--fg); border-radius: 6px; padding: 4px 12px;
-    font-size: 13px; cursor: pointer; }
-  header button:hover { border-color: var(--accent); }
-  main button { background: var(--panel); border: 1px solid var(--border);
-    color: var(--fg); border-radius: 6px; padding: 2px 10px;
-    font-size: 12px; cursor: pointer; }
-  main button:hover:not(:disabled) { border-color: var(--accent); }
-  main button:disabled { opacity: 0.45; cursor: not-allowed; }
+  thead th { position: sticky; top: 0; color: var(--muted);
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.08em; background: rgba(12, 20, 36, 0.9); }
+  tbody tr { transition: background 0.15s; }
+  tbody tr:hover { background: rgba(148, 163, 184, 0.05); }
+  tbody tr:last-child td { border-bottom: none; }
+  .empty { color: var(--faint); padding: 22px; text-align: center;
+    font-style: italic; }
+  .pill { display: inline-block; font-size: 12px; font-weight: 700;
+    padding: 1px 10px; border-radius: 999px;
+    color: var(--accent); background: rgba(56, 224, 200, 0.1);
+    border: 1px solid rgba(56, 224, 200, 0.35); }
+  #conn { display: none; text-align: center; padding: 8px;
+    font-size: 13px; font-weight: 600; color: #fff;
+    background: linear-gradient(90deg, #7f2d2d, #b3402e, #7f2d2d); }
+  header input { background: rgba(5, 8, 15, 0.8); border: 1px solid var(--border);
+    color: var(--fg); border-radius: 9px; padding: 6px 12px;
+    font-size: 13px; width: 190px; }
+  header input:focus { outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(56, 224, 200, 0.18); }
+  header button { background: linear-gradient(135deg,
+      rgba(56, 224, 200, 0.16), rgba(122, 168, 255, 0.16));
+    border: 1px solid rgba(56, 224, 200, 0.4); color: var(--fg);
+    border-radius: 9px; padding: 6px 14px; font-size: 13px; font-weight: 700;
+    cursor: pointer; }
+  header button:hover { border-color: var(--accent);
+    box-shadow: 0 0 12px rgba(56, 224, 200, 0.25); }
+  main button { background: rgba(148, 163, 184, 0.08);
+    border: 1px solid var(--border); color: var(--fg);
+    border-radius: 8px; padding: 4px 12px; font-size: 12px; font-weight: 600;
+    cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s; }
+  main button:hover:not(:disabled) { border-color: var(--accent);
+    box-shadow: 0 0 10px rgba(56, 224, 200, 0.2); }
+  main button:disabled { opacity: 0.4; cursor: not-allowed; }
+  main button.btn-danger { color: #ffb4b4;
+    border-color: rgba(255, 107, 107, 0.35); }
+  main button.btn-danger:hover:not(:disabled) { border-color: var(--red);
+    box-shadow: 0 0 10px rgba(255, 107, 107, 0.2); }
+  main button:focus-visible, header button:focus-visible,
+  header input:focus-visible, header a.sso:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; }
   .meters { display: grid; grid-template-columns: repeat(4, 1fr);
     gap: 12px; }
-  .mono { font-variant-numeric: tabular-nums; }
-  .note { color: var(--muted); font-size: 12px; font-weight: 400;
+  .mono { font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-size: 12.5px; }
+  .note { color: var(--faint); font-size: 12px; font-weight: 400;
     text-transform: none; letter-spacing: normal; }
   #storewarn { display: none; }
+  .actions { margin-top: 12px; display: flex; gap: 8px; align-items: center;
+    flex-wrap: wrap; }
+  #action-status { color: var(--muted); font-size: 13px; }
+  footer { margin-top: 30px; padding-top: 14px;
+    border-top: 1px solid var(--border); color: var(--faint);
+    font-size: 12px; display: flex; gap: 8px; align-items: center; }
+  footer .dotsep::before { content: "·"; margin-right: 8px; }
+  @media (max-width: 1100px) { .kpis { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 760px) {
+    .kpis, .meters { grid-template-columns: repeat(2, 1fr); }
+    main { padding: 18px 14px 32px; }
+    header input { width: 140px; }
+  }
+  @media (max-width: 480px) { .kpis, .meters { grid-template-columns: 1fr; } }
   @media (prefers-reduced-motion: reduce) {
-    .bar > div { transition: none; }
+    .bar > div, tbody tr, main button { transition: none; }
+    #stream.ok::before { animation: none; }
   }
 </style>
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<g id="dash-bird" fill="currentColor">
+<path d="M25 11.5 31 14l-6 2.5-.8-1.2 3.4-.9-3-1-.4-1.9z"/>
+<path d="M22.5 9.5c1.8 0 3 1.4 3 3.2s-1.2 3.3-3 3.3c-2.4 0-4.5-1.2-5.9-3.2 1.2-1.9 3.3-3.3 5.9-3.3z"/>
+<path d="M21 10 15 2.5 17.5 10.5 12 6l3 5.5L21 10z"/>
+<path d="M20 15.5c-4.5.8-9 3.5-12.5 8.5l6-.8c3-2.3 5.5-4.3 8-5.5l-1.5-2.2z"/>
+<path d="M9.5 22 3 20.5l5.5 3L9.5 22zM10.5 24.5 4.5 26l5-.4 1-1.1z"/>
+<path d="M15.5 23.5 14 28.5h-2.5M18.5 22.5l1 5 2.5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M2.5 7.5h5M1.5 11h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".55"/>
+</g>
+<g id="dash-hero">
+<circle cx="118" cy="42" r="30" class="hero-disc"/>
+<path d="M8 30h34M4 44h44M10 58h30" class="hero-lines"/>
+<g transform="translate(58,12) scale(2.1)"><use href="#dash-bird"/></g>
+<path d="M20 78h120" class="hero-ground"/>
+</g>
+</defs></svg>
 <div id="conn">reconnecting to control plane…</div>
 <header>
-  <span class="logo">runner</span>
+  <span class="logo"><span class="mark" aria-hidden="true" title="Dash, the runner roadrunner"><svg width="20" height="20" viewBox="0 0 32 32"><use href="#dash-bird"/></svg></span><span>runner<small>fleet console</small></span></span>
   <span class="badge" id="version">…</span>
   <span class="badge" id="health">…</span>
   <span class="badge" id="cloud">cloud …</span>
   <span class="badge" id="stream">stream …</span>
+  <span class="badge" id="role">role …</span>
   <span class="badge bad" id="storewarn">storage unavailable</span>
   <span class="spacer"></span>
-  <input id="token" type="password" placeholder="console token" autocomplete="off">
-  <button id="connect">Connect</button>
-  <button id="signout">Sign out</button>
-  <a class="sso" href="/auth/login">Sign in via SSO</a>
+  <span class="auth">
+    <button id="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle light and dark theme"><span class="icon-moon"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 8.5A5 5 0 0 1 5.5 2 5 5 0 1 0 12 8.5z"/></svg></span><span class="icon-sun"><svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="7" cy="7" r="2.6"/><path d="M7 1v1.6M7 11.4V13M1 7h1.6M11.4 7H13M2.8 2.8l1.1 1.1M10.1 10.1l1.1 1.1M11.2 2.8 10.1 3.9M3.9 10.1l-1.1 1.1"/></svg></span></button>
+    <input id="token" type="password" placeholder="console token" autocomplete="off" aria-label="console token">
+    <button id="connect">Connect</button>
+    <button id="signout">Sign out</button>
+    <a class="sso" href="/auth/login">Sign in via SSO</a>
+  </span>
 </header>
 <main>
   <div class="kpis">
-    <div class="card"><div class="label">Fleet nodes</div><div class="value" id="k-nodes">–</div></div>
-    <div class="card"><div class="label">Capacity slots</div><div class="value" id="k-slots">–</div></div>
-    <div class="card"><div class="label">In-flight jobs</div><div class="value" id="k-jobs">–</div></div>
-    <div class="card"><div class="label">Host load state</div><div class="value" id="k-gov">–</div></div>
-    <div class="card"><div class="label">Cache hit rate</div><div class="value" id="k-cache-hit">–</div></div>
-    <div class="card"><div class="label">Cached data</div><div class="value" id="k-cache-mb">–</div></div>
+    <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="3" cy="3" r="1.6"/><circle cx="11" cy="3" r="1.6"/><circle cx="7" cy="11" r="1.6"/><path d="M4.2 4.2 5.8 9.8M9.8 4.2 8.2 9.8M4.6 3h4.8"/></svg>Fleet nodes</div><div class="value" id="k-nodes">–</div></div>
+    <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="1.5" width="11" height="11" rx="2"/><path d="M1.5 5.5h11M5.5 5.5v7"/></svg>Capacity slots</div><div class="value" id="k-slots">–</div></div>
+    <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M7 1.5 12.5 7 7 12.5 1.5 7z"/><circle cx="7" cy="7" r="1.6"/></svg>In-flight jobs</div><div class="value" id="k-jobs">–</div></div>
+    <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 10.5 5 7l2.5 2.5L12 5"/><path d="M2 13h10"/></svg>Host load state</div><div class="value" id="k-gov">–</div></div>
+    <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5.5"/><path d="M7 4v3l2 1.5"/></svg>Cache hit rate</div><div class="value" id="k-cache-hit">–</div></div>
+    <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="7" cy="3.5" rx="5" ry="2"/><path d="M2 3.5v7c0 1.1 2.2 2 5 2s5-.9 5-2v-7M2 7c0 1.1 2.2 2 5 2s5-.9 5-2"/></svg>Cached data</div><div class="value" id="k-cache-mb">–</div></div>
   </div>
   <section>
     <h2>Control-plane host PSI</h2>
@@ -116,7 +298,7 @@
   </section>
   <section>
     <h2>Active jobs <span class="note">(this host, live)</span></h2>
-    <div class="card"><table>
+    <div class="card table-card"><table>
       <thead><tr><th>Job ID</th><th>Name</th><th>Provider</th><th>Age</th><th>Action</th></tr></thead>
       <tbody id="jobs"><tr><td colspan="5" class="empty">waiting for stream…</td></tr></tbody>
     </table></div>
@@ -132,16 +314,16 @@
     <div class="card" style="margin-top:12px">
       <div class="gauge"><div class="row"><span>Blob presence</span><span id="oci-t">–</span></div>
         <div class="bar"><div id="oci-bar"></div></div></div>
-      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <div class="actions">
         <button data-action="prune-preview" id="btn-preview">Preview prune</button>
-        <button data-action="prune" id="btn-prune">Prune cache</button>
-        <span id="action-status" style="color:var(--muted);font-size:13px"></span>
+        <button data-action="prune" id="btn-prune" class="btn-danger">Prune cache</button>
+        <span id="action-status"></span>
       </div>
     </div>
   </section>
   <section>
     <h2>Swarm sessions <span class="note">(this host, live)</span></h2>
-    <div class="card"><table>
+    <div class="card table-card"><table>
       <thead><tr><th>Swarm</th><th>Status</th><th>Members</th><th>Waiting</th>
         <th>Jobs</th><th>CPU weight</th><th>Memory</th><th>Spent</th><th>Action</th></tr></thead>
       <tbody id="swarms"><tr><td colspan="9" class="empty">waiting for stream…</td></tr></tbody>
@@ -149,12 +331,13 @@
   </section>
   <section>
     <h2>Active fleet nodes</h2>
-    <div class="card"><table>
+    <div class="card table-card"><table>
       <thead><tr><th>Node ID</th><th>Hostname</th><th>Providers</th>
         <th>Capacity</th><th>Jobs</th><th>PSI</th><th>Last heartbeat</th></tr></thead>
-      <tbody id="fleet"><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
+      <tbody id="fleet"><tr><td colspan="7" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>loading…</td></tr></tbody>
     </table></div>
   </section>
+  <footer><span>runner fleet console</span><span class="dotsep">single-file air-gapped bundle</span><span class="dotsep">live event stream</span></footer>
 </main>
 <script>
 "use strict";
@@ -166,8 +349,8 @@ function color(v) {
 }
 function gauge(id, v) {
   var bar = document.getElementById(id), txt = document.getElementById(id + "-t");
-  if (v == null || isNaN(v)) { bar.style.width = "0%"; bar.style.background = "var(--border)"; txt.textContent = "n/a"; return; }
-  bar.style.width = Math.min(100, v) + "%"; bar.style.background = color(v);
+  if (v == null || isNaN(v)) { bar.style.width = "0%"; bar.style.setProperty("--fill", "var(--faint)"); txt.textContent = "n/a"; return; }
+  bar.style.width = Math.min(100, v) + "%"; bar.style.setProperty("--fill", color(v));
   txt.textContent = v.toFixed(1) + "%";
 }
 function esc(s) {
@@ -218,6 +401,11 @@ function paintStaticButtons() {
   prune.disabled = !ops;
   preview.title = ops ? "" : "Requires operator role";
   prune.title = ops ? "" : "Requires operator role";
+  var role = streamState.role, chip = document.getElementById("role");
+  if (role == null) { chip.textContent = "role …"; chip.className = "badge"; }
+  else if (role === "admin") { chip.textContent = "admin"; chip.className = "badge ok"; }
+  else if (role === "operator") { chip.textContent = "operator"; chip.className = "badge warn"; }
+  else { chip.textContent = "viewer"; chip.className = "badge"; }
 }
 function actionStatus(msg, isErr) {
   var el = document.getElementById("action-status");
@@ -312,11 +500,11 @@ function renderGovernor(gov) {
 function renderJobs(jobs) {
   var tb = document.getElementById("jobs");
   if (jobs == null) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty">daemon offline (unobserved)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>daemon offline (unobserved)</td></tr>';
     return;
   }
   if (!jobs.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty">no active jobs</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no active jobs — the fleet is idle</td></tr>';
     return;
   }
   var now = Date.now();
@@ -325,10 +513,10 @@ function renderJobs(jobs) {
     var age = (j.started_unix_ms == null)
       ? "–" : Math.max(0, Math.round((now - j.started_unix_ms) / 1000)) + "s";
     var id = (j.id == null) ? "–" : j.id;
-    return "<tr><td>" + esc(id) + "</td><td>" +
+    return "<tr><td class=\"mono\">" + esc(id) + "</td><td>" +
       esc(j.name == null ? "–" : j.name) + "</td><td>" +
       esc(j.provider == null ? "–" : j.provider) + "</td><td>" + esc(age) +
-      "</td><td><button data-action=\"cancel\" data-id=\"" + esc(String(j.id == null ? "" : j.id)) +
+      "</td><td><button class=\"btn-danger\" data-action=\"cancel\" data-id=\"" + esc(String(j.id == null ? "" : j.id)) +
       "\"" + off + ">Cancel</button></td></tr>";
   }).join("");
 }
@@ -343,21 +531,21 @@ function renderOci(oci) {
     ? null : (oci.size_bytes / 1048576).toFixed(1) + " MB");
   var bar = document.getElementById("oci-bar"), txt = document.getElementById("oci-t");
   if (present == null || layers == null || layers === 0) {
-    bar.style.width = "0%"; bar.style.background = "var(--border)";
+    bar.style.width = "0%"; bar.style.setProperty("--fill", "var(--faint)");
     txt.textContent = "n/a"; return;
   }
   var pct = Math.round(present / layers * 100);
-  bar.style.width = pct + "%"; bar.style.background = "var(--accent)";
+  bar.style.width = pct + "%"; bar.style.setProperty("--fill", "var(--accent)");
   txt.textContent = pct + "% present";
 }
 function renderSwarms(swarms) {
   var tb = document.getElementById("swarms");
   if (swarms == null) {
-    tb.innerHTML = '<tr><td colspan="9" class="empty">daemon offline (unobserved)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>daemon offline (unobserved)</td></tr>';
     return;
   }
   if (!swarms.length) {
-    tb.innerHTML = '<tr><td colspan="9" class="empty">no swarm sessions</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no swarm sessions running</td></tr>';
     return;
   }
   var off = canUse("admin") ? "" : " disabled title=\"Requires admin role\"";
@@ -367,13 +555,13 @@ function renderSwarms(swarms) {
     var mem = (s.memory_allocated_mb == null || s.memory_max_mb == null)
       ? "–" : (s.memory_allocated_mb + " / " + s.memory_max_mb + " MB");
     var spent = (s.spent_usd == null) ? "–" : ("$" + Number(s.spent_usd).toFixed(2));
-    return "<tr><td>" + esc(s.swarm_id == null ? "–" : s.swarm_id) + "</td><td>" +
-      esc(s.status == null ? "–" : s.status) + "</td><td>" +
+    return "<tr><td class=\"mono\">" + esc(s.swarm_id == null ? "–" : s.swarm_id) + "</td><td>" +
+      "<span class=\"pill\">" + esc(s.status == null ? "–" : s.status) + "</span></td><td>" +
       esc(s.member_count == null ? "–" : s.member_count) + "</td><td>" +
       esc(s.waiting_count == null ? "–" : s.waiting_count) + "</td><td>" +
       esc(s.active_jobs == null ? "–" : s.active_jobs) + "</td><td>" +
-      esc(cpu) + "</td><td>" + esc(mem) + "</td><td>" + esc(spent) +
-      "</td><td><button data-action=\"kill\" data-id=\"" +
+      esc(cpu) + "</td><td>" + esc(mem) + "</td><td class=\"mono\">" + esc(spent) +
+      "</td><td><button class=\"btn-danger\" data-action=\"kill\" data-id=\"" +
       esc(String(s.swarm_id == null ? "" : s.swarm_id)) + "\"" + off + ">Kill</button></td></tr>";
   }).join("");
 }
@@ -422,7 +610,7 @@ async function refresh() {
         ? (cache.size_bytes / 1048576).toFixed(1) + " MB" : "–";
     var tb = document.getElementById("fleet");
     if (!runners.length) {
-      tb.innerHTML = '<tr><td colspan="7" class="empty">no runners registered</td></tr>';
+      tb.innerHTML = '<tr><td colspan="7" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no runners registered yet</td></tr>';
       return;
     }
     tb.innerHTML = runners.map(function (r) {
@@ -484,7 +672,13 @@ async function consumeStream(token, myId) {
   clearTimeout(connectTimer);
   if (res.status === 401) {
     setBadge("stream", "unauthorized", "bad");
-    streamBanner("console token rejected — enter a valid token");
+    streamBanner("token rejected (tokens rotate every restart) — paste the fresh console token, then Connect");
+    clearToken();
+    streamState.token = null;
+    streamState.role = null;
+    paintStaticButtons();
+    if (streamState.lastEvent) renderTables(streamState.lastEvent);
+    try { document.getElementById("token").focus(); } catch (e) {}
     return;
   }
   if (res.status === 403) {
@@ -589,6 +783,14 @@ document.getElementById("token").addEventListener("keydown", function (e) {
     var t = e.target.value.trim();
     if (t) connect(t);
   }
+});
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem("runner.theme", t); } catch (e) {}
+}
+document.getElementById("theme-toggle").addEventListener("click", function () {
+  var cur = document.documentElement.dataset.theme;
+  applyTheme(cur === "light" ? "dark" : "light");
 });
 var saved = loadToken();
 paintStaticButtons();

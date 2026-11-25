@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "runner"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "runner-cli"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "runner-enterprise"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "runner-guest-agent"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "base64 0.23.1",
  "libc",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "runner-providers"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "runner-sandbox"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1487,7 +1487,7 @@ dependencies = [
 
 [[package]]
 name = "runner-telemetry"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "serde",
  "serde_json",

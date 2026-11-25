@@ -12,7 +12,9 @@ Two supported paths, pick one:
 
 Supported: Tier-3 dispatch (direct unprivileged subprocess), the
 WireGuard mesh transport (UDP + STUN work unchanged on Windows),
-and the Job Objects governor (v2.0.0 — see "Windows governor").
+the Job Objects governor (v2.0.0 — see "Windows governor"), WFP
+egress filtering (v2.6.0 — see below), the local web console
+(`runner dashboard`), and ReFS block-cloned snapshots.
 
 `runner top` renders live frames: system CPU/memory gauges come
 from Win32 (`GetSystemTimes`, `GlobalMemoryStatusEx`), and daemon
@@ -22,6 +24,57 @@ Daemon IPC runs over Windows named pipes (`\\.\pipe\runner-*`).
 Unsupported — every item logs loudly at the point of use, never
 silently: Tier-2 sandboxing (no Linux namespaces) and Tier-1
 microVMs (no Firecracker/KVM).
+
+### Egress filtering (WFP, v2.6.0)
+
+Native enforcement of the shared egress contract: RFC 1918,
+link-local, and ULA destinations are dropped; only DNS (UDP 53)
+and public HTTPS (TCP 443) are allowed; everything else drops —
+parity with the Linux eBPF boundary. Filters attach at the
+outbound-connect authorize layers
+(`FWPM_LAYER_ALE_AUTH_CONNECT_V4`/`_V6`) via user-mode `fwpuclnt`
+APIs only (no callout driver), optionally scoped to one image via
+`FWPM_CONDITION_ALE_APP_ID`. The session is dynamic
+(`FWPM_SESSION_FLAG_DYNAMIC`): if the runner dies, the kernel
+tears the session and every filter down, so rules can never leak
+past the job. Deny-before-allow ordering is weight-enforced, never
+position-dependent. The live engine tests install the real 11-filter
+set and need an elevated prompt plus `RUNNER_LIVE_WFP=1`:
+
+```powershell
+$env:RUNNER_LIVE_WFP = '1'; cargo test -p runner-sandbox -- --nocapture
+```
+
+### Web console (`runner dashboard`)
+
+```powershell
+cargo run -p runner-cli -- dashboard --no-open
+```
+
+Serves the local console (default `127.0.0.1:8080`, overridable
+with `--listen`/`--port`) and prints the bound URL plus the console
+bearer token to stderr. The token is `--token`, else
+`RUNNER_DASHBOARD_TOKEN`, else a fresh random value per run.
+Without `--no-open` the console also opens in a browser
+(`ui` is an alias for `dashboard`).
+
+### Audit trail location (`RUNNER_AUDIT_LOG`)
+
+The tamper-evident trail defaults to
+`%APPDATA%\runner\audit.jsonl`. `RUNNER_AUDIT_LOG` overrides the
+path (blank values fall through to the default): point it at an
+isolated file when running smoke tests so the production ledger
+stays clean.
+
+### Instant snapshots (ReFS Dev Drive CoW)
+
+File and tree duplication uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+block cloning on ReFS — instant, space-efficient snapshots —
+degrading cleanly to plain copies on NTFS. Detection is empirical
+(a real micro-clone is attempted), never a filesystem-name
+allowlist. For instant snapshots, keep checkouts and caches on a
+ReFS Dev Drive (`doctor` says so when it finds a fallback
+filesystem).
 
 ## Windows governor (Job Objects, v2.0.0)
 
@@ -57,7 +110,7 @@ in the governor path can fail a healthy job.
 Install (no admin rights required):
 
 ```powershell
-irm https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/runnerhq/runner/main/install.ps1 | iex
 ```
 
 Then restart the terminal and run `runner doctor`. Expected output
@@ -77,9 +130,8 @@ Strict mode: Windows has no Tier-2 sandbox, so `--strict` (flag,
 exit 1, and `runner doctor --strict` escalates guardrail warnings
 to failures.
 
-Future (v2.3+): WFP egress filtering and a native sandbox backend.
-Every remaining stub logs its feature name so the work can be
-harvested by grep.
+Future: a native sandbox backend (Tier-2). Every remaining stub
+logs its feature name so the work can be harvested by grep.
 
 ## Windows via WSL2
 
@@ -105,7 +157,7 @@ without systemd, or with cgroups v1, fails closed with the fix.
 From inside the distro (not `/mnt/c` — see below):
 
 ```sh
-git clone https://github.com/kirthi-sagar/runner.git ~/runner
+git clone https://github.com/runnerhq/runner.git ~/runner
 cd ~/runner
 ./install.sh
 runner doctor

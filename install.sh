@@ -231,7 +231,7 @@ else
     if [ "$OS" = "Darwin" ]; then
         TARBALL="runner-darwin-arm64.tar.gz"
     fi
-    BASE_URL="https://github.com/kirthi-sagar/runner/releases/download/v$VERSION"
+    BASE_URL="https://github.com/runnerhq/runner/releases/download/v$VERSION"
     TMP_DL="$(mktemp -d)"
     log "fetching prebuilt $TARBALL"
     if [ "$DRY_RUN" -eq 1 ]; then

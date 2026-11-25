@@ -67,7 +67,7 @@ fn asset_pattern_matches_release_matrix() {
         "installer tarball pattern drifted"
     );
     assert!(
-        sh.contains("https://github.com/kirthi-sagar/runner/releases/download/v$VERSION"),
+        sh.contains("https://github.com/runnerhq/runner/releases/download/v$VERSION"),
         "installer base URL drifted"
     );
     // Every target the workflow builds must be installable.

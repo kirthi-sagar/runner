@@ -257,6 +257,8 @@ impl WorkspaceSnapshots {
     /// wholesale directory replacement — force-gated extras are
     /// deleted, and only then do captured directory modes apply
     /// (locking a directory before deleting inside it would fail).
+    /// Modes finalize even when the fill or sweep fails midway,
+    /// so partial restores never leave permissive leftovers.
     /// `.git`/`.runner` are never touched on either side, and
     /// symlinks restore verbatim (never followed).
     pub fn restore(
@@ -280,47 +282,69 @@ impl WorkspaceSnapshots {
                 describe_extras(&extras),
             )));
         }
-        // Phase B: reconcile the baseline granularly. Directory
-        // modes queue for Phase D — nothing locks down yet.
+        // Phases B and C run inside a closure so Phase D still
+        // executes when they fail: recreated private directories
+        // must land their captured modes even on a partial
+        // restore, never permissive umask leftovers.
         let mut mode_queue = Vec::new();
-        restore_tree(&tree, worktree, &mut stats, &mut mode_queue)?;
-        // Phase C: delete genuine extras (mismatched counterparts
-        // were already replaced above and no longer qualify).
-        for extra in &extras {
-            if tree.join(extra).symlink_metadata().is_ok() {
-                continue;
+        let outcome: SnapshotResult<()> = (|| {
+            // Phase B: reconcile the baseline granularly. Directory
+            // modes queue for Phase D — nothing locks down yet.
+            restore_tree(&tree, worktree, &mut stats, &mut mode_queue)?;
+            // Phase C: delete genuine extras (mismatched counterparts
+            // were already replaced above and no longer qualify).
+            for extra in &extras {
+                if tree.join(extra).symlink_metadata().is_ok() {
+                    continue;
+                }
+                let target = worktree.join(extra);
+                match std::fs::symlink_metadata(&target) {
+                    Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
+                        std::fs::remove_dir_all(&target).map_err(|e| {
+                            SnapshotError::Io(format!("cannot remove {}: {e}", target.display()))
+                        })?;
+                    }
+                    Ok(_) => {
+                        remove_file_or_symlink(&target).map_err(|e| {
+                            SnapshotError::Io(format!("cannot remove {}: {e}", target.display()))
+                        })?;
+                    }
+                    // Vanished between scan and sweep (external actor):
+                    // already gone is already correct.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => {
+                        return Err(SnapshotError::Io(format!(
+                            "cannot inspect {}: {e}",
+                            target.display()
+                        )));
+                    }
+                }
+                stats.entries_removed += 1;
             }
-            let target = worktree.join(extra);
-            match std::fs::symlink_metadata(&target) {
-                Ok(meta) if meta.file_type().is_dir() && !meta.file_type().is_symlink() => {
-                    std::fs::remove_dir_all(&target).map_err(|e| {
-                        SnapshotError::Io(format!("cannot remove {}: {e}", target.display()))
-                    })?;
-                }
-                Ok(_) => {
-                    remove_file_or_symlink(&target).map_err(|e| {
-                        SnapshotError::Io(format!("cannot remove {}: {e}", target.display()))
-                    })?;
-                }
-                // Vanished between scan and sweep (external actor):
-                // already gone is already correct.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(SnapshotError::Io(format!(
-                        "cannot inspect {}: {e}",
-                        target.display()
+            Ok(())
+        })();
+        // Phase D: finalize captured directory modes (queued
+        // deepest-first during the fill). Always runs — on the
+        // happy path deletions are done so restricted trees lock
+        // down without trapping extras; on a partial failure every
+        // recreated directory still locks down. Best-effort here:
+        // each entry attempts its mode, the first failure is kept,
+        // and the original fill/sweep error propagates first (the
+        // cause reports, collateral yields).
+        let mut mode_error: Option<SnapshotError> = None;
+        for (from, onto) in mode_queue {
+            if let Err(e) = mirror_mode(&from, &onto) {
+                if mode_error.is_none() {
+                    mode_error = Some(SnapshotError::Io(format!(
+                        "cannot restore modes {}: {e}",
+                        onto.display()
                     )));
                 }
             }
-            stats.entries_removed += 1;
         }
-        // Phase D: finalize captured directory modes (queued
-        // deepest-first during the fill). Deletions are done, so
-        // restricted trees lock down without trapping extras.
-        for (from, onto) in mode_queue {
-            mirror_mode(&from, &onto).map_err(|e| {
-                SnapshotError::Io(format!("cannot restore modes {}: {e}", onto.display()))
-            })?;
+        outcome?;
+        if let Some(error) = mode_error {
+            return Err(error);
         }
         Ok(stats)
     }
@@ -977,6 +1001,43 @@ mod tests {
         assert_eq!(std::fs::read(locked.join("keep.txt")).unwrap(), b"keep");
         let mode = std::fs::metadata(&locked).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o555);
+        // Loosen both copies so TempDir drops without debris.
+        let baseline = store.dir().join("v1").join("tree").join("locked");
+        for dir in [&locked, &baseline] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Partial restores still lock down: when the fill fails
+    /// midway, queued directory modes apply before the error
+    /// propagates, so recreated private trees never keep
+    /// permissive umask modes.
+    #[cfg(unix)]
+    #[test]
+    fn restore_partial_failure_still_finalizes_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::TempDir::new("snap-unwind").unwrap();
+        let repo = fake_repo(dir.path());
+        let locked = repo.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("keep.txt"), b"keep").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = store_for(&repo);
+        store.create(&repo, "v1").unwrap();
+        // Break one baseline file so the fill fails midway.
+        let victim = store.dir().join("v1").join("tree").join("main.rs");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&victim).is_ok() {
+            eprintln!("running privileged; skipping unwind test");
+            return;
+        }
+        // Loosen the worktree copy so the lockdown is observable.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(store.restore(&repo, "v1", true).is_err());
+        let mode = std::fs::metadata(&locked).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     /// Failed restores preserve the worktree: counterparts are

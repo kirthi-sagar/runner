@@ -533,13 +533,18 @@ mod tests {
         let outcome =
             provision_rootfs(&snapshots, &digest(6), fake_unpack(b"v3"), &bundle).unwrap();
         #[cfg(unix)]
-        assert!(matches!(outcome, ProvisionOutcome::FreshlyUnpacked));
+        {
+            assert!(matches!(outcome, ProvisionOutcome::FreshlyUnpacked));
+            assert_eq!(
+                std::fs::read(bundle.join("bin").join("app")).unwrap(),
+                b"v3"
+            );
+        }
         #[cfg(not(unix))]
-        assert!(matches!(outcome, ProvisionOutcome::ClonedFromSnapshot(_)));
-        assert_eq!(
-            std::fs::read(bundle.join("bin").join("app")).unwrap(),
-            b"v3"
-        );
+        {
+            assert!(matches!(outcome, ProvisionOutcome::ClonedFromSnapshot(_)));
+            assert_eq!(std::fs::read(bundle.join("f")).unwrap(), b"plain");
+        }
     }
 
     #[test]

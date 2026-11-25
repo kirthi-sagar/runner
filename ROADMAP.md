@@ -5,8 +5,33 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.12.1 and prior)
+## Shipped (v2.15.1 and prior)
 
+- Hardware Copy-on-Write (CoW) Snapshots: zero-dependency cross-platform
+  block cloning engine (`crates/runner-core/src/fs/cow.rs`), APFS `clonefile`,
+  Linux `ioctl(FICLONE)` and `copy_file_range`, Windows ReFS
+  `FSCTL_DUPLICATE_EXTENTS_TO_FILE`, empirical capability probe, and
+  recursive tree cloner (v2.15.0 & v2.15.1, Candidate I delivered).
+- OCI Image rootfs snapshot cache (`crates/runner-sandbox/src/oci/snapshot.rs`):
+  atomic `.complete` sentinel, instant <5ms container rootfs provisioning,
+  fail-open staging resilience, and snapshots-first storage GC eviction.
+- AI Agent workspace snapshots and rollback (`runner snapshot` CLI + MCP
+  `runner_snapshot` tool) with 4-phase scan-then-act recursive reconciler.
+- `runner doctor` CoW storage capability probe and diagnostics reporting
+  Native block cloning vs Fallback plain copy.
+- Windows native snapshot test assertion fix for non-Unix exotic file clones
+  achieving 100% green 6/6 CI on `main` (v2.15.1).
+
+- Disk pressure-gated cache eviction & safety signpost: two-tier
+  storage governor (90% high trigger, 80% low target), `runner image rm`,
+  Plentiful Disk Invariant (<90% untouched), `runner doctor` storage check
+  (v2.13.0, Candidate G delivered).
+- Forge federation & universal device-code auth (`runner auth`):
+  RFC 8628 OAuth device flow for GitHub, gitlab.com, and self-hosted GitLab,
+  0600 POSIX / owner-only Win32 DACL store with cross-process flock,
+  native git credential helper (`runner auth git-credential`) with
+  line-injection defense, daemonless OCI cross-auth with realm SSRF
+  defense and manifest byte hashing (v2.14.0, Candidate H delivered).
 - Zero-freeze governor, JIT worker wrap, 4-provider matrix.
 - 12 MCP tools, embedded dashboard, OIDC control plane.
 - Mesh federation, cloud bursting + 5-minute scale-to-zero watchdog.
@@ -44,7 +69,7 @@ services or heavyweight frameworks.
   reservation limits & pricing (v2.8.0).
 - LAN mesh cache federation & peer streaming: background peer
   table, scatter-gather queries, verified chunk streaming, donor
-  governance + `cache peers` CLI (v2.9.0).
+  governance + `cache peers` CLI (v2.9.0, Candidate B delivered).
 - Container runtime isolation tier: OCI probing, rootless
   lifecycle, egress/offline boundaries, CLI/doctor/MCP wire-up
   (v2.10.0, Candidate D delivered).
@@ -63,24 +88,36 @@ services or heavyweight frameworks.
 - Supply-chain patch: `publish = false` workspace protection
   satisfying `cargo deny` under the commercial license (v2.12.1).
 
-## Current: v2.12.1 (Autonomous Multi-Agent Swarms)
+## Active Milestone: Candidate K (World-Class Hybrid Web Console & Role-Based Access Control)
 
-- Swarm sessions: membership, leases, shared CPU/RAM pools with
-  host ceilings, 1,024-member safety cap.
-- 0ms handover, priority preemption, spend ledger with budget
-  caps, multi-tier dispatch, lifecycle event bus.
-- `runner swarm list/kill` CLI plus `swarm`/`swarm-events`
-  doctor checks; 712 tests green across 57 suites.
+### Candidate K: World-Class Hybrid Web Console & Role-Based Access Control (RBAC)
+- **High-Performance Web Console**:
+  - `runner dashboard` / `runner ui` CLI command opening `http://localhost:8080`.
+  - Cloud PWA portal (`https://app.runnerhq.com`) with offline Service Worker support.
+  - Zero-dependency embedded static bundle (zero external CDN scripts/fonts, 100% air-gapped compliant).
+  - Real-time Linux kernel PSI gauges, live mesh fleet topology, OCI layer cache visualizer, and swarm execution monitors.
+- **Enterprise Role-Based Access Control (RBAC)**:
+  - Granular permission matrix: `Admin`, `Operator`, and `Viewer` roles.
+  - Action-level authorization: viewing metrics/logs vs terminating jobs, purging caches, and rotating forge credentials.
+  - Enterprise OIDC Single Sign-On (Okta, Microsoft Entra ID / Azure AD, Google Workspace, GitHub SSO) wired to `crates/runner-enterprise/src/control_plane/auth.rs`.
+  - Cryptographic audit trail logging all console actions with user identity and timestamp.
 
-## Next: v2.13.0 candidates (all lettered candidates shipped)
+### Candidate L: Internal Adversarial Pentest & Continuous Fuzzing ("Fortress Runner")
+- **Stage 1: Internal Adversarial "Red Team" Exploit Suite** (`tests/test_adversarial_sandbox.rs`):
+  - Sandbox escape & jailbreak defense (OCI rootless container and Firecracker microVM boundary checks).
+  - Network egress boundary evasion testing (blocking raw sockets, DNS exfiltration, loopback redirects).
+  - Filesystem boundary & containment enforcement (Tar-Slip traversal, symlink host leaks, ReFS/APFS CoW escapes).
+  - Denial of Service & resource exhaustion resilience (fork bomb immunity via cgroups/Job Objects, zip bomb budget).
+  - Credential store protection (0600 flock file integrity, zero-memory token exposure).
+- **Stage 2: Continuous Fuzz Testing** (`cargo-fuzz` / `libFuzzer`):
+  - OCI layer Tar unpacker and whiteout resolver fuzzing with corrupted byte streams.
+  - Git credential helper protocol parser fuzzing (validating \r\n and injection defense).
+  - JSON-RPC MCP server message dispatch fuzzing.
+  - OCI registry manifest parser and HTTP chunk framing fuzzing.
 
-- Podman/docker engine dispatch (remaining half of the container
-  Phase 2 deferral; engines manage their own image storage).
-- Loopback prestart hook for offline containers needing `lo` up.
-- Config-file volume declarations for container jobs.
-- Manifest-byte verification against the index digest (currently
-  covered by TLS + trusted registry).
-- MCP→daemon swarm convergence (daemon-side registration arm).
+### Candidate J: Peer-to-Peer Web Tunnels & Silicon GPU Acceleration
+- Direct agent NAT-bypassing tunnels over WebRTC DataChannels with zero relay servers.
+- Apple Silicon (Metal) and NVIDIA (CUDA) GPU acceleration pass-through for local AI coding agents.
 
 ## Shipped in v2.9.0: LAN Mesh Cache Federation & Peer Streaming
 

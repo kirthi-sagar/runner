@@ -284,11 +284,22 @@ pub fn export_trail(path: &Path) -> Result<String, ExportError> {
 mod tests {
     use super::*;
 
+    /// Serializes env mutation against env reads: parallel test
+    /// threads must never observe a half-applied override.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     // Path override: explicit values win, blanks fall through to
     // the platform default (previous value restored — env is
     // process-global).
     #[test]
     fn audit_path_override_respects_explicit_paths_only() {
+        let _env = lock_env();
         let prior = std::env::var("RUNNER_AUDIT_LOG").ok();
         std::env::set_var("RUNNER_AUDIT_LOG", "  /tmp/hermetic-audit.jsonl  ");
         assert_eq!(
@@ -333,6 +344,7 @@ mod tests {
     // instead of panicking.
     #[test]
     fn default_audit_path_follows_platform_convention() {
+        let _env = lock_env();
         #[cfg(unix)]
         {
             match std::env::var_os("HOME") {

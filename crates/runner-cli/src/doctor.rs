@@ -631,6 +631,104 @@ fn check_storage(config: &runner_core::config::RunnerConfig) -> Check {
     })
 }
 
+/// Gathered copy-on-write facts; verdict logic lives in
+/// [`cow_storage_verdict`].
+struct CowFacts {
+    dir: std::path::PathBuf,
+    capability: Result<runner_core::fs::cow::CowCapability, String>,
+    filesystem: String,
+    snapshots: Option<(usize, std::path::PathBuf)>,
+}
+
+/// CoW storage diagnostic: native block cloning passes; fallback
+/// and probe failures warn (snapshots still work through plain
+/// copies, so nothing here is fatal).
+fn cow_storage_verdict(facts: &CowFacts) -> Check {
+    use runner_core::fs::cow::CowCapability;
+
+    let mut detail = format!(
+        "{} ({}) at {}",
+        facts.filesystem,
+        match &facts.capability {
+            Ok(CowCapability::Native) => "native block cloning".to_string(),
+            Ok(CowCapability::Unsupported { reason }) => format!("copy fallback: {reason}"),
+            Err(e) => format!("unprobed: {e}"),
+        },
+        facts.dir.display()
+    );
+    match &facts.snapshots {
+        Some((count, root)) => detail.push_str(&format!(
+            "; {count} workspace snapshots under {}",
+            root.display()
+        )),
+        None => detail.push_str("; not inside a git repository"),
+    }
+    match &facts.capability {
+        Ok(CowCapability::Native) => Check::pass("storage-cow", detail),
+        _ => Check::warn(
+            "storage-cow",
+            format!("{detail} — {}", cow_fallback_guidance()),
+        ),
+    }
+}
+
+/// Platform guidance for hosts stuck on copy fallback.
+fn cow_fallback_guidance() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "for instant snapshots use Btrfs or XFS with reflink"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "for instant snapshots use a ReFS Dev Drive"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "for instant snapshots use an APFS volume"
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        "native cloning unavailable on this platform"
+    }
+}
+
+/// Workspace snapshot census from an explicit start path (the live
+/// check passes the process working directory; tests pass temp
+/// dirs): `Some` count plus store root inside a repository, `None`
+/// outside one. Listing never fails, so neither does this.
+fn workspace_snapshot_summary(start: &std::path::Path) -> Option<(usize, std::path::PathBuf)> {
+    let store = runner_core::fs::snapshot::WorkspaceSnapshots::for_repository(start).ok()?;
+    Some((store.list().len(), store.dir().to_path_buf()))
+}
+
+fn check_cow_storage(config: &runner_core::config::RunnerConfig) -> Check {
+    use runner_core::fs::cow::{filesystem_type, probe_cow_capability};
+    use runner_sandbox::oci::cache::LayerCache;
+
+    let dir = config
+        .sandbox
+        .container
+        .cache_dir
+        .clone()
+        .unwrap_or_else(LayerCache::default_dir);
+    // Fresh installs have no cache dir yet; create it so the probe
+    // tests the real volume instead of erroring on a missing path
+    // (mirrors the writability-probe precedent below).
+    let capability = match std::fs::create_dir_all(&dir) {
+        Ok(()) => probe_cow_capability(&dir).map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let snapshots = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| workspace_snapshot_summary(&cwd));
+    cow_storage_verdict(&CowFacts {
+        filesystem: filesystem_type(&dir),
+        dir,
+        capability,
+        snapshots,
+    })
+}
+
 /// Real writability proof: permission bits lie under ACLs and
 /// overlays, so create the directory and round-trip a probe file.
 fn store_writable(dir: &std::path::Path) -> bool {
@@ -924,6 +1022,7 @@ pub async fn run_all(
         check_swarm(config),
         check_swarm_bus(),
         check_storage(config),
+        check_cow_storage(config),
         check_daemon().await,
         check_mcp(),
         check_cache(config),
@@ -1529,5 +1628,110 @@ mod tests {
         });
         assert!(matches!(blind.status, Status::Warn));
         assert!(blind.detail.contains("unreadable"), "{}", blind.detail);
+    }
+
+    #[test]
+    fn cow_storage_verdict_reports_capability_and_snapshots() {
+        use runner_core::fs::cow::CowCapability;
+        use std::path::PathBuf;
+
+        let native = cow_storage_verdict(&CowFacts {
+            dir: PathBuf::from("/cache"),
+            capability: Ok(CowCapability::Native),
+            filesystem: "btrfs".to_string(),
+            snapshots: Some((3, PathBuf::from("/repo/.runner/snapshots"))),
+        });
+        assert_eq!(native.name, "storage-cow");
+        assert!(matches!(native.status, Status::Pass));
+        assert!(
+            native.detail.contains("native block cloning"),
+            "{}",
+            native.detail
+        );
+        assert!(native.detail.contains("btrfs"), "{}", native.detail);
+        assert!(
+            native.detail.contains("3 workspace snapshots"),
+            "{}",
+            native.detail
+        );
+        let fallback = cow_storage_verdict(&CowFacts {
+            dir: PathBuf::from("/cache"),
+            capability: Ok(CowCapability::Unsupported {
+                reason: "nope".to_string(),
+            }),
+            filesystem: "ext".to_string(),
+            snapshots: None,
+        });
+        assert!(matches!(fallback.status, Status::Warn));
+        assert!(
+            fallback.detail.contains("copy fallback"),
+            "{}",
+            fallback.detail
+        );
+        assert!(
+            fallback.detail.contains("not inside a git repository"),
+            "{}",
+            fallback.detail
+        );
+        assert!(
+            fallback.detail.contains(cow_fallback_guidance()),
+            "{}",
+            fallback.detail
+        );
+        let blind = cow_storage_verdict(&CowFacts {
+            dir: PathBuf::from("/cache"),
+            capability: Err("no dir".to_string()),
+            filesystem: "unknown".to_string(),
+            snapshots: None,
+        });
+        assert!(matches!(blind.status, Status::Warn));
+        assert!(blind.detail.contains("unprobed"), "{}", blind.detail);
+    }
+
+    #[test]
+    fn cow_fallback_guidance_names_platform_solution() {
+        #[cfg(target_os = "linux")]
+        assert!(cow_fallback_guidance().contains("Btrfs"));
+        #[cfg(target_os = "windows")]
+        assert!(cow_fallback_guidance().contains("ReFS"));
+        #[cfg(target_os = "macos")]
+        assert!(cow_fallback_guidance().contains("APFS"));
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        assert!(!cow_fallback_guidance().is_empty());
+    }
+
+    #[test]
+    fn workspace_snapshot_summary_counts_inside_repos_only() {
+        let dir = runner_core::test_support::TempDir::new("doctor-snaps").unwrap();
+        assert!(workspace_snapshot_summary(dir.path()).is_none());
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let (count, root) = workspace_snapshot_summary(&repo).unwrap();
+        assert_eq!(count, 0);
+        assert!(root.ends_with(".runner/snapshots"), "{}", root.display());
+    }
+
+    #[test]
+    fn cow_check_renders_in_text_and_json() {
+        use runner_core::fs::cow::CowCapability;
+        use std::path::PathBuf;
+
+        let check = cow_storage_verdict(&CowFacts {
+            dir: PathBuf::from("/cache"),
+            capability: Ok(CowCapability::Native),
+            filesystem: "btrfs".to_string(),
+            snapshots: Some((1, PathBuf::from("/repo/.runner/snapshots"))),
+        });
+        let text = render_text(std::slice::from_ref(&check));
+        assert!(text.contains("storage-cow"), "{text}");
+        assert!(text.contains("native block cloning"), "{text}");
+        let json: serde_json::Value = serde_json::from_str(&render_json(&[check])).unwrap();
+        let names: Vec<_> = json["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"storage-cow".to_string()), "{json}");
     }
 }

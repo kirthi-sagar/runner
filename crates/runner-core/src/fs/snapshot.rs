@@ -8,7 +8,7 @@
 //! would leak secrets into checkpoint payloads).
 
 use super::cow::{
-    cow_clone_file, cow_clone_tree_excluding, mirror_symlink, remove_file_or_symlink,
+    cow_clone_file, cow_clone_tree_excluding, mirror_mode, mirror_symlink, remove_file_or_symlink,
 };
 use std::path::{Path, PathBuf};
 
@@ -300,13 +300,18 @@ impl WorkspaceSnapshots {
     }
 
     /// List snapshots newest-last (unreadable records skipped, never
-    /// fatal: one corrupt sidecar must not hide the rest).
+    /// fatal: one corrupt sidecar must not hide the rest). Staging
+    /// and tombstone debris (`.tmp.*`) never lists, even mid-flight
+    /// with a sidecar already written.
     pub fn list(&self) -> Vec<SnapshotMeta> {
         let mut metas = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return metas;
         };
         for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".tmp.") {
+                continue;
+            }
             let body = std::fs::read(entry.path().join("meta.json"));
             let Ok(body) = body else {
                 continue;
@@ -320,7 +325,9 @@ impl WorkspaceSnapshots {
     }
 
     /// Delete one snapshot by name (missing names fail loudly —
-    /// typos must not silently succeed).
+    /// typos must not silently succeed). The baseline renames to a
+    /// private tombstone first, so an interrupted deletion can never
+    /// leave a truncated snapshot eligible for restore.
     pub fn remove(&self, name: &str) -> SnapshotResult<()> {
         let dir = self.snapshot_dir(name)?;
         if std::fs::symlink_metadata(&dir).is_err() {
@@ -328,7 +335,18 @@ impl WorkspaceSnapshots {
                 "unknown snapshot: '{name}'"
             )));
         }
-        std::fs::remove_dir_all(&dir)
+        let tombstone = self.root.join(format!(
+            ".tmp.del-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0),
+            STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        std::fs::rename(&dir, &tombstone)
+            .map_err(|e| SnapshotError::Io(format!("cannot remove snapshot '{name}': {e}")))?;
+        std::fs::remove_dir_all(&tombstone)
             .map_err(|e| SnapshotError::Io(format!("cannot remove snapshot '{name}': {e}")))?;
         Ok(())
     }
@@ -471,6 +489,12 @@ fn restore_tree(
                 }
             }
             restore_tree(&from, &onto, stats)?;
+            // Captured modes apply post-order: children land before
+            // the lockdown, so 0700 directories stay writable while
+            // filling and restricted afterwards.
+            mirror_mode(&from, &onto).map_err(|e| {
+                SnapshotError::Io(format!("cannot restore modes {}: {e}", onto.display()))
+            })?;
         } else if file_type.is_file() {
             clear_counterpart(&onto, stats)?;
             cow_clone_file(&from, &onto).map_err(|e| {
@@ -544,9 +568,7 @@ fn remove_worktree_entry(path: &Path) -> SnapshotResult<()> {
 
 /// Uniform exclusion test (mirrors the walker rule).
 fn is_excluded(name: &std::ffi::OsStr) -> bool {
-    WORKSPACE_EXCLUDES
-        .iter()
-        .any(|excluded| name == std::ffi::OsStr::new(excluded))
+    super::cow::name_is_excluded(name, WORKSPACE_EXCLUDES)
 }
 
 #[cfg(test)]
@@ -803,6 +825,74 @@ mod tests {
             store.restore(&repo, "junk", true),
             Err(SnapshotError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn capture_excludes_case_folded_vcs_and_runner_state() {
+        let dir = crate::test_support::TempDir::new("snap-fold").unwrap();
+        let repo = fake_repo(dir.path());
+        std::fs::create_dir_all(repo.join(".GIT")).unwrap();
+        std::fs::write(repo.join(".GIT").join("evil"), b"x").unwrap();
+        let store = store_for(&repo);
+        store.create(&repo, "v1").unwrap();
+        let snap = store.dir().join("v1").join("tree");
+        assert!(!snap.join(".GIT").exists());
+        assert!(!snap.join(".runner").exists());
+        assert!(snap.join("main.rs").exists());
+    }
+
+    #[test]
+    fn remove_leaves_no_debris_behind() {
+        let dir = crate::test_support::TempDir::new("snap-tomb").unwrap();
+        let repo = fake_repo(dir.path());
+        let store = store_for(&repo);
+        store.create(&repo, "v1").unwrap();
+        store.remove("v1").unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(store.dir()).unwrap().collect();
+        assert!(leftovers.is_empty());
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn list_skips_staging_and_tombstone_debris() {
+        let dir = crate::test_support::TempDir::new("snap-skip").unwrap();
+        let repo = fake_repo(dir.path());
+        let store = store_for(&repo);
+        store.create(&repo, "v1").unwrap();
+        // In-flight staging with a sidecar already written, plus a
+        // leftover tombstone: neither may ever list.
+        let staging = store.dir().join(".tmp.1-2-3");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("meta.json"), b"{}").unwrap();
+        let tomb = store.dir().join(".tmp.del-4-5-6");
+        std::fs::create_dir_all(&tomb).unwrap();
+        let listed = store.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "v1");
+    }
+
+    /// Restricted directories roundtrip with their restrictions
+    /// (modes land post-order, after children fill in).
+    #[cfg(unix)]
+    #[test]
+    fn restore_preserves_restricted_directory_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::TempDir::new("snap-modes").unwrap();
+        let repo = fake_repo(dir.path());
+        let locked = repo.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"s").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = store_for(&repo);
+        store.create(&repo, "v1").unwrap();
+        // Loosen and mutate, then restore.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(locked.join("secret.txt"), b"mutated").unwrap();
+        store.restore(&repo, "v1", true).unwrap();
+        let mode = std::fs::metadata(&locked).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(std::fs::read(locked.join("secret.txt")).unwrap(), b"s");
     }
 
     /// Snapshot of a whole tree for before/after refusal proofs.

@@ -108,6 +108,152 @@ fn probe_inner(src: &Path, dst: &Path) -> std::io::Result<CowCapability> {
     }
 }
 
+/// Best-effort filesystem type label for a path (for
+/// diagnostics; never fails — every error degrades to `"unknown"`,
+/// and unlisted Linux magic numbers render as `unknown(0x…)`).
+pub fn filesystem_type(path: &Path) -> String {
+    filesystem_type_inner(path).unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Linux filesystem label from `statfs` `f_type` (magic values per
+/// statfs(2); unlisted values stay honest hex, never invented).
+#[cfg(target_os = "linux")]
+fn filesystem_type_inner(path: &Path) -> std::io::Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path holds NUL for statfs",
+        )
+    })?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid path pointer, valid out-struct.
+    if unsafe { libc::statfs(path_c.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(match stat.f_type as u64 {
+        0x9123_683e => "btrfs".to_string(),
+        0x5846_5342 => "xfs".to_string(),
+        0xef53 => "ext".to_string(),
+        0x0102_1994 => "tmpfs".to_string(),
+        0x794c_7630 => "overlayfs".to_string(),
+        0x6969 => "nfs".to_string(),
+        0x4d44 => "vfat".to_string(),
+        0x6573_5546 => "fuse".to_string(),
+        other => format!("unknown(0x{other:x})"),
+    })
+}
+
+/// macOS filesystem label from `statfs` `f_fstypename` (`apfs`,
+/// `hfs`, `nfs`, …). The field is NUL-padded, not NUL-guaranteed,
+/// so the length is measured, never assumed.
+#[cfg(target_os = "macos")]
+fn filesystem_type_inner(path: &Path) -> std::io::Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path holds NUL for statfs",
+        )
+    })?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid path pointer, valid out-struct.
+    if unsafe { libc::statfs(path_c.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let len = stat
+        .f_fstypename
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(stat.f_fstypename.len());
+    let bytes: Vec<u8> = stat.f_fstypename[..len].iter().map(|&c| c as u8).collect();
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "filesystem name is not UTF-8",
+        )
+    })
+}
+
+/// Windows filesystem label (`NTFS`, `ReFS`, …) via
+/// `GetVolumeInformationW` on the canonical volume root. Unneeded
+/// outputs stay NULL; any failure degrades to `"unknown"`.
+#[cfg(target_os = "windows")]
+fn filesystem_type_inner(path: &Path) -> std::io::Result<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    let root = volume_root(&std::fs::canonicalize(path)?).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot determine volume root",
+        )
+    })?;
+    let root_w: Vec<u16> = root.encode_wide().chain(std::iter::once(0)).collect();
+    let mut name = [0u16; 64];
+    // SAFETY: valid root + sized out-buffer; unneeded outputs NULL.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root_w.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16(&name[..len]).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "filesystem name is not UTF-16",
+        )
+    })
+}
+
+/// Volume root with trailing backslash (`C:\`, `\\server\share\`)
+/// from a canonical Windows path (verbatim and plain forms).
+#[cfg(target_os = "windows")]
+fn volume_root(canonical: &Path) -> Option<std::ffi::OsString> {
+    use std::path::{Component, Prefix};
+
+    let prefix = match canonical.components().next()? {
+        Component::Prefix(prefix) => prefix,
+        _ => return None,
+    };
+    match prefix.kind() {
+        Prefix::Disk(disk) | Prefix::VerbatimDisk(disk) => {
+            Some(std::ffi::OsString::from(format!("{}:\\", disk as char)))
+        }
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            let mut root = std::ffi::OsString::from(r"\\");
+            root.push(server);
+            root.push(r"\");
+            root.push(share);
+            root.push(r"\");
+            Some(root)
+        }
+        _ => None,
+    }
+}
+
+/// Filesystem labels are unimplemented off the big three (the
+/// public wrapper degrades to `"unknown"`).
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn filesystem_type_inner(_path: &Path) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "filesystem type unavailable on this platform",
+    ))
+}
+
 /// Clone one file's bytes natively or report the OS error (no
 /// fallback here — the caller decides). Both paths must live on the
 /// same filesystem; `dst` must not exist.
@@ -547,8 +693,9 @@ pub(crate) fn remove_file_or_symlink(path: &Path) -> std::io::Result<()> {
 }
 
 /// Mirror the source permission bits onto the destination (unix
-/// modes; Windows files carry no POSIX mode to mirror).
-fn mirror_mode(src: &Path, dst: &Path) -> std::io::Result<()> {
+/// modes; Windows files carry no POSIX mode to mirror). Shared
+/// with the snapshot store for post-order directory modes.
+pub(crate) fn mirror_mode(src: &Path, dst: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -629,6 +776,22 @@ fn cow_clone_tree_inner(
 /// the remainder rejoined before comparing. Permission-masked
 /// ancestors compare lexically (traversal would fail there first
 /// anyway, so no infinite descent can result).
+/// True when a file name matches the exclusion list, compared
+/// case-insensitively: `.GIT`/`.Git` on case-insensitive volumes
+/// (NTFS, default APFS) must exclude exactly like `.git`, or
+/// captures would swallow (and restores destroy) VCS metadata.
+/// On case-sensitive filesystems this over-excludes pathological
+/// lookalike names — accepted, since the dangerous direction is
+/// under-exclusion. Shared with the snapshot store.
+pub(crate) fn name_is_excluded(name: &std::ffi::OsStr, exclude_names: &[&str]) -> bool {
+    let Some(text) = name.to_str() else {
+        return false;
+    };
+    exclude_names
+        .iter()
+        .any(|excluded| text.eq_ignore_ascii_case(excluded))
+}
+
 /// True when `dst` nests inside `src` through a path the walker
 /// will actually descend: nesting whose top-level entry is excluded
 /// is safe (the walker skips that whole subtree, so `dst` is never
@@ -697,10 +860,7 @@ fn clone_dir_into(
                 format!("clone entry has no name: {}", src_path.display()),
             )
         })?;
-        if exclude_names
-            .iter()
-            .any(|excluded| name == std::ffi::OsStr::new(excluded))
-        {
+        if name_is_excluded(name, exclude_names) {
             continue;
         }
         let dst_path = dst.join(name);
@@ -788,5 +948,42 @@ mod tests {
             !dst_nests_unexcluded(&src, &src.join(".runner").join("snapshots"), &[".runner"])
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn exclusion_matching_folds_ascii_case() {
+        use std::ffi::OsStr;
+
+        let excludes = [".git", ".runner"];
+        for name in [".git", ".GIT", ".Git", ".RUNNER", ".Runner"] {
+            assert!(name_is_excluded(OsStr::new(name), &excludes), "{name}");
+        }
+        for name in ["src", ".github", "git", "runner", ""] {
+            assert!(!name_is_excluded(OsStr::new(name), &excludes), "{name}");
+        }
+    }
+
+    #[test]
+    fn filesystem_type_labels_known_volumes() {
+        // Deterministic on every Linux box: shared memory is tmpfs
+        // by kernel definition, and proc renders honest hex.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(filesystem_type(Path::new("/dev/shm")), "tmpfs");
+            assert_eq!(filesystem_type(Path::new("/proc")), "unknown(0x9fa0)");
+            assert_eq!(
+                filesystem_type(Path::new("/missing-no-such-dir-xyz")),
+                "unknown"
+            );
+        }
+        // Elsewhere: labels never fail, even for missing paths.
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert!(!filesystem_type(Path::new("/tmp")).is_empty());
+            assert_eq!(
+                filesystem_type(Path::new("/missing-no-such-dir-xyz")),
+                "unknown"
+            );
+        }
     }
 }

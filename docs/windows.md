@@ -38,7 +38,17 @@ permitted ports and drops everywhere else. Filters attach at the
 outbound-connect authorize layers
 (`FWPM_LAYER_ALE_AUTH_CONNECT_V4`/`_V6`) via user-mode `fwpuclnt`
 APIs only (no callout driver), optionally scoped to one image via
-`FWPM_CONDITION_ALE_APP_ID`. The session is dynamic
+`FWPM_CONDITION_ALE_APP_ID`. Scoping boundary: packaged jobs
+auto-resolve `bin/Runner.Worker.exe` and scope filters to that
+image — but ALE app scoping matches the connecting process's OWN
+image only, so descendant job-step processes (`pwsh.exe`,
+`node.exe`, `curl.exe`) fall outside those filters; it narrows
+enforcement to one binary, never a process tree (true tree
+confinement needs token/package isolation). Unpackaged scripts
+with no `Runner.Worker.exe` image fall back to unscoped session
+filters covering all local traffic, with a loud log — filtering
+is preserved while precision degrades, never the reverse. The
+session is dynamic
 (`FWPM_SESSION_FLAG_DYNAMIC`): if the runner dies, the kernel
 tears the session and every filter down, so rules can never leak
 past the job. Deny-before-allow ordering is weight-enforced, never

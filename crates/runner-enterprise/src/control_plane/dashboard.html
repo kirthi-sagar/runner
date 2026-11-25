@@ -411,6 +411,7 @@ function paintStaticButtons() {
   if (role == null) { chip.textContent = "role …"; chip.className = "badge"; }
   else if (role === "admin") { chip.textContent = "admin"; chip.className = "badge ok"; }
   else if (role === "operator") { chip.textContent = "operator"; chip.className = "badge warn"; }
+  else if (role === "unknown") { chip.textContent = "role unknown"; chip.className = "badge warn"; }
   else { chip.textContent = "viewer"; chip.className = "badge"; }
 }
 function actionStatus(msg, isErr) {
@@ -510,6 +511,13 @@ function renderSession(me) {
     if (role && el.getAttribute("data-col") === role) el.classList.add("you");
     else el.classList.remove("you");
   }
+}
+function renderSessionUnknown() {
+  setText("rbac-role", "unknown");
+  setText("rbac-actor", null);
+  setText("rbac-kind", "identity lookup failed");
+  var cells = document.querySelectorAll("[data-col]");
+  for (var i = 0; i < cells.length; i++) cells[i].classList.remove("you");
 }
 function renderGovernor(gov) {
   gov = gov || {};
@@ -763,9 +771,17 @@ function connect(token) {
   var myId = streamState.activeId;
   fetchRole(token, myId).then(function (me) {
     if (isStale(token, myId)) return;
-    streamState.role = (me && me.role) || "viewer";
-    paintStaticButtons();
-    renderSession(me);
+    if (me && me.role) {
+      streamState.role = me.role;
+      paintStaticButtons();
+      renderSession(me);
+    } else {
+      // Identity lookup failed: never masquerade as a
+      // confirmed viewer (roleRank stays fail-closed at 0).
+      streamState.role = "unknown";
+      paintStaticButtons();
+      renderSessionUnknown();
+    }
     if (streamState.lastEvent) renderTables(streamState.lastEvent);
   });
   consumeStream(token, myId);

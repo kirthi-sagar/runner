@@ -769,20 +769,14 @@ fn cow_clone_tree_inner(
     Ok(stats)
 }
 
-/// True when `dst` sits inside `src` (directly or via symlinked
-/// parents): cloning there would recurse forever, creating a new
-/// level on every descent. `dst` itself must not exist (checked
-/// upstream), so the nearest existing ancestor is canonicalized and
-/// the remainder rejoined before comparing. Permission-masked
-/// ancestors compare lexically (traversal would fail there first
-/// anyway, so no infinite descent can result).
 /// True when a file name matches the exclusion list, compared
 /// case-insensitively: `.GIT`/`.Git` on case-insensitive volumes
 /// (NTFS, default APFS) must exclude exactly like `.git`, or
 /// captures would swallow (and restores destroy) VCS metadata.
 /// On case-sensitive filesystems this over-excludes pathological
 /// lookalike names — accepted, since the dangerous direction is
-/// under-exclusion. Shared with the snapshot store.
+/// under-exclusion. Shared with the snapshot store and the
+/// nesting check below (one rule, every call site).
 pub(crate) fn name_is_excluded(name: &std::ffi::OsStr, exclude_names: &[&str]) -> bool {
     let Some(text) = name.to_str() else {
         return false;
@@ -792,10 +786,15 @@ pub(crate) fn name_is_excluded(name: &std::ffi::OsStr, exclude_names: &[&str]) -
         .any(|excluded| text.eq_ignore_ascii_case(excluded))
 }
 
-/// True when `dst` nests inside `src` through a path the walker
-/// will actually descend: nesting whose top-level entry is excluded
-/// is safe (the walker skips that whole subtree, so `dst` is never
-/// reached during traversal).
+/// True when `dst` nests inside `src` (directly or via symlinked
+/// parents) through a path the walker will actually descend:
+/// nesting whose top-level entry is excluded is safe (the walker
+/// skips that whole subtree, so `dst` is never reached during
+/// traversal). `dst` itself must not exist (checked upstream), so
+/// the nearest existing ancestor is canonicalized and the remainder
+/// rejoined before comparing. Permission-masked ancestors compare
+/// lexically (traversal would fail there first anyway, so no
+/// infinite descent can result).
 fn dst_nests_unexcluded(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Result<bool> {
     let canonical_src = std::fs::canonicalize(src)?;
     let mut ancestor = dst;
@@ -821,9 +820,9 @@ fn dst_nests_unexcluded(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Re
     };
     match rel.components().next() {
         None => Ok(true),
-        Some(first) => Ok(!exclude
-            .iter()
-            .any(|name| first.as_os_str() == std::ffi::OsStr::new(name))),
+        // Same folded rule as the walker, or `.RUNNER`-style
+        // nesting reads forbidden while the walker would skip it.
+        Some(first) => Ok(!name_is_excluded(first.as_os_str(), exclude)),
     }
 }
 
@@ -946,6 +945,11 @@ mod tests {
         // walker never descends there.
         assert!(
             !dst_nests_unexcluded(&src, &src.join(".runner").join("snapshots"), &[".runner"])
+                .unwrap()
+        );
+        // Case-folded too: `.RUNNER` excludes like `.runner`.
+        assert!(
+            !dst_nests_unexcluded(&src, &src.join(".RUNNER").join("snapshots"), &[".runner"])
                 .unwrap()
         );
     }

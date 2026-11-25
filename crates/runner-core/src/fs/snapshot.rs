@@ -124,7 +124,10 @@ pub fn discover_repo_root(start: &Path) -> SnapshotResult<PathBuf> {
 
 /// Validate a user snapshot name: non-empty, no path separators or
 /// NUL/control bytes, never `.`/`..`, never trailing dots or spaces
-/// (Windows strips those, aliasing distinct names together).
+/// (Windows strips those, aliasing distinct names together), and
+/// never the `.tmp.` prefix (reserved for staging and tombstones,
+/// which `list()` skips — a public name there would restore but
+/// never list).
 pub fn validate_snapshot_name(name: &str) -> SnapshotResult<()> {
     if name.is_empty() {
         return Err(SnapshotError::Invalid(
@@ -149,6 +152,11 @@ pub fn validate_snapshot_name(name: &str) -> SnapshotResult<()> {
     if name.ends_with('.') || name.ends_with(' ') {
         return Err(SnapshotError::Invalid(format!(
             "snapshot name must not end with a dot or space: '{name}'"
+        )));
+    }
+    if name.starts_with(".tmp.") {
+        return Err(SnapshotError::Invalid(format!(
+            "snapshot name must not use the reserved '.tmp.' prefix: '{name}'"
         )));
     }
     // Structural backstop: exactly one normal component (no roots,
@@ -246,9 +254,11 @@ impl WorkspaceSnapshots {
     /// whose content cannot survive); any extras without `force`
     /// abort before a single file is modified. Then the baseline is
     /// reconciled granularly — files overwritten in place, never
-    /// wholesale directory replacement — and force-gated extras are
-    /// deleted. `.git`/`.runner` are never touched on either side,
-    /// and symlinks restore verbatim (never followed).
+    /// wholesale directory replacement — force-gated extras are
+    /// deleted, and only then do captured directory modes apply
+    /// (locking a directory before deleting inside it would fail).
+    /// `.git`/`.runner` are never touched on either side, and
+    /// symlinks restore verbatim (never followed).
     pub fn restore(
         &self,
         worktree: &Path,
@@ -270,8 +280,10 @@ impl WorkspaceSnapshots {
                 describe_extras(&extras),
             )));
         }
-        // Phase B: reconcile the baseline granularly.
-        restore_tree(&tree, worktree, &mut stats)?;
+        // Phase B: reconcile the baseline granularly. Directory
+        // modes queue for Phase D — nothing locks down yet.
+        let mut mode_queue = Vec::new();
+        restore_tree(&tree, worktree, &mut stats, &mut mode_queue)?;
         // Phase C: delete genuine extras (mismatched counterparts
         // were already replaced above and no longer qualify).
         for extra in &extras {
@@ -301,6 +313,14 @@ impl WorkspaceSnapshots {
                 }
             }
             stats.entries_removed += 1;
+        }
+        // Phase D: finalize captured directory modes (queued
+        // deepest-first during the fill). Deletions are done, so
+        // restricted trees lock down without trapping extras.
+        for (from, onto) in mode_queue {
+            mirror_mode(&from, &onto).map_err(|e| {
+                SnapshotError::Io(format!("cannot restore modes {}: {e}", onto.display()))
+            })?;
         }
         Ok(stats)
     }
@@ -462,12 +482,16 @@ fn describe_extras(extras: &[PathBuf]) -> String {
 /// Reconcile one snapshot level into its worktree counterpart:
 /// directories merge (created as needed, never wholesale-replaced),
 /// files clone over cleared counterparts, links recreate verbatim.
-/// Exclusions skip defensively (captures never store them, but
-/// hand-built baselines must not touch VCS state either).
+/// Directory modes only queue here — the caller applies them
+/// after extras deletion, so restricted trees stay writable
+/// while filling and sweeping. Exclusions skip defensively
+/// (captures never store them, but hand-built baselines must
+/// not touch VCS state either).
 fn restore_tree(
     snapshot_dir: &Path,
     worktree_dir: &Path,
     stats: &mut RestoreStats,
+    mode_queue: &mut Vec<(PathBuf, PathBuf)>,
 ) -> SnapshotResult<()> {
     std::fs::create_dir_all(worktree_dir)
         .map_err(|e| SnapshotError::Io(format!("cannot create {}: {e}", worktree_dir.display())))?;
@@ -486,13 +510,10 @@ fn restore_tree(
                     remove_worktree_entry(&onto)?;
                 }
             }
-            restore_tree(&from, &onto, stats)?;
-            // Captured modes apply post-order: children land before
-            // the lockdown, so 0700 directories stay writable while
-            // filling and restricted afterwards.
-            mirror_mode(&from, &onto).map_err(|e| {
-                SnapshotError::Io(format!("cannot restore modes {}: {e}", onto.display()))
-            })?;
+            restore_tree(&from, &onto, stats, mode_queue)?;
+            // Queue only — the caller finalizes modes after extras
+            // deletion, deepest first.
+            mode_queue.push((from, onto));
         } else if file_type.is_file() {
             replace_counterpart_atomic(&onto, stats, |tmp| {
                 cow_clone_file(&from, tmp).map_err(|e| {
@@ -626,13 +647,31 @@ mod tests {
     #[test]
     fn names_reject_paths_and_tricky_shapes() {
         for bad in [
-            "", ".", "..", "a/b", "a\\b", "a\0b", "trail.", "C:src", "a:b",
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            "trail.",
+            "C:src",
+            "a:b",
+            ".tmp.evil",
+            ".tmp.",
         ] {
             assert!(validate_snapshot_name(bad).is_err(), "{bad:?}");
         }
         for ok in ["v1", "before-refactor", "Agent.Try_2"] {
             assert!(validate_snapshot_name(ok).is_ok(), "{ok}");
         }
+        // The temp prefix can never become a real snapshot: it
+        // would restore but never list.
+        let dir = crate::test_support::TempDir::new("snap-tmpname").unwrap();
+        let repo = fake_repo(dir.path());
+        let store = store_for(&repo);
+        assert!(store.create(&repo, ".tmp.evil").is_err());
+        assert!(store.remove(".tmp.evil").is_err());
+        assert!(store.list().is_empty());
     }
 
     #[test]
@@ -890,7 +929,8 @@ mod tests {
     }
 
     /// Restricted directories roundtrip with their restrictions
-    /// (modes land post-order, after children fill in).
+    /// (modes land after the fill and extras sweep, deepest
+    /// first, so nothing locks down mid-restore).
     #[cfg(unix)]
     #[test]
     fn restore_preserves_restricted_directory_modes() {
@@ -911,6 +951,32 @@ mod tests {
         let mode = std::fs::metadata(&locked).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         assert_eq!(std::fs::read(locked.join("secret.txt")).unwrap(), b"s");
+    }
+
+    /// Extras inside a read-only tree still delete: modes apply
+    /// only after the extras sweep, so a captured 0555 directory
+    /// never locks its own cleanup out with PermissionDenied.
+    #[cfg(unix)]
+    #[test]
+    fn restore_deletes_extras_before_directory_lockdown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::TempDir::new("snap-lockorder").unwrap();
+        let repo = fake_repo(dir.path());
+        let locked = repo.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("keep.txt"), b"keep").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let store = store_for(&repo);
+        store.create(&repo, "v1").unwrap();
+        // Loosen, then plant an untracked extra inside.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(locked.join("extra.txt"), b"extra").unwrap();
+        store.restore(&repo, "v1", true).unwrap();
+        assert!(!locked.join("extra.txt").exists());
+        assert_eq!(std::fs::read(locked.join("keep.txt")).unwrap(), b"keep");
+        let mode = std::fs::metadata(&locked).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o555);
     }
 
     /// Failed restores preserve the worktree: counterparts are

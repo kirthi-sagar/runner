@@ -208,5 +208,9 @@ discover the repo from; default `.`). Output: per-action JSON
 `entries_removed`, `snapshots` array, `removed`). Checkpoints live
 under `<repo>/.runner/snapshots/`, excluding `.git`/`.runner`;
 restore reverts snapshotted state freely but deletes untracked
-extras only with `force: true`. Unknown action, bad name, unknown
-snapshot, or unforced extras → `-32602`.
+extras only with `force: true`. `force` removes snapshot-relative
+extras at every depth and gates file/directory kind replacements
+(a directory standing where the snapshot holds a file, or vice
+versa); without it, any such case aborts the restore before
+modifying anything. Unknown action, bad name, unknown snapshot,
+or unforced extras → `-32602`.

@@ -68,9 +68,23 @@ impl std::error::Error for SnapshotError {}
 /// Fallible snapshot result (see [`SnapshotError`]).
 pub type SnapshotResult<T> = Result<T, SnapshotError>;
 
-/// Disambiguates staging directories created within the same
-/// nanosecond by concurrent same-process captures.
+/// Disambiguates temp paths created within the same nanosecond
+/// by concurrent same-process captures.
 static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Unique per-call tag for staging directories, tombstones, and
+/// restore temp files (process + time + counter: no two collide).
+fn unique_tag() -> String {
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0),
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
+}
 
 /// Locate the enclosing repository root by walking up from `start`
 /// for a `.git` entry (directory or worktree/submodule file). No git
@@ -187,15 +201,7 @@ impl WorkspaceSnapshots {
         }
         std::fs::create_dir_all(&self.root)
             .map_err(|e| SnapshotError::Io(format!("cannot create snapshot store: {e}")))?;
-        let staging = self.root.join(format!(
-            ".tmp.{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0),
-            STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ));
+        let staging = self.root.join(format!(".tmp.{}", unique_tag()));
         let tree = staging.join("tree");
         if let Err(e) = cow_clone_tree_excluding(worktree, &tree, WORKSPACE_EXCLUDES) {
             let _ = std::fs::remove_dir_all(&staging);
@@ -335,15 +341,7 @@ impl WorkspaceSnapshots {
                 "unknown snapshot: '{name}'"
             )));
         }
-        let tombstone = self.root.join(format!(
-            ".tmp.del-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0),
-            STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        ));
+        let tombstone = self.root.join(format!(".tmp.del-{}", unique_tag()));
         std::fs::rename(&dir, &tombstone)
             .map_err(|e| SnapshotError::Io(format!("cannot remove snapshot '{name}': {e}")))?;
         std::fs::remove_dir_all(&tombstone)
@@ -496,15 +494,17 @@ fn restore_tree(
                 SnapshotError::Io(format!("cannot restore modes {}: {e}", onto.display()))
             })?;
         } else if file_type.is_file() {
-            clear_counterpart(&onto, stats)?;
-            cow_clone_file(&from, &onto).map_err(|e| {
-                SnapshotError::Io(format!("cannot restore {}: {e}", from.display()))
+            replace_counterpart_atomic(&onto, stats, |tmp| {
+                cow_clone_file(&from, tmp).map_err(|e| {
+                    SnapshotError::Io(format!("cannot restore {}: {e}", from.display()))
+                })
             })?;
             stats.files_restored += 1;
         } else if file_type.is_symlink() {
-            clear_counterpart(&onto, stats)?;
-            mirror_symlink(&from, &onto).map_err(|e| {
-                SnapshotError::Io(format!("cannot restore {}: {e}", from.display()))
+            replace_counterpart_atomic(&onto, stats, |tmp| {
+                mirror_symlink(&from, tmp).map_err(|e| {
+                    SnapshotError::Io(format!("cannot restore {}: {e}", from.display()))
+                })
             })?;
             stats.files_restored += 1;
         } else {
@@ -517,13 +517,21 @@ fn restore_tree(
     Ok(())
 }
 
-/// Clear one restore counterpart: missing passes, files and links go
-/// singly, real directories go recursively and count as removed
-/// (mismatched subtrees were force-gated during the extras scan).
-fn clear_counterpart(onto: &Path, stats: &mut RestoreStats) -> SnapshotResult<()> {
-    let meta = match std::fs::symlink_metadata(onto) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+/// Replace one restore counterpart atomically: the new content
+/// materializes in a unique sibling temp file first, then renames
+/// over the target — a failed write never destroys the existing
+/// file or link. A real directory in the way is removed first and
+/// counted (mismatched subtrees were force-gated during the extras
+/// scan); a failed produce or rename cleans up its temp and reports
+/// loudly with the original untouched.
+fn replace_counterpart_atomic(
+    onto: &Path,
+    stats: &mut RestoreStats,
+    produce: impl FnOnce(&Path) -> SnapshotResult<()>,
+) -> SnapshotResult<()> {
+    let is_real_dir = match std::fs::symlink_metadata(onto) {
+        Ok(meta) => meta.file_type().is_dir() && !meta.file_type().is_symlink(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
             return Err(SnapshotError::Io(format!(
                 "cannot inspect {}: {e}",
@@ -531,13 +539,23 @@ fn clear_counterpart(onto: &Path, stats: &mut RestoreStats) -> SnapshotResult<()
             )));
         }
     };
-    if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+    if is_real_dir {
         std::fs::remove_dir_all(onto)
             .map_err(|e| SnapshotError::Io(format!("cannot clear {}: {e}", onto.display())))?;
         stats.entries_removed += 1;
-    } else {
-        remove_file_or_symlink(onto)
-            .map_err(|e| SnapshotError::Io(format!("cannot clear {}: {e}", onto.display())))?;
+    }
+    let parent = onto.parent().unwrap_or(Path::new("."));
+    let tmp = parent.join(format!(".tmp.restore-{}", unique_tag()));
+    if let Err(e) = produce(&tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, onto) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SnapshotError::Io(format!(
+            "cannot install {}: {e}",
+            onto.display()
+        )));
     }
     Ok(())
 }
@@ -893,6 +911,38 @@ mod tests {
         let mode = std::fs::metadata(&locked).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         assert_eq!(std::fs::read(locked.join("secret.txt")).unwrap(), b"s");
+    }
+
+    /// Failed restores preserve the worktree: counterparts are
+    /// replaced via temp-rename, so a mid-restore failure leaves
+    /// originals (and no debris) behind.
+    #[cfg(unix)]
+    #[test]
+    fn restore_failure_preserves_counterparts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::test_support::TempDir::new("snap-atomic").unwrap();
+        let repo = fake_repo(dir.path());
+        let store = store_for(&repo);
+        store.create(&repo, "v1").unwrap();
+        // Make the baseline unreadable so the clone fails mid-way.
+        let baseline = store.dir().join("v1").join("tree").join("main.rs");
+        std::fs::set_permissions(&baseline, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&baseline).is_ok() {
+            eprintln!("running privileged; skipping atomic-restore test");
+            return;
+        }
+        std::fs::write(repo.join("main.rs"), b"mutated").unwrap();
+        assert!(store.restore(&repo, "v1", true).is_err());
+        // Original bytes intact; temp debris cleaned up.
+        assert_eq!(std::fs::read(repo.join("main.rs")).unwrap(), b"mutated");
+        let debris: Vec<_> = std::fs::read_dir(&repo)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".tmp.restore-"))
+            .collect();
+        assert!(debris.is_empty());
+        std::fs::set_permissions(&baseline, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     /// Snapshot of a whole tree for before/after refusal proofs.

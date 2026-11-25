@@ -9,10 +9,18 @@ use std::time::Duration;
 
 /// Spawn the app on an ephemeral loopback port; returns the base
 /// URL plus the session store handle for minting test sessions.
+/// Pins `RUNNER_SOCK` to a path nothing ever serves, so test
+/// mutations can never reach a live production daemon (same
+/// value on every call — safe under parallel tests).
 async fn spawn_dashboard(
     local_token: Option<String>,
     ttl: Duration,
+    cache_dir: Option<std::path::PathBuf>,
 ) -> (String, Arc<SessionStore>) {
+    std::env::set_var(
+        "RUNNER_SOCK",
+        std::env::temp_dir().join("runner-test-no-daemon.sock"),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let state = AppState::new(
@@ -20,6 +28,7 @@ async fn spawn_dashboard(
         SessionStore::new(ttl),
         None,
         local_token,
+        cache_dir,
     );
     let sessions = state.sessions.clone();
     tokio::spawn(async move { serve_on(listener, state).await });
@@ -63,7 +72,7 @@ async fn read_first_event(response: &mut reqwest::Response) -> serde_json::Value
 
 #[tokio::test]
 async fn stream_rejects_missing_and_unknown_bearers() {
-    let (base, _) = spawn_dashboard(None, Duration::from_secs(60)).await;
+    let (base, _) = spawn_dashboard(None, Duration::from_secs(60), None).await;
     let http = reqwest::Client::new();
     let res = http
         .get(format!("{base}/api/v1/stream"))
@@ -82,7 +91,7 @@ async fn stream_rejects_missing_and_unknown_bearers() {
 
 #[tokio::test]
 async fn stream_serves_every_role_with_shaped_events() {
-    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60)).await;
+    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None).await;
     let http = reqwest::Client::new();
     // Viewers observe: the lowest role streams 200 with shape.
     let viewer = sessions.create(Some("v@x.y".to_string()), vec![]).await;
@@ -126,7 +135,7 @@ async fn stream_serves_every_role_with_shaped_events() {
 
 #[tokio::test]
 async fn stream_ends_when_session_lapses() {
-    let (base, sessions) = spawn_dashboard(None, Duration::from_millis(150)).await;
+    let (base, sessions) = spawn_dashboard(None, Duration::from_millis(150), None).await;
     let http = reqwest::Client::new();
     let session = sessions.create(Some("e@x.y".to_string()), vec![]).await;
     let mut res = http
@@ -150,8 +159,12 @@ async fn stream_ends_when_session_lapses() {
 
 #[tokio::test]
 async fn stream_accepts_local_console_token_as_admin() {
-    let (base, _) =
-        spawn_dashboard(Some("console-secret".to_string()), Duration::from_secs(60)).await;
+    let (base, _) = spawn_dashboard(
+        Some("console-secret".to_string()),
+        Duration::from_secs(60),
+        None,
+    )
+    .await;
     let http = reqwest::Client::new();
     let mut res = http
         .get(format!("{base}/api/v1/stream"))
@@ -174,7 +187,7 @@ async fn stream_accepts_local_console_token_as_admin() {
 
 #[tokio::test]
 async fn dashboard_page_serves_single_bundle_airgapped() {
-    let (base, _) = spawn_dashboard(None, Duration::from_secs(60)).await;
+    let (base, _) = spawn_dashboard(None, Duration::from_secs(60), None).await;
     let page = reqwest::get(format!("{base}/"))
         .await
         .unwrap()
@@ -201,4 +214,142 @@ async fn dashboard_page_serves_single_bundle_airgapped() {
     for banned in ["https://", "http://", "<script src", "<link href"] {
         assert!(!page.contains(banned), "leaks {banned}");
     }
+}
+
+#[tokio::test]
+async fn mutations_gate_by_role_then_proxy_daemon() {
+    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None).await;
+    let http = reqwest::Client::new();
+    let viewer = sessions.create(Some("v@x.y".to_string()), vec![]).await;
+    let operator = sessions
+        .create(Some("o@x.y".to_string()), vec!["ops".to_string()])
+        .await;
+    let admin = sessions
+        .create(Some("a@x.y".to_string()), vec!["admins".to_string()])
+        .await;
+    // Cancel is Operator+: viewer forbidden, operator/admin
+    // reach the (absent) daemon.
+    let res = http
+        .post(format!("{base}/api/v1/jobs/7/cancel"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let res = http
+        .post(format!("{base}/api/v1/jobs/7/cancel"))
+        .bearer_auth(&viewer.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+    for session in [&operator, &admin] {
+        let res = http
+            .post(format!("{base}/api/v1/jobs/7/cancel"))
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+    // Kill is Admin+: operators are forbidden too.
+    for (session, want) in [
+        (&viewer, reqwest::StatusCode::FORBIDDEN),
+        (&operator, reqwest::StatusCode::FORBIDDEN),
+        (&admin, reqwest::StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let res = http
+            .post(format!("{base}/api/v1/swarms/s1/kill"))
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), want);
+    }
+}
+
+#[tokio::test]
+async fn prune_dry_run_reports_shape_without_deleting() {
+    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None).await;
+    let http = reqwest::Client::new();
+    let viewer = sessions.create(Some("v@x.y".to_string()), vec![]).await;
+    let operator = sessions
+        .create(Some("o@x.y".to_string()), vec!["ops".to_string()])
+        .await;
+    let res = http
+        .post(format!("{base}/api/v1/cache/prune"))
+        .bearer_auth(&viewer.token)
+        .json(&serde_json::json!({ "dry_run": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+    let res = http
+        .post(format!("{base}/api/v1/cache/prune"))
+        .bearer_auth(&operator.token)
+        .json(&serde_json::json!({ "dry_run": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["dry_run"], true);
+    for key in ["blobs_removed", "blobs_bytes", "tmps_removed", "tmps_bytes"] {
+        assert!(
+            body.get(key).and_then(|v| v.as_u64()).is_some(),
+            "missing {key}"
+        );
+    }
+    // A missing body fails loudly (exact code is axum's).
+    let res = http
+        .post(format!("{base}/api/v1/cache/prune"))
+        .bearer_auth(&operator.token)
+        .send()
+        .await
+        .unwrap();
+    assert!(res.status().is_client_error());
+}
+
+#[tokio::test]
+async fn prune_real_run_removes_only_orphans_in_custom_dir() {
+    use runner::sandbox::oci::cache::{ImageStore, LayerCache, StoredLayer, StoredManifest};
+    let tmp = runner::test_support::TempDir::new("prune-dir").unwrap();
+    let dir = tmp.path().join("layers");
+    let cache = LayerCache::new(dir.clone());
+    std::fs::create_dir_all(cache.dir()).unwrap();
+    std::fs::write(cache.dir().join("a".repeat(64)), vec![1u8; 16]).unwrap();
+    std::fs::write(cache.dir().join("b".repeat(64)), vec![2u8; 32]).unwrap();
+    let store = ImageStore::new(cache.dir());
+    store
+        .write_manifest(
+            "img:1",
+            &StoredManifest {
+                reference: "img:1".to_string(),
+                manifest_digest: "sha256:bbbb".to_string(),
+                layers: vec![StoredLayer {
+                    digest: format!("sha256:{}", "a".repeat(64)),
+                    size: 16,
+                }],
+                pulled_at_secs: 1,
+            },
+        )
+        .unwrap();
+    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), Some(dir.clone())).await;
+    let http = reqwest::Client::new();
+    let operator = sessions
+        .create(Some("o@x.y".to_string()), vec!["ops".to_string()])
+        .await;
+    let res = http
+        .post(format!("{base}/api/v1/cache/prune"))
+        .bearer_auth(&operator.token)
+        .json(&serde_json::json!({ "dry_run": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["dry_run"], false);
+    assert_eq!(body["blobs_removed"], 1);
+    assert_eq!(body["blobs_bytes"], 32);
+    assert!(!cache.dir().join("b".repeat(64)).exists());
+    assert!(cache.dir().join("a".repeat(64)).exists());
 }

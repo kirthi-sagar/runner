@@ -7,7 +7,7 @@
 //! Throttling is weight-only: this module never freezes cgroups, so test
 //! timers and TCP keepalives survive critical pressure on trickle CPU.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -95,6 +95,20 @@ pub struct InFlightJob {
 /// Cap on tracked jobs; oldest entries roll off first.
 pub const MAX_TRACKED_JOBS: usize = 64;
 
+/// Cancelled-job redispatch suppression window: comfortably longer
+/// than several coordinator poll ticks, short enough that a genuinely
+/// re-queued job id recovers the same shift.
+pub const CANCEL_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Cap on cooldown entries; oldest roll off first (same scale as
+/// the tracked-job registry).
+pub const MAX_COOLDOWNS: usize = 64;
+
+/// True while `cancelled_at` is inside the redispatch cooldown.
+fn cooling_since(cancelled_at: Instant, now: Instant) -> bool {
+    now.duration_since(cancelled_at) < CANCEL_COOLDOWN
+}
+
 /// Lease for one peer-dispatched job: the result is expected before
 /// `deadline`, else the sweeper releases it for re-dispatch.
 #[derive(Debug, Clone)]
@@ -151,6 +165,9 @@ pub struct SupervisorState {
     next_reservation: u64,
     in_flight: u32,
     jobs: Vec<InFlightJob>,
+    /// Recently cancelled `(provider, id, at)` (FIFO-capped):
+    /// cancelled jobs must not re-dispatch on the next poll tick.
+    cancelled_cooldown: VecDeque<(String, String, Instant)>,
     queue_depth: u32,
     forge_health: BTreeMap<String, ForgeHealth>,
     wakeup: Arc<Notify>,
@@ -203,6 +220,7 @@ impl SupervisorState {
             next_reservation: 1,
             in_flight: 0,
             jobs: Vec::new(),
+            cancelled_cooldown: VecDeque::new(),
             queue_depth: 0,
             forge_health: BTreeMap::new(),
             wakeup: Arc::new(Notify::new()),
@@ -627,6 +645,58 @@ impl SupervisorState {
     /// Drop a finished job from the registry (caller's forge only).
     pub fn job_finished(&mut self, provider: &str, id: &str) {
         self.jobs.retain(|j| j.provider != provider || j.id != id);
+    }
+
+    /// Administratively cancel every tracked job with `id`, across
+    /// providers: drops the records and releases their peer leases.
+    /// The daemon tracks dispatches, not worker processes, so a
+    /// remote worker may still run to completion — cancellation
+    /// stops coordinator tracking, not remote execution. Returns
+    /// the cancelled providers in stable order (empty = unknown).
+    pub fn job_cancel(&mut self, id: &str) -> Vec<String> {
+        let mut providers = Vec::new();
+        self.jobs.retain(|j| {
+            if j.id == id {
+                providers.push(j.provider.clone());
+                false
+            } else {
+                true
+            }
+        });
+        for provider in &providers {
+            self.release_peer_lease(provider, id);
+        }
+        providers.sort();
+        providers.dedup();
+        let now = Instant::now();
+        for provider in &providers {
+            self.note_cancelled(provider, id, now);
+        }
+        providers
+    }
+
+    /// Record a cancellation for redispatch suppression (stale
+    /// entries pruned, oldest evicted past the cap).
+    fn note_cancelled(&mut self, provider: &str, id: &str, now: Instant) {
+        self.cancelled_cooldown
+            .retain(|(_, _, at)| cooling_since(*at, now));
+        self.cancelled_cooldown
+            .retain(|(p, i, _)| p != provider || i != id);
+        while self.cancelled_cooldown.len() >= MAX_COOLDOWNS {
+            self.cancelled_cooldown.pop_front();
+        }
+        self.cancelled_cooldown
+            .push_back((provider.to_string(), id.to_string(), now));
+    }
+
+    /// True while a dispatch of `(provider, id)` must be refused
+    /// as recently cancelled. Pure read (stale entries fall out
+    /// on the next cancellation, bounded by the cap regardless).
+    pub fn is_cancelled_cooling(&self, provider: &str, id: &str) -> bool {
+        let now = Instant::now();
+        self.cancelled_cooldown
+            .iter()
+            .any(|(p, i, at)| p == provider && i == id && cooling_since(*at, now))
     }
 
     /// Install the WAN transport handle (daemon Start with `[mesh] peer_port`).
@@ -1212,6 +1282,61 @@ async fn run_supervisor_inner(
 mod tests {
     use super::*;
     use crate::governor::psi::{PsiFile, PsiLine};
+
+    // Administrative cancel drops every same-id record across
+    // providers plus their peer leases; unknown ids cancel nothing.
+    #[test]
+    fn job_cancel_drops_records_and_leases_across_providers() {
+        let mut state = SupervisorState::new();
+        state.job_started("github", "7", "ci / test");
+        state.job_started("gitlab", "7", "ci / test");
+        state.job_started("github", "8", "ci / other");
+        state.add_peer_lease(
+            "github",
+            "7",
+            "node-1".to_string(),
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        assert_eq!(
+            state.job_cancel("7"),
+            vec!["github".to_string(), "gitlab".to_string()]
+        );
+        let ids: Vec<String> = state
+            .in_flight_jobs()
+            .into_iter()
+            .map(|job| format!("{}/{}", job.provider, job.id))
+            .collect();
+        assert_eq!(ids, vec!["github/8".to_string()]);
+        assert!(state.peer_load().is_empty());
+        assert!(state.job_cancel("7").is_empty());
+        assert!(state.job_cancel("missing").is_empty());
+    }
+
+    // Cancelled ids cool down (per provider), then lapse; the set
+    // stays capped with oldest-first eviction.
+    #[test]
+    fn cooldown_suppresses_redispatch_then_lapses() {
+        let mut state = SupervisorState::new();
+        state.job_started("github", "7", "ci / test");
+        assert!(!state.is_cancelled_cooling("github", "7"));
+        state.job_cancel("7");
+        assert!(state.is_cancelled_cooling("github", "7"));
+        assert!(!state.is_cancelled_cooling("gitlab", "7"));
+        assert!(!state.is_cancelled_cooling("github", "8"));
+        // Window edges, without sleeping.
+        let now = std::time::Instant::now();
+        assert!(cooling_since(now, now));
+        assert!(!cooling_since(now - CANCEL_COOLDOWN, now));
+        // Oldest entries roll off past the cap.
+        for i in 0..MAX_COOLDOWNS + 5 {
+            let id = format!("x{i}");
+            state.job_started("github", &id, "flood");
+            state.job_cancel(&id);
+        }
+        assert_eq!(state.cancelled_cooldown.len(), MAX_COOLDOWNS);
+        assert!(!state.is_cancelled_cooling("github", "x0"));
+        assert!(state.is_cancelled_cooling("github", &format!("x{}", MAX_COOLDOWNS + 4)));
+    }
 
     // Sleep latch: halting zeroes intake immediately and clamps every
     // tick while set; resume restores normal allocation.

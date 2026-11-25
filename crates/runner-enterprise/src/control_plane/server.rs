@@ -1,12 +1,15 @@
 //! Embedded Axum control plane: fleet API + OIDC login.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
+use runner_sandbox::oci::cache;
 
 use super::auth::{grant_expired, Grant, OidcManager, Role, SessionStore};
 use super::fleet::{FleetRegistry, HeartbeatPayload, RunnerRegistration};
@@ -19,6 +22,11 @@ pub struct AppState {
     pub oidc: Option<Arc<OidcManager>>,
     /// Pre-shared local-console bearer (grants Admin when matched).
     pub local_token: Option<String>,
+    /// OCI cache root override (custom container cache dirs);
+    /// `None` reads the default location.
+    pub cache_dir: Option<PathBuf>,
+    /// Memoized OCI summary + stamp (shared across viewer ticks).
+    pub oci_memo: Arc<Mutex<Option<(Instant, cache::CacheSummary)>>>,
 }
 
 impl AppState {
@@ -27,12 +35,15 @@ impl AppState {
         sessions: SessionStore,
         oidc: Option<OidcManager>,
         local_token: Option<String>,
+        cache_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             fleet: Arc::new(fleet),
             sessions: Arc::new(sessions),
             oidc: oidc.map(Arc::new),
             local_token,
+            cache_dir,
+            oci_memo: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -295,25 +306,50 @@ async fn authorize(
 /// to null instead of stalling the whole event.
 const IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Daemon proxy failure, classified for HTTP mapping.
+enum ProxyError {
+    /// Socket missing, timed out, or otherwise silent.
+    Unreachable,
+    /// The daemon answered with an error message.
+    Daemon(String),
+}
+
+/// Proxy one daemon call within budget: the result value or the
+/// classified failure (callers map to HTTP).
+async fn proxy_ipc(
+    method: &str,
+    params: Option<serde_json::Value>,
+) -> Result<serde_json::Value, ProxyError> {
+    let sock = runner_core::ipc::resolve_sock_path();
+    let call = runner_core::ipc::ipc_call_with(&sock, method, params);
+    let Ok(Ok(res)) = tokio::time::timeout(IPC_TIMEOUT, call).await else {
+        return Err(ProxyError::Unreachable);
+    };
+    if res.get("error").is_some() {
+        let message = res
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(|message| message.as_str())
+            .unwrap_or("daemon error")
+            .to_string();
+        return Err(ProxyError::Daemon(message));
+    }
+    res.get("result")
+        .cloned()
+        .ok_or(ProxyError::Daemon("daemon returned no result".to_string()))
+}
+
 /// Daemon IPC result value (`None` when the daemon is
 /// unreachable, slow, or reports an error).
 async fn ipc_result(method: &str) -> Option<serde_json::Value> {
-    let sock = runner_core::ipc::resolve_sock_path();
-    let call = runner_core::ipc::ipc_call(&sock, method);
-    let Ok(Ok(res)) = tokio::time::timeout(IPC_TIMEOUT, call).await else {
-        return None;
-    };
-    if res.get("error").is_some() {
-        return None;
-    }
-    res.get("result").cloned()
+    proxy_ipc(method, None).await.ok()
 }
 
 /// One metrics snapshot: PSI pressure, governor weights, active
 /// jobs, OCI cache stats, swarm sessions. Every daemon-owned
 /// source is best-effort (null when unreachable); the local OCI
 /// cache always summarizes, even when empty.
-async fn metrics_payload() -> serde_json::Value {
+async fn metrics_payload(state: &AppState) -> serde_json::Value {
     let psi = runner_core::governor::psi::read_snapshot().ok().map(|s| {
         serde_json::json!({
             "cpu": s.cpu.some.avg10,
@@ -334,7 +370,7 @@ async fn metrics_payload() -> serde_json::Value {
     let swarms = ipc_result("swarm_list")
         .await
         .and_then(|v| v.get("swarms").cloned());
-    let oci_cache = memoized_cache_summary();
+    let oci_cache = oci_summary_cached(state).await;
     let ts_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -364,25 +400,33 @@ const OCI_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Lock a poison-tolerant mutex (a panicked holder must not wedge
 /// metrics for the rest of the process).
-fn lock_mutex<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-/// Memoized default-cache summary: every viewer tick reads the
-/// memo and disk is scanned only once it goes stale. The guard
-/// is never held across IO or await.
-fn memoized_cache_summary() -> runner_sandbox::oci::cache::CacheSummary {
-    use std::sync::{LazyLock, Mutex};
-    type Memo = Option<(std::time::Instant, runner_sandbox::oci::cache::CacheSummary)>;
-    static MEMO: LazyLock<Mutex<Memo>> = LazyLock::new(|| Mutex::new(None));
-    if let Some((at, summary)) = lock_mutex(&MEMO).clone() {
+/// OCI cache summary for this server's cache root, memoized per
+/// state (2s TTL): every viewer tick reads the memo and disk is
+/// scanned only once it goes stale. The guard is never held
+/// across IO or await; slow scans run off the async runtime
+/// (a panicking scan degrades to zeros, never aborts ticks).
+async fn oci_summary_cached(state: &AppState) -> cache::CacheSummary {
+    if let Some((at, summary)) = lock_mutex(&state.oci_memo).clone() {
         if at.elapsed() < OCI_MEMO_TTL {
             return summary;
         }
     }
-    let fresh = runner_sandbox::oci::cache::cache_summary();
-    *lock_mutex(&MEMO) = Some((std::time::Instant::now(), fresh.clone()));
-    fresh
+    let memo = state.oci_memo.clone();
+    let dir = state.cache_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let fresh = match &dir {
+            Some(dir) => cache::cache_summary_at(dir),
+            None => cache::cache_summary(),
+        };
+        *lock_mutex(&memo) = Some((Instant::now(), fresh.clone()));
+        fresh
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Real-time metrics SSE (Viewer+): one JSON event every
@@ -398,27 +442,214 @@ async fn metrics_stream(
         Err(response) => return *response,
     };
     let events = futures_util::stream::unfold(
-        (tokio::time::interval(METRICS_INTERVAL), grant.expires_at),
-        |(mut ticker, expires_at)| async move {
+        (
+            tokio::time::interval(METRICS_INTERVAL),
+            grant.expires_at,
+            state.clone(),
+        ),
+        |(mut ticker, expires_at, state)| async move {
             // Sessions lapse mid-stream: end the stream rather
             // than serve a dead credential's metrics. Checked both
             // before and after collection, so a grant lapsing
             // during a slow tick emits nothing fresh.
-            if grant_expired(expires_at, std::time::Instant::now()) {
+            if grant_expired(expires_at, Instant::now()) {
                 return None;
             }
             ticker.tick().await;
-            let payload = metrics_payload().await;
-            if grant_expired(expires_at, std::time::Instant::now()) {
+            let payload = metrics_payload(&state).await;
+            if grant_expired(expires_at, Instant::now()) {
                 return None;
             }
             let event = axum::response::sse::Event::default()
                 .json_data(payload)
                 .unwrap_or_else(|_| axum::response::sse::Event::default().comment("encode error"));
-            Some((Ok::<_, axum::Error>(event), (ticker, expires_at)))
+            Some((Ok::<_, axum::Error>(event), (ticker, expires_at, state)))
         },
     );
     axum::response::Sse::new(events).into_response()
+}
+
+/// Cancel one tracked job by id (Operator+): administrative —
+/// drops coordinator tracking and leases, never kills remote
+/// workers. Unknown ids 404; a silent daemon 503s.
+async fn cancel_job(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if let Err(response) = authorize(&headers, &state, Role::Operator).await {
+        return *response;
+    }
+    if job_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "job id must not be empty" })),
+        )
+            .into_response();
+    }
+    let params = serde_json::json!({ "job_id": job_id });
+    match proxy_ipc("job_cancel", Some(params)).await {
+        Err(ProxyError::Unreachable) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "daemon unreachable" })),
+        )
+            .into_response(),
+        Err(ProxyError::Daemon(message)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        Ok(result) => {
+            let cancelled = result
+                .get("cancelled")
+                .and_then(|cancelled| cancelled.as_bool())
+                .unwrap_or(false);
+            if !cancelled {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": format!("unknown job: '{job_id}'") })),
+                )
+                    .into_response();
+            }
+            (StatusCode::OK, Json(result)).into_response()
+        }
+    }
+}
+
+/// Terminate one swarm by id (Admin+): reclaims slices and
+/// abandons member jobs. Unknown ids 404; a silent daemon 503s.
+async fn kill_swarm(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Path(swarm_id): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if let Err(response) = authorize(&headers, &state, Role::Admin).await {
+        return *response;
+    }
+    if swarm_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "swarm id must not be empty" })),
+        )
+            .into_response();
+    }
+    let params = serde_json::json!({ "swarm_id": swarm_id });
+    match proxy_ipc("swarm_kill", Some(params)).await {
+        Err(ProxyError::Unreachable) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "daemon unreachable" })),
+        )
+            .into_response(),
+        Err(ProxyError::Daemon(message)) => {
+            if message.contains("unknown swarm_id") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": message })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+    }
+}
+
+/// Prune request: dry runs report targets without deleting.
+#[derive(serde::Deserialize)]
+struct PruneRequest {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Staging grace mirrors the CLI prune default (1h): younger
+/// staging files may belong to in-flight pulls.
+const PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Prune tallies (dry runs count targets, real runs count
+/// removals).
+#[derive(Default)]
+struct PruneTallies {
+    blobs: usize,
+    blob_bytes: u64,
+    tmps: usize,
+    tmp_bytes: u64,
+}
+
+/// Collect (+ optionally remove) unreferenced blobs and stale
+/// staging at `cache_dir`. Removals continue past individual
+/// failures; the first error reports alongside partial tallies.
+fn run_prune(dry_run: bool, cache_dir: PathBuf) -> (PruneTallies, Option<String>) {
+    let cache = cache::LayerCache::new(cache_dir);
+    let store = cache::ImageStore::new(cache.dir());
+    let mut tallies = PruneTallies::default();
+    let mut first_error: Option<String> = None;
+    let mut take = |path: &std::path::PathBuf, is_blob: bool| {
+        let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        if !dry_run {
+            if let Err(e) = std::fs::remove_file(path) {
+                if first_error.is_none() {
+                    first_error = Some(format!("cannot remove {}: {e}", path.display()));
+                }
+                return;
+            }
+        }
+        if is_blob {
+            tallies.blobs += 1;
+            tallies.blob_bytes += bytes;
+        } else {
+            tallies.tmps += 1;
+            tallies.tmp_bytes += bytes;
+        }
+    };
+    for path in store.unreferenced_blobs(&cache) {
+        take(&path, true);
+    }
+    for path in cache.stale_tmps(PRUNE_GRACE) {
+        take(&path, false);
+    }
+    (tallies, first_error)
+}
+
+/// Prune the OCI layer cache (Operator+): unreferenced blobs
+/// plus staging older than the grace window. Runs off the
+/// async runtime; partial failures 502 with tallies intact.
+async fn prune_cache(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<PruneRequest>,
+) -> axum::response::Response {
+    if let Err(response) = authorize(&headers, &state, Role::Operator).await {
+        return *response;
+    }
+    let dry_run = body.dry_run;
+    let dir = state
+        .cache_dir
+        .clone()
+        .unwrap_or_else(cache::LayerCache::default_dir);
+    let outcome = tokio::task::spawn_blocking(move || run_prune(dry_run, dir)).await;
+    let Ok((tallies, error)) = outcome else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "prune task failed" })),
+        )
+            .into_response();
+    };
+    let mut payload = serde_json::json!({
+        "dry_run": dry_run,
+        "blobs_removed": tallies.blobs,
+        "blobs_bytes": tallies.blob_bytes,
+        "tmps_removed": tallies.tmps,
+        "tmps_bytes": tallies.tmp_bytes,
+    });
+    if let Some(error) = error {
+        payload["error"] = serde_json::json!(error);
+        return (StatusCode::BAD_GATEWAY, Json(payload)).into_response();
+    }
+    (StatusCode::OK, Json(payload)).into_response()
 }
 
 /// Build the router (pure constructor; integration-tested over TCP).
@@ -428,6 +659,9 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/dashboard", get(dashboard))
         .route("/health", get(health))
         .route("/api/v1/stream", get(metrics_stream))
+        .route("/api/v1/jobs/:id/cancel", post(cancel_job))
+        .route("/api/v1/cache/prune", post(prune_cache))
+        .route("/api/v1/swarms/:id/kill", post(kill_swarm))
         .route("/api/v1/fleet", get(fleet_inventory))
         .route("/api/v1/runners/register", post(register_runner))
         .route("/api/v1/runners/heartbeat", post(runner_heartbeat))

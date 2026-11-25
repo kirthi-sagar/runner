@@ -65,3 +65,39 @@ async fn ipc_snapshot_and_poll_now() {
 
     task.abort();
 }
+
+#[tokio::test]
+async fn ipc_job_cancel_drops_records() {
+    use runner::ipc::ipc_call_with;
+    let dir = runner::test_support::TempDir::new("ipc-cancel").unwrap();
+    let path = dir.path().join("runner.sock");
+    let state = new_shared_state();
+    {
+        let mut guard = state.write().await;
+        guard.job_started("github", "7", "ci / test");
+        guard.job_started("gitlab", "7", "ci / test");
+    }
+    let server = Arc::new(IpcServer::bind(&path, state.clone()).await.unwrap());
+    let task = tokio::spawn(async move { server.serve().await });
+
+    let params = |job_id: &str| Some(serde_json::json!({ "job_id": job_id }));
+    let res = ipc_call_with(&path, "job_cancel", params("7"))
+        .await
+        .unwrap();
+    assert_eq!(res["result"]["cancelled"], true);
+    assert_eq!(
+        res["result"]["providers"],
+        serde_json::json!(["github", "gitlab"])
+    );
+    // Second cancel finds nothing; empty ids are rejected.
+    let res = ipc_call_with(&path, "job_cancel", params("7"))
+        .await
+        .unwrap();
+    assert_eq!(res["result"]["cancelled"], false);
+    let res = ipc_call_with(&path, "job_cancel", params("  "))
+        .await
+        .unwrap();
+    assert_eq!(res["error"]["code"], -32602);
+
+    task.abort();
+}

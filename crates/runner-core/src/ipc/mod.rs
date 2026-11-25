@@ -37,8 +37,13 @@ pub fn fallback_sock_path() -> Option<PathBuf> {
 }
 
 /// Pick the privileged path when its parent is writable, else the fallback.
+/// `RUNNER_SOCK` overrides everything (tests pin a hermetic path so
+/// they never dial a live production daemon).
 #[cfg(not(windows))]
 pub fn resolve_sock_path() -> PathBuf {
+    if let Some(path) = sock_override() {
+        return path;
+    }
     let primary = PathBuf::from(SOCK_PATH);
     if let Some(parent) = primary.parent() {
         // Writable probe: the daemon must be able to create the socket file.
@@ -61,7 +66,21 @@ pub const PIPE_NAME: &str = r"\\.\pipe\runner-ipc";
 /// tests never collide on one pipe.
 #[cfg(windows)]
 pub fn resolve_sock_path() -> PathBuf {
+    if let Some(path) = sock_override() {
+        return path;
+    }
     PathBuf::from(PIPE_NAME)
+}
+
+/// Explicit socket override from the environment (blank values
+/// ignored, so empty exports can't strand the client).
+fn sock_override() -> Option<PathBuf> {
+    let path = std::env::var("RUNNER_SOCK").ok()?;
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
 }
 
 /// Map a socket path to its Windows pipe name (see [`resolve_sock_path`]).
@@ -508,6 +527,25 @@ pub async fn handle_ipc_request(value: Value, state: &SharedState) -> Value {
                 }
             }
         }
+        "job_cancel" => {
+            let job_id = value
+                .get("params")
+                .and_then(|p| p.get("job_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if job_id.trim().is_empty() {
+                return serde_json::json!({ "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32602, "message": "job_id must not be empty" } });
+            }
+            let mut guard = state.write().await;
+            let providers = guard.job_cancel(&job_id);
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {
+                "job_id": job_id,
+                "cancelled": !providers.is_empty(),
+                "providers": providers,
+            } })
+        }
         _ => serde_json::json!({ "jsonrpc": "2.0", "id": id,
             "error": { "code": -32601, "message": format!("method not found: {method}") } }),
     }
@@ -770,6 +808,22 @@ mod tests {
         let server = IpcServer::bind(&path, new_shared_state()).await.unwrap();
         let mode = std::fs::metadata(server.path()).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    // Socket override: explicit paths win, blanks fall through
+    // (previous value restored — env is process-global).
+    #[test]
+    fn sock_override_respects_explicit_paths_only() {
+        let prior = std::env::var("RUNNER_SOCK").ok();
+        std::env::set_var("RUNNER_SOCK", "  /tmp/hermetic.sock  ");
+        assert_eq!(sock_override(), Some(PathBuf::from("/tmp/hermetic.sock")));
+        assert_eq!(resolve_sock_path(), PathBuf::from("/tmp/hermetic.sock"));
+        std::env::set_var("RUNNER_SOCK", "   ");
+        assert_eq!(sock_override(), None);
+        match prior {
+            Some(value) => std::env::set_var("RUNNER_SOCK", value),
+            None => std::env::remove_var("RUNNER_SOCK"),
+        }
     }
 
     fn cloud_req(method: &str, params: serde_json::Value) -> serde_json::Value {

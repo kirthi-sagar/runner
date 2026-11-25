@@ -191,8 +191,9 @@ function streamBanner(msg) {
   streamState.bannerMsg = msg;
   paintBanner();
 }
-var streamState = { token: null, abort: null, backoffMs: 1000, timer: null, live: false, bannerMsg: null, reader: null, watchdog: null, lastChunkAt: 0 };
-function isStale(token) {
+var streamState = { token: null, abort: null, backoffMs: 1000, timer: null, live: false, bannerMsg: null, reader: null, watchdog: null, lastChunkAt: 0, activeId: 0 };
+function isStale(token, myId) {
+  if (myId !== streamState.activeId) return true;
   if (streamState.token !== token) return true;
   return !!(streamState.abort && streamState.abort.signal.aborted);
 }
@@ -365,14 +366,27 @@ function scheduleReconnect() {
   }, streamState.backoffMs);
   streamState.backoffMs = Math.min(streamState.backoffMs * 2, 5000);
 }
-async function consumeStream(token) {
+async function consumeStream(token, myId) {
+  // Establishment timeout: stalled headers must retry, not hang.
+  // The abort below also rejects the fetch, but the staleness
+  // guard suppresses that duplicate reconnect.
+  var connectTimer = setTimeout(function () {
+    if (isStale(token, myId)) return;
+    try { streamState.abort.abort(); } catch (e) {}
+    scheduleReconnect();
+  }, 5000);
   var res;
   try {
     res = await fetch("/api/v1/stream", {
       headers: { "Authorization": "Bearer " + token },
       signal: streamState.abort.signal
     });
-  } catch (e) { if (!isStale(token)) scheduleReconnect(); return; }
+  } catch (e) {
+    clearTimeout(connectTimer);
+    if (!isStale(token, myId)) scheduleReconnect();
+    return;
+  }
+  clearTimeout(connectTimer);
   if (res.status === 401) {
     setBadge("stream", "unauthorized", "bad");
     streamBanner("console token rejected — enter a valid token");
@@ -383,7 +397,7 @@ async function consumeStream(token) {
     streamBanner("this token needs the operator role");
     return;
   }
-  if (!res.ok) { if (!isStale(token)) scheduleReconnect(); return; }
+  if (!res.ok) { if (!isStale(token, myId)) scheduleReconnect(); return; }
   streamBanner(null);
   setBadge("stream", "live", "ok");
   streamState.backoffMs = 1000;
@@ -395,6 +409,9 @@ async function consumeStream(token) {
   try {
     for (;;) {
       var chunk = await reader.read();
+      // A superseded consumer abandons its stream silently:
+      // no renders, no reconnect, the active one owns both.
+      if (myId !== streamState.activeId) return;
       streamState.lastChunkAt = Date.now();
       if (chunk.done) break;
       buf += decoder.decode(chunk.value, { stream: true });
@@ -411,16 +428,20 @@ async function consumeStream(token) {
       }
     }
   } catch (e) {}
+  // Superseded consumers exit silently (their watchdog was
+  // already replaced); only the active one may disarm or retry.
+  if (myId !== streamState.activeId) return;
   disarmWatchdog();
-  if (!isStale(token)) scheduleReconnect();
+  if (!isStale(token, myId)) scheduleReconnect();
 }
 function connect(token) {
   disconnect(true);
   streamState.token = token;
+  streamState.activeId++;
   streamState.abort = new AbortController();
   saveToken(token);
   document.getElementById("token").value = "";
-  consumeStream(token);
+  consumeStream(token, streamState.activeId);
 }
 function disconnect(silent) {
   streamState.token = null;

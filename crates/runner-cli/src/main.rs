@@ -1816,6 +1816,21 @@ fn resolve_dashboard_addr(listen: &str, port: Option<u16>) -> Result<std::net::S
     Ok(addr)
 }
 
+/// Resolve the console bearer: explicit `--token` wins, then
+/// `RUNNER_DASHBOARD_TOKEN` (keeps secrets out of world-readable
+/// `/proc/<pid>/cmdline`), else a fresh per-run token. Blanks
+/// fall through so surrounding whitespace can't strand
+/// authorization with a mismatch.
+fn resolve_console_token(flag: Option<String>, env: Option<String>, generated: String) -> String {
+    for token in [flag, env].into_iter().flatten() {
+        let trimmed = token.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    generated
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load ~/.config/runner/env first so every subcommand sees configured
@@ -2126,6 +2141,7 @@ async fn main() -> Result<()> {
                 SessionStore::new(std::time::Duration::from_secs(3600)),
                 oidc,
                 None,
+                config.sandbox.container.cache_dir.clone(),
             );
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             eprintln!("runner: control plane listening on {listen}");
@@ -2144,14 +2160,17 @@ async fn main() -> Result<()> {
             let addr = resolve_dashboard_addr(&listen, port)?;
             // Single-user local console: no OIDC. The bearer is
             // caller-supplied or fresh per run (never empty).
-            let token = token
-                .filter(|t| !t.trim().is_empty())
-                .unwrap_or_else(|| random_hex(16));
+            let token = resolve_console_token(
+                token,
+                std::env::var("RUNNER_DASHBOARD_TOKEN").ok(),
+                random_hex(16),
+            );
             let state = AppState::new(
                 FleetRegistry::new(),
                 SessionStore::new(std::time::Duration::from_secs(3600)),
                 None,
                 Some(token.clone()),
+                config.sandbox.container.cache_dir.clone(),
             );
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             // Advertise the bound address (not the requested one),
@@ -2572,6 +2591,31 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn console_token_prefers_flag_then_env_then_generated() {
+        assert_eq!(
+            resolve_console_token(
+                Some("  abc  ".to_string()),
+                Some("env".to_string()),
+                "gen".to_string()
+            ),
+            "abc"
+        );
+        assert_eq!(
+            resolve_console_token(
+                Some("   ".to_string()),
+                Some(" env ".to_string()),
+                "gen".to_string()
+            ),
+            "env"
+        );
+        assert_eq!(
+            resolve_console_token(None, Some(String::new()), "gen".to_string()),
+            "gen"
+        );
+        assert_eq!(resolve_console_token(None, None, "gen".to_string()), "gen");
     }
 
     #[test]

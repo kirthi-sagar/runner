@@ -504,7 +504,7 @@ pub async fn run_coordinator(
             }
         }
         for job in jobs {
-            let (free, peers, drained, flying, peer_load) = {
+            let (free, peers, drained, flying, peer_load, cooling) = {
                 let guard = state.read().await;
                 (
                     guard.last_slots.saturating_sub(guard.in_flight()),
@@ -512,11 +512,19 @@ pub async fn run_coordinator(
                     guard.drained_nodes(),
                     guard.in_flight_jobs(),
                     guard.peer_load(),
+                    guard.is_cancelled_cooling("github", &job.id.to_string()),
                 )
             };
             if already_in_flight(&flying, "github", &job.id.to_string()) {
                 eprintln!(
                     "runner: job {} ({}) already in flight; skipping re-dispatch",
+                    job.id, job.name
+                );
+                continue;
+            }
+            if cooling {
+                eprintln!(
+                    "runner: job {} ({}) recently cancelled; skipping re-dispatch",
                     job.id, job.name
                 );
                 continue;

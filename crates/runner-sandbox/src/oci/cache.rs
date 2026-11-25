@@ -190,7 +190,7 @@ pub struct StoredManifest {
 /// Best-effort: missing or unreadable stores summarize as zero,
 /// never fail. Layer counts are unique digests across all
 /// manifests, so shared blobs never inflate presence fractions.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct CacheSummary {
     pub images: usize,
     pub layers: usize,

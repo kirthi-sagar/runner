@@ -316,6 +316,8 @@ impl PeerHandler for PeerRole {
                     .any(|j| j.provider == "wan" && j.id == id)
                 {
                     Err("already running".to_string())
+                } else if guard.is_cancelled_cooling("wan", &id) {
+                    Err("recently cancelled".to_string())
                 } else {
                     let (min_cores, min_ram) = parse_job_minimums(&offer.labels);
                     let caps_ok = guard.donor_caps().is_some_and(|(cores, ram)| {

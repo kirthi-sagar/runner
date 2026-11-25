@@ -59,6 +59,7 @@ async fn spawn_app(oidc: Option<OidcManager>) -> String {
         SessionStore::new(Duration::from_secs(60)),
         oidc,
         None,
+        None,
     );
     tokio::spawn(async move { serve_on(listener, state).await });
     // Wait for readiness.

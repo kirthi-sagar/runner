@@ -3,14 +3,14 @@
 [![CI](https://github.com/runnerhq/runner/actions/workflows/ci.yml/badge.svg)](https://github.com/runnerhq/runner/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/runnerhq/runner?color=blue&label=release)](https://github.com/runnerhq/runner/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)](https://github.com/runnerhq/runner#platform-support)
-[![Tests](https://img.shields.io/badge/tests-851%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
+[![Tests](https://img.shields.io/badge/tests-876%20passed-success.svg)](https://github.com/runnerhq/runner/actions)
 [![License: Runner Commercial Source-Available v1.0](https://img.shields.io/badge/License-Runner%20Commercial%20Source--Available%20v1.0-yellow.svg)](https://github.com/runnerhq/runner/blob/main/LICENSE)
 [![Rust 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/runtime-single%20static%20binary-brightgreen.svg)](#)
 
 ### High-Performance, Zero-Freeze, AI-Agent-Native Local & Federated GitHub Actions Runner Mesh
 
-> **Status**: Generally Available (v2.15.1) — install with `./install.sh`, run with `runner start`.  
+> **Status**: Generally Available (v2.16.0) — install with `./install.sh`, run with `runner start`.  
 > **Target Audience**: Autonomous AI Coding Agents (Codex CLI, Antigravity, Muse CLI, Claude Code), Solo Developers, and Teams with Workstations, Spare PCs, Connected Peers, and Cloud Credits.
 
 ---
@@ -172,6 +172,19 @@ Existing self-hosted runners fail at this because:
 | Image baselines | `runner image pull` | Shared CoW rootfs snapshots |
 | Agent control | `runner_snapshot` MCP tool | create/restore/list/remove |
 
+11. **Hybrid Web Console & RBAC**:
+   - `runner dashboard` (`ui` alias) serves the local console on loopback with fail-open browser launch: a single air-gapped bundle (zero external assets) streaming PSI gauges, governor meters, jobs, OCI cache, and swarm sessions over authenticated Server-Sent Events with reconnect, watchdog, and session-expiry handling.
+   - Role-based access control: Viewer/Operator/Admin roles resolved from OIDC groups (email with `sso:{sub}` fallback), enforced at HTTP (401/403) on the stream (Viewer+), job cancel and cache prune (Operator+), and swarm kill (Admin+), with a pre-shared local console token for single-user mode.
+   - Every authorized mutation lands actor-attributed in the tamper-evident SHA-256 audit ledger (fail-open and loud); the console exposes role-gated action buttons with confirmations, and `RUNNER_SOCK` / `RUNNER_AUDIT_LOG` overrides keep tests hermetic.
+
+**v2.16.0 console capability matrix:**
+
+| Capability | Command | What it does |
+| :--- | :--- | :--- |
+| Live console | `runner dashboard` | Loopback metrics UI + SSE |
+| Identity | `GET /api/v1/whoami` | Role + email for grants |
+| Mutations | `POST /api/v1/...` | Gated cancel/prune/kill |
+
 ---
 
 ## 3. Comprehensive Comparison: `runner` vs. Alternatives
@@ -220,7 +233,7 @@ Existing self-hosted runners fail at this because:
 
 Prerequisites: Linux kernel ≥ 5.8 with cgroups v2 (`/sys/fs/cgroup/cgroup.controllers`), Apple Silicon macOS (see [`docs/macos.md`](docs/macos.md)), or Windows via WSL2 (see [`docs/windows.md`](docs/windows.md)).
 
-Zero-dependency install (downloads the prebuilt v2.15.1 binary with SHA-256 verification — no Rust toolchain needed):
+Zero-dependency install (downloads the prebuilt v2.16.0 binary with SHA-256 verification — no Rust toolchain needed):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runnerhq/runner/main/install.sh | sh
@@ -257,7 +270,7 @@ runner top
 ```
 
 ```text
-runner top v2.15.1  (q quit, live cadence)
+runner top v2.16.0  (q quit, live cadence)
 CPU  [##----------------------]   7.4% some avg10
 MEM  [#-----------------------]   2.4% some avg10
 IO   [#-----------------------]   6.2% full avg10
@@ -385,7 +398,7 @@ curl -s localhost:8080/health | python3 -m json.tool
 ```
 
 ```json
-{"status": "healthy", "version": "2.15.1", "governor": "normal",
+{"status": "healthy", "version": "2.16.0", "governor": "normal",
  "psi": {"cpu": 5.3, "memory": 0.6, "io": 6.9}, "cloud_nodes_active": 0}
 ```
 

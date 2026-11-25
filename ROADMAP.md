@@ -5,8 +5,24 @@ LAN mesh cache-transparent. Identity guardrail: **zero-dependency
 single static binary** — accepted work must not require new runtime
 services or heavyweight frameworks.
 
-## Shipped (v2.15.1 and prior)
+## Shipped (v2.16.0 and prior)
 
+- World-class hybrid web console & RBAC: `runner dashboard` / `runner ui`
+  CLI (loopback serve, fail-open browser launch, pre-shared console
+  token), authenticated SSE metrics streaming (`/api/v1/stream`),
+  Viewer/Operator/Admin roles resolved from OIDC groups with HTTP
+  401/403 enforcement (v2.16.0, Candidate K delivered).
+- Air-gapped single-bundle console UI: zero-dependency embedded page
+  with live PSI gauges, governor meters, jobs/OCI/swarm telemetry,
+  fetch-streaming SSE consumer (reconnect, watchdog, session
+  expiry), and role-gated action buttons with confirmations.
+- RBAC-gated mutation endpoints: `POST /api/v1/jobs/:id/cancel`
+  (administrative supervisor cancel + `job_cancel` IPC),
+  `/api/v1/cache/prune` (dry-run capable, off-runtime), and
+  `/api/v1/swarms/:id/kill`, plus `GET /api/v1/whoami` identity.
+- Actor-attributed audit logging: every authorized mutation lands
+  in the tamper-evident SHA-256 ledger (fail-open and loud), with
+  `RUNNER_SOCK` / `RUNNER_AUDIT_LOG` overrides keeping tests hermetic.
 - Hardware Copy-on-Write (CoW) Snapshots: zero-dependency cross-platform
   block cloning engine (`crates/runner-core/src/fs/cow.rs`), APFS `clonefile`,
   Linux `ioctl(FICLONE)` and `copy_file_range`, Windows ReFS
@@ -88,19 +104,7 @@ services or heavyweight frameworks.
 - Supply-chain patch: `publish = false` workspace protection
   satisfying `cargo deny` under the commercial license (v2.12.1).
 
-## Active Milestone: Candidate K (World-Class Hybrid Web Console & Role-Based Access Control)
-
-### Candidate K: World-Class Hybrid Web Console & Role-Based Access Control (RBAC)
-- **High-Performance Web Console**:
-  - `runner dashboard` / `runner ui` CLI command opening `http://localhost:8080`.
-  - Cloud PWA portal (`https://app.runnerhq.com`) with offline Service Worker support.
-  - Zero-dependency embedded static bundle (zero external CDN scripts/fonts, 100% air-gapped compliant).
-  - Real-time Linux kernel PSI gauges, live mesh fleet topology, OCI layer cache visualizer, and swarm execution monitors.
-- **Enterprise Role-Based Access Control (RBAC)**:
-  - Granular permission matrix: `Admin`, `Operator`, and `Viewer` roles.
-  - Action-level authorization: viewing metrics/logs vs terminating jobs, purging caches, and rotating forge credentials.
-  - Enterprise OIDC Single Sign-On (Okta, Microsoft Entra ID / Azure AD, Google Workspace, GitHub SSO) wired to `crates/runner-enterprise/src/control_plane/auth.rs`.
-  - Cryptographic audit trail logging all console actions with user identity and timestamp.
+## Active Milestone: Candidate L ("Fortress Runner" Adversarial Pentest & Continuous Fuzzing)
 
 ### Candidate L: Internal Adversarial Pentest & Continuous Fuzzing ("Fortress Runner")
 - **Stage 1: Internal Adversarial "Red Team" Exploit Suite** (`tests/test_adversarial_sandbox.rs`):

@@ -186,6 +186,54 @@ pub struct StoredManifest {
     pub pulled_at_secs: u64,
 }
 
+/// Aggregate OCI cache counts for dashboards and streams.
+/// Best-effort: missing or unreadable stores summarize as zero,
+/// never fail. `layers` counts manifest references (shared blobs
+/// once per image); presence and bytes count each unique blob
+/// once, matching disk reality.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CacheSummary {
+    pub images: usize,
+    pub layers: usize,
+    pub present_layers: usize,
+    /// Bytes on disk (unique present blobs only).
+    pub size_bytes: u64,
+}
+
+/// Summarize the default cache: image records plus on-disk
+/// layer presence and bytes.
+pub fn cache_summary() -> CacheSummary {
+    let cache = LayerCache::new(LayerCache::default_dir());
+    let store = ImageStore::new(cache.dir());
+    summarize_cache(&store, &cache)
+}
+
+/// Summarize one store (test seam; production passes the
+/// defaults through [`cache_summary`]).
+fn summarize_cache(store: &ImageStore, cache: &LayerCache) -> CacheSummary {
+    let mut summary = CacheSummary {
+        images: 0,
+        layers: 0,
+        present_layers: 0,
+        size_bytes: 0,
+    };
+    let mut seen = std::collections::HashSet::new();
+    for (_, manifest) in store.list_manifests() {
+        summary.images += 1;
+        for layer in &manifest.layers {
+            summary.layers += 1;
+            // Shared blobs occupy disk once, however many
+            // manifests reference them (presence first, so
+            // inconsistent records stay order-independent).
+            if cache.contains(&layer.digest, layer.size) && seen.insert(layer.digest.clone()) {
+                summary.present_layers += 1;
+                summary.size_bytes += layer.size;
+            }
+        }
+    }
+    summary
+}
+
 /// Outcome of removing one cached image record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoveOutcome {
@@ -495,6 +543,47 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    #[test]
+    fn summarize_cache_counts_images_layers_and_bytes() {
+        let dir = runner_core::test_support::TempDir::new("layer-summary").unwrap();
+        let cache = LayerCache::new(dir.path().join("layers"));
+        let store = ImageStore::new(cache.dir());
+        // Empty store summarizes as zero, never fails.
+        assert_eq!(
+            summarize_cache(&store, &cache),
+            CacheSummary {
+                images: 0,
+                layers: 0,
+                present_layers: 0,
+                size_bytes: 0,
+            }
+        );
+        let present = write_blob(&cache, &"c".repeat(64), &[3u8; 8]);
+        let missing = format!("sha256:{}", "d".repeat(64));
+        write_record(&store, "img:1", vec![(present.clone(), 8), (missing, 24)]);
+        assert_eq!(
+            summarize_cache(&store, &cache),
+            CacheSummary {
+                images: 1,
+                layers: 2,
+                present_layers: 1,
+                size_bytes: 8,
+            }
+        );
+        // A second image sharing the blob adds a reference but
+        // no new bytes on disk.
+        write_record(&store, "img:2", vec![(present, 8)]);
+        assert_eq!(
+            summarize_cache(&store, &cache),
+            CacheSummary {
+                images: 2,
+                layers: 3,
+                present_layers: 1,
+                size_bytes: 8,
+            }
+        );
     }
 
     #[test]

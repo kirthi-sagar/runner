@@ -201,12 +201,76 @@ pub fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Control-plane role, least to most privilege: Viewers read,
+/// Operators run, Admins govern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Viewer,
+    Operator,
+    Admin,
+}
+
+impl Role {
+    /// Operators and admins may call operational endpoints
+    /// (control actions; observation stays open to Viewers).
+    pub fn can_operate(&self) -> bool {
+        !matches!(self, Role::Viewer)
+    }
+
+    /// Only admins may govern (policy, users, secrets).
+    pub fn can_admin(&self) -> bool {
+        matches!(self, Role::Admin)
+    }
+}
+
+/// Resolve the strongest role from OIDC group membership.
+/// Case-insensitive; Admin wins over Operator, anything else
+/// (including no groups) reads as Viewer.
+pub fn role_for_groups(groups: &[String]) -> Role {
+    let mut role = Role::Viewer;
+    for group in groups {
+        if group.eq_ignore_ascii_case("admin")
+            || group.eq_ignore_ascii_case("admins")
+            || group.eq_ignore_ascii_case("runner-admin")
+            || group.eq_ignore_ascii_case("runner-admins")
+        {
+            return Role::Admin;
+        }
+        if group.eq_ignore_ascii_case("operator")
+            || group.eq_ignore_ascii_case("operators")
+            || group.eq_ignore_ascii_case("ops")
+            || group.eq_ignore_ascii_case("runner-operator")
+            || group.eq_ignore_ascii_case("runner-operators")
+        {
+            role = Role::Operator;
+        }
+    }
+    role
+}
+
+/// Granted access: the caller's role plus when the grant lapses
+/// (`None` never expires — the per-run local console token).
+#[derive(Debug, Clone, Copy)]
+pub struct Grant {
+    pub role: Role,
+    pub expires_at: Option<std::time::Instant>,
+}
+
+/// True once a time-boxed grant has lapsed (local console
+/// grants never lapse).
+pub fn grant_expired(expires_at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    expires_at.is_some_and(|end| now >= end)
+}
+
 /// Short-lived control plane bearer session.
 #[derive(Debug, Clone)]
 pub struct SessionToken {
     pub token: String,
     pub email: Option<String>,
     pub groups: Vec<String>,
+    /// Resolved once at issuance from `groups`.
+    pub role: Role,
     pub expires_at: Instant,
 }
 
@@ -245,6 +309,7 @@ impl SessionStore {
         let session = SessionToken {
             token: random_hex(32),
             email,
+            role: role_for_groups(&groups),
             groups,
             expires_at: Instant::now() + self.ttl,
         };
@@ -342,5 +407,67 @@ mod tests {
         store.remember_state("s1".to_string()).await;
         assert!(store.take_state("s1").await);
         assert!(!store.take_state("s1").await);
+    }
+
+    #[test]
+    fn role_hierarchy_orders_viewer_operator_admin() {
+        assert!(!Role::Viewer.can_operate());
+        assert!(!Role::Viewer.can_admin());
+        assert!(Role::Operator.can_operate());
+        assert!(!Role::Operator.can_admin());
+        assert!(Role::Admin.can_operate());
+        assert!(Role::Admin.can_admin());
+    }
+
+    #[test]
+    fn group_resolution_folds_case_and_prefers_admin() {
+        let groups = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(role_for_groups(&groups(&[])), Role::Viewer);
+        assert_eq!(role_for_groups(&groups(&["everyone"])), Role::Viewer);
+        for name in [
+            "ops",
+            "OPS",
+            "Ops",
+            "operator",
+            "OPERATORS",
+            "runner-operator",
+        ] {
+            assert_eq!(role_for_groups(&groups(&[name])), Role::Operator, "{name}");
+        }
+        for name in ["admin", "ADMINS", "Admin", "runner-admins"] {
+            assert_eq!(role_for_groups(&groups(&[name])), Role::Admin, "{name}");
+        }
+        // Admin wins mixed membership in either order.
+        assert_eq!(role_for_groups(&groups(&["ops", "admin"])), Role::Admin);
+        assert_eq!(role_for_groups(&groups(&["admin", "ops"])), Role::Admin);
+    }
+
+    #[test]
+    fn grant_expiry_lapses_only_timeboxed_grants() {
+        let now = std::time::Instant::now();
+        assert!(!grant_expired(None, now));
+        assert!(!grant_expired(Some(now + Duration::from_secs(60)), now));
+        assert!(grant_expired(Some(now), now));
+        assert!(grant_expired(Some(now - Duration::from_secs(1)), now));
+    }
+
+    #[tokio::test]
+    async fn sessions_carry_resolved_role() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let viewer = store.create(Some("v@x.y".to_string()), vec![]).await;
+        assert_eq!(viewer.role, Role::Viewer);
+        let operator = store
+            .create(Some("o@x.y".to_string()), vec!["ops".to_string()])
+            .await;
+        assert_eq!(operator.role, Role::Operator);
+        assert_eq!(
+            store.validate(&operator.token).await.unwrap().role,
+            Role::Operator
+        );
     }
 }

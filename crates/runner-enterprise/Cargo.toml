@@ -21,6 +21,8 @@ hmac.workspace = true
 sha2.workspace = true
 runner-core.workspace = true
 runner-telemetry.workspace = true
+runner-sandbox.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 runner-core.workspace = true

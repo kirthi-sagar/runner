@@ -90,6 +90,22 @@ enum Commands {
         #[arg(long)]
         client_secret: Option<String>,
     },
+    /// Serve the local web console and open it in a browser
+    #[command(alias = "ui")]
+    Dashboard {
+        /// Listen address, e.g. 127.0.0.1:8080
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        /// Override the port in --listen
+        #[arg(long)]
+        port: Option<u16>,
+        /// Serve without opening a browser
+        #[arg(long, default_value_t = false)]
+        no_open: bool,
+        /// Pre-shared console bearer token (generated when absent)
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Federated mesh controls
     Mesh {
         #[command(subcommand)]
@@ -1786,6 +1802,20 @@ async fn cmd_exec_container(
     }
 }
 
+/// Resolve the dashboard bind address: `--listen` must be a
+/// socket address (`IP:port`); `--port` overrides its port.
+/// Anything else fails loudly — a console that silently binds
+/// elsewhere would strand the browser launch.
+fn resolve_dashboard_addr(listen: &str, port: Option<u16>) -> Result<std::net::SocketAddr> {
+    let mut addr: std::net::SocketAddr = listen
+        .parse()
+        .map_err(|_| anyhow::anyhow!("--listen must be IP:port, got {listen:?}"))?;
+    if let Some(port) = port {
+        addr.set_port(port);
+    }
+    Ok(addr)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load ~/.config/runner/env first so every subcommand sees configured
@@ -2095,9 +2125,50 @@ async fn main() -> Result<()> {
                 FleetRegistry::new(),
                 SessionStore::new(std::time::Duration::from_secs(3600)),
                 oidc,
+                None,
             );
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             eprintln!("runner: control plane listening on {listen}");
+            serve_on(listener, state).await?;
+        }
+        Commands::Dashboard {
+            listen,
+            port,
+            no_open,
+            token,
+        } => {
+            use runner_cli::commands::auth::open_browser;
+            use runner_enterprise::control_plane::auth::{random_hex, SessionStore};
+            use runner_enterprise::control_plane::fleet::FleetRegistry;
+            use runner_enterprise::control_plane::server::{serve_on, AppState};
+            let addr = resolve_dashboard_addr(&listen, port)?;
+            // Single-user local console: no OIDC. The bearer is
+            // caller-supplied or fresh per run (never empty).
+            let token = token
+                .filter(|t| !t.trim().is_empty())
+                .unwrap_or_else(|| random_hex(16));
+            let state = AppState::new(
+                FleetRegistry::new(),
+                SessionStore::new(std::time::Duration::from_secs(3600)),
+                None,
+                Some(token.clone()),
+            );
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            // Advertise the bound address (not the requested one),
+            // so `--port 0` opens the OS-assigned port.
+            let bound = listener.local_addr()?;
+            let url = format!("http://{bound}/");
+            eprintln!("runner: dashboard listening on {bound}");
+            eprintln!("runner: console bearer token: {token}");
+            if !no_open {
+                // Detached: browser exit waits must never delay
+                // serving (dropping the handle keeps it running).
+                tokio::task::spawn_blocking(move || {
+                    if open_browser(&url).is_err() {
+                        eprintln!("runner: could not open a browser; visit {url}");
+                    }
+                });
+            }
             serve_on(listener, state).await?;
         }
         Commands::Mesh { command } => match command {
@@ -2453,5 +2524,63 @@ mod tests {
                 command: SnapshotCommands::Rm { .. }
             }
         ));
+    }
+
+    #[test]
+    fn dashboard_parse_defaults_and_alias() {
+        use clap::Parser;
+        for argv in [vec!["runner", "dashboard"], vec!["runner", "ui"]] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command {
+                Commands::Dashboard {
+                    listen,
+                    port,
+                    no_open,
+                    token,
+                } => {
+                    assert_eq!(listen, "127.0.0.1:8080");
+                    assert_eq!(port, None);
+                    assert!(!no_open);
+                    assert_eq!(token, None);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+        let cli = Cli::try_parse_from([
+            "runner",
+            "dashboard",
+            "--listen",
+            "127.0.0.1:9000",
+            "--port",
+            "9001",
+            "--no-open",
+            "--token",
+            "secret",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Dashboard {
+                listen,
+                port,
+                no_open,
+                token,
+            } => {
+                assert_eq!(listen, "127.0.0.1:9000");
+                assert_eq!(port, Some(9001));
+                assert!(no_open);
+                assert_eq!(token.as_deref(), Some("secret"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dashboard_addr_overrides_port_and_rejects_names() {
+        let addr = resolve_dashboard_addr("127.0.0.1:8080", None).unwrap();
+        assert_eq!(addr.port(), 8080);
+        let addr = resolve_dashboard_addr("127.0.0.1:8080", Some(9001)).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:9001");
+        assert!(resolve_dashboard_addr("localhost:8080", None).is_err());
+        assert!(resolve_dashboard_addr("not-an-addr", Some(1)).is_err());
     }
 }

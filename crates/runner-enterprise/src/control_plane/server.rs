@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json};
 use axum::routing::{get, post};
 
-use super::auth::{OidcManager, SessionStore};
+use super::auth::{grant_expired, Grant, OidcManager, Role, SessionStore};
 use super::fleet::{FleetRegistry, HeartbeatPayload, RunnerRegistration};
 
 /// Shared server state (cloneable handle).
@@ -17,14 +17,22 @@ pub struct AppState {
     pub fleet: Arc<FleetRegistry>,
     pub sessions: Arc<SessionStore>,
     pub oidc: Option<Arc<OidcManager>>,
+    /// Pre-shared local-console bearer (grants Admin when matched).
+    pub local_token: Option<String>,
 }
 
 impl AppState {
-    pub fn new(fleet: FleetRegistry, sessions: SessionStore, oidc: Option<OidcManager>) -> Self {
+    pub fn new(
+        fleet: FleetRegistry,
+        sessions: SessionStore,
+        oidc: Option<OidcManager>,
+        local_token: Option<String>,
+    ) -> Self {
         Self {
             fleet: Arc::new(fleet),
             sessions: Arc::new(sessions),
             oidc: oidc.map(Arc::new),
+            local_token,
         }
     }
 }
@@ -63,27 +71,13 @@ async fn health() -> impl IntoResponse {
 /// Daemon LAN-cache stats over IPC (`None` when the daemon or the
 /// cache proxy is unreachable).
 async fn cache_stats() -> Option<serde_json::Value> {
-    let sock = runner_core::ipc::resolve_sock_path();
-    let Ok(res) = runner_core::ipc::ipc_call(&sock, "cache_stats").await else {
-        return None;
-    };
-    if res.get("error").is_some() {
-        return None;
-    }
-    res.get("result").cloned()
+    ipc_result("cache_stats").await
 }
 
 /// Daemon cloud stats over the local IPC socket: active node count +
 /// ledgered month spend (both `None` when unreachable).
 async fn cloud_stats() -> (Option<usize>, Option<f64>) {
-    let sock = runner_core::ipc::resolve_sock_path();
-    let Ok(res) = runner_core::ipc::ipc_call(&sock, "cloud_list").await else {
-        return (None, None);
-    };
-    if res.get("error").is_some() {
-        return (None, None);
-    }
-    let Some(result) = res.get("result") else {
+    let Some(result) = ipc_result("cloud_list").await else {
         return (None, None);
     };
     let count = result
@@ -227,9 +221,171 @@ async fn auth_callback(
         .await;
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "token": session.token, "email": session.email })),
+        Json(serde_json::json!({
+            "token": session.token,
+            "email": session.email,
+            "role": session.role,
+        })),
     )
         .into_response()
+}
+
+/// Authorize one control-plane request: the pre-shared local
+/// token grants a never-expiring Admin grant; otherwise a live
+/// session must satisfy `min`. Missing or unknown credentials →
+/// 401; a valid but under-privileged session → 403.
+async fn authorize(
+    headers: &axum::http::HeaderMap,
+    state: &AppState,
+    min: Role,
+) -> Result<Grant, Box<axum::response::Response>> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    // Empty local tokens never match, so an absent bearer can
+    // never equal an absent secret.
+    if let Some(local) = &state.local_token {
+        if !local.is_empty() && token == local {
+            return Ok(Grant {
+                role: Role::Admin,
+                expires_at: None,
+            });
+        }
+    }
+    let session = match state.sessions.validate(token).await {
+        Some(session) => session,
+        None => {
+            return Err(Box::new(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "bad or missing bearer token" })),
+                )
+                    .into_response(),
+            ));
+        }
+    };
+    let allowed = match min {
+        Role::Viewer => true,
+        Role::Operator => session.role.can_operate(),
+        Role::Admin => session.role.can_admin(),
+    };
+    if !allowed {
+        let need = match min {
+            Role::Viewer => "viewer",
+            Role::Operator => "operator",
+            Role::Admin => "admin",
+        };
+        return Err(Box::new(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": format!("{need} role required") })),
+            )
+                .into_response(),
+        ));
+    }
+    Ok(Grant {
+        role: session.role,
+        expires_at: Some(session.expires_at),
+    })
+}
+
+/// Daemon IPC call budget: a hung daemon degrades one source
+/// to null instead of stalling the whole event.
+const IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Daemon IPC result value (`None` when the daemon is
+/// unreachable, slow, or reports an error).
+async fn ipc_result(method: &str) -> Option<serde_json::Value> {
+    let sock = runner_core::ipc::resolve_sock_path();
+    let call = runner_core::ipc::ipc_call(&sock, method);
+    let Ok(Ok(res)) = tokio::time::timeout(IPC_TIMEOUT, call).await else {
+        return None;
+    };
+    if res.get("error").is_some() {
+        return None;
+    }
+    res.get("result").cloned()
+}
+
+/// One metrics snapshot: PSI pressure, governor weights, active
+/// jobs, OCI cache stats, swarm sessions. Every daemon-owned
+/// source is best-effort (null when unreachable); the local OCI
+/// cache always summarizes, even when empty.
+async fn metrics_payload() -> serde_json::Value {
+    let psi = runner_core::governor::psi::read_snapshot().ok().map(|s| {
+        serde_json::json!({
+            "cpu": s.cpu.some.avg10,
+            "memory": s.memory.some.avg10,
+            "io": s.io.full.avg10,
+        })
+    });
+    let snapshot = ipc_result("snapshot").await;
+    let governor = snapshot.as_ref().map(|s| {
+        serde_json::json!({
+            "weight": s.get("weight"),
+            "slots": s.get("slots"),
+            "in_flight": s.get("in_flight"),
+            "queue_depth": s.get("queue_depth"),
+        })
+    });
+    let jobs = snapshot.as_ref().and_then(|s| s.get("jobs").cloned());
+    let swarms = ipc_result("swarm_list")
+        .await
+        .and_then(|v| v.get("swarms").cloned());
+    let oci_cache = runner_sandbox::oci::cache::cache_summary();
+    let ts_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    serde_json::json!({
+        "ts_secs": ts_secs,
+        "psi": psi,
+        "governor": governor,
+        "jobs": jobs,
+        "oci_cache": {
+            "images": oci_cache.images,
+            "layers": oci_cache.layers,
+            "present_layers": oci_cache.present_layers,
+            "size_bytes": oci_cache.size_bytes,
+        },
+        "swarms": swarms,
+    })
+}
+
+/// Metrics tick: sub-second live feel without hammering the
+/// daemon IPC socket.
+const METRICS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Real-time metrics SSE (Viewer+): one JSON event every
+/// 500ms, first tick immediate. Unreachable sources surface
+/// as nulls, never break the stream; a lapsed session ends it
+/// (the per-run local token never lapses).
+async fn metrics_stream(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let grant = match authorize(&headers, &state, Role::Viewer).await {
+        Ok(grant) => grant,
+        Err(response) => return *response,
+    };
+    let events = futures_util::stream::unfold(
+        (tokio::time::interval(METRICS_INTERVAL), grant.expires_at),
+        |(mut ticker, expires_at)| async move {
+            // Sessions lapse mid-stream: end the stream rather
+            // than serve a dead credential's metrics.
+            if grant_expired(expires_at, std::time::Instant::now()) {
+                return None;
+            }
+            ticker.tick().await;
+            let event = axum::response::sse::Event::default()
+                .json_data(metrics_payload().await)
+                .unwrap_or_else(|_| axum::response::sse::Event::default().comment("encode error"));
+            Some((Ok::<_, axum::Error>(event), (ticker, expires_at)))
+        },
+    );
+    axum::response::Sse::new(events).into_response()
 }
 
 /// Build the router (pure constructor; integration-tested over TCP).
@@ -238,6 +394,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/", get(dashboard))
         .route("/dashboard", get(dashboard))
         .route("/health", get(health))
+        .route("/api/v1/stream", get(metrics_stream))
         .route("/api/v1/fleet", get(fleet_inventory))
         .route("/api/v1/runners/register", post(register_runner))
         .route("/api/v1/runners/heartbeat", post(runner_heartbeat))

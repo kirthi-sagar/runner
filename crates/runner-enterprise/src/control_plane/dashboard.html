@@ -92,13 +92,6 @@ try {
     color: #05080f;
     background: linear-gradient(135deg, var(--accent), var(--accent2));
     box-shadow: 0 2px 14px rgba(56, 224, 200, 0.35); }
-  .hero { display: block; width: 150px; height: auto; margin: 0 auto 4px;
-    color: var(--fg); }
-  .hero-disc { fill: var(--accent); opacity: 0.14; }
-  .hero-lines { fill: none; stroke: var(--accent); stroke-width: 3;
-    stroke-linecap: round; opacity: 0.7; }
-  .hero-ground { fill: none; stroke: var(--faint); stroke-width: 2;
-    stroke-linecap: round; opacity: 0.6; }
   header .logo small { display: block; font-size: 10px; font-weight: 600;
     color: var(--muted); text-transform: uppercase; letter-spacing: 0.14em; }
   .badge { display: inline-flex; align-items: center; gap: 7px;
@@ -205,6 +198,16 @@ try {
     outline: 2px solid var(--accent); outline-offset: 2px; }
   .meters { display: grid; grid-template-columns: repeat(4, 1fr);
     gap: 12px; }
+  .rbac { display: grid; grid-template-columns: 1fr 1.5fr; gap: 12px; }
+  .sessrow { display: flex; justify-content: space-between; gap: 12px;
+    padding: 8px 0; border-bottom: 1px solid var(--border);
+    font-size: 13px; }
+  .sessrow:last-child { border-bottom: none; }
+  .sessrow > span:first-child { color: var(--muted); }
+  .sessrow strong { font-size: 14px; text-transform: capitalize; }
+  .matrix td[data-col], .matrix th[data-col] { text-align: center; }
+  .matrix .you { background: rgba(56, 224, 200, 0.10); }
+  [data-theme="light"] .matrix .you { background: rgba(14, 159, 133, 0.10); }
   .mono { font-variant-numeric: tabular-nums;
     font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
     font-size: 12.5px; }
@@ -220,6 +223,7 @@ try {
   footer .dotsep::before { content: "·"; margin-right: 8px; }
   @media (max-width: 1100px) { .kpis { grid-template-columns: repeat(3, 1fr); } }
   @media (max-width: 760px) {
+    .rbac { grid-template-columns: 1fr; }
     .kpis, .meters { grid-template-columns: repeat(2, 1fr); }
     main { padding: 18px 14px 32px; }
     header input { width: 140px; }
@@ -232,26 +236,9 @@ try {
 </style>
 </head>
 <body>
-<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
-<g id="dash-bird" fill="currentColor">
-<path d="M25 11.5 31 14l-6 2.5-.8-1.2 3.4-.9-3-1-.4-1.9z"/>
-<path d="M22.5 9.5c1.8 0 3 1.4 3 3.2s-1.2 3.3-3 3.3c-2.4 0-4.5-1.2-5.9-3.2 1.2-1.9 3.3-3.3 5.9-3.3z"/>
-<path d="M21 10 15 2.5 17.5 10.5 12 6l3 5.5L21 10z"/>
-<path d="M20 15.5c-4.5.8-9 3.5-12.5 8.5l6-.8c3-2.3 5.5-4.3 8-5.5l-1.5-2.2z"/>
-<path d="M9.5 22 3 20.5l5.5 3L9.5 22zM10.5 24.5 4.5 26l5-.4 1-1.1z"/>
-<path d="M15.5 23.5 14 28.5h-2.5M18.5 22.5l1 5 2.5.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-<path d="M2.5 7.5h5M1.5 11h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".55"/>
-</g>
-<g id="dash-hero">
-<circle cx="118" cy="42" r="30" class="hero-disc"/>
-<path d="M8 30h34M4 44h44M10 58h30" class="hero-lines"/>
-<g transform="translate(58,12) scale(2.1)"><use href="#dash-bird"/></g>
-<path d="M20 78h120" class="hero-ground"/>
-</g>
-</defs></svg>
 <div id="conn">reconnecting to control plane…</div>
 <header>
-  <span class="logo"><span class="mark" aria-hidden="true" title="Dash, the runner roadrunner"><svg width="20" height="20" viewBox="0 0 32 32"><use href="#dash-bird"/></svg></span><span>runner<small>fleet console</small></span></span>
+  <span class="logo"><span class="mark" aria-hidden="true"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="#05080f" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6 7 10l-4.5 4M8 6l4.5 4L8 14M13.5 6 18 10l-4.5 4"/></svg></span><span>runner<small>fleet console</small></span></span>
   <span class="badge" id="version">…</span>
   <span class="badge" id="health">…</span>
   <span class="badge" id="cloud">cloud …</span>
@@ -276,6 +263,25 @@ try {
     <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5.5"/><path d="M7 4v3l2 1.5"/></svg>Cache hit rate</div><div class="value" id="k-cache-hit">–</div></div>
     <div class="card"><div class="label"><svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="7" cy="3.5" rx="5" ry="2"/><path d="M2 3.5v7c0 1.1 2.2 2 5 2s5-.9 5-2v-7M2 7c0 1.1 2.2 2 5 2s5-.9 5-2"/></svg>Cached data</div><div class="value" id="k-cache-mb">–</div></div>
   </div>
+  <section>
+    <h2>Access &amp; roles <span class="note">(this session, live)</span></h2>
+    <div class="rbac">
+      <div class="card"><div class="label">Current session</div>
+        <div class="sessrow"><span>Role</span><strong id="rbac-role">–</strong></div>
+        <div class="sessrow"><span>Identity</span><span id="rbac-actor" class="mono">–</span></div>
+        <div class="sessrow"><span>Grant</span><span id="rbac-kind">–</span></div>
+      </div>
+      <div class="card table-card"><table class="matrix">
+        <thead><tr><th>Capability</th><th data-col="viewer">Viewer</th><th data-col="operator">Operator</th><th data-col="admin">Admin</th></tr></thead>
+        <tbody>
+          <tr><td>Observe metrics &amp; stream</td><td data-col="viewer">✓</td><td data-col="operator">✓</td><td data-col="admin">✓</td></tr>
+          <tr><td>Cancel jobs</td><td data-col="viewer">—</td><td data-col="operator">✓</td><td data-col="admin">✓</td></tr>
+          <tr><td>Preview &amp; prune cache</td><td data-col="viewer">—</td><td data-col="operator">✓</td><td data-col="admin">✓</td></tr>
+          <tr><td>Terminate swarms</td><td data-col="viewer">—</td><td data-col="operator">—</td><td data-col="admin">✓</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </section>
   <section>
     <h2>Control-plane host PSI</h2>
     <div class="card">
@@ -334,7 +340,7 @@ try {
     <div class="card table-card"><table>
       <thead><tr><th>Node ID</th><th>Hostname</th><th>Providers</th>
         <th>Capacity</th><th>Jobs</th><th>PSI</th><th>Last heartbeat</th></tr></thead>
-      <tbody id="fleet"><tr><td colspan="7" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>loading…</td></tr></tbody>
+      <tbody id="fleet"><tr><td colspan="7" class="empty">loading…</td></tr></tbody>
     </table></div>
   </section>
   <footer><span>runner fleet console</span><span class="dotsep">single-file air-gapped bundle</span><span class="dotsep">live event stream</span></footer>
@@ -423,7 +429,7 @@ async function fetchRole(token, myId) {
     if (!res.ok) return null;
     var me = await res.json();
     if (isStale(token, myId)) return null;
-    return (me && me.role) || null;
+    return me || null;
   } catch (e) { return null; }
 }
 async function doCancel(id) {
@@ -491,6 +497,20 @@ function disarmWatchdog() {
     streamState.watchdog = null;
   }
 }
+function renderSession(me) {
+  var role = (me && me.role) || null;
+  var email = (me && me.email) || null;
+  setText("rbac-role", role);
+  setText("rbac-actor", email || (role ? "local console" : null));
+  setText("rbac-kind", role == null ? null
+    : (email ? "SSO session" : "local console · never expires"));
+  var cells = document.querySelectorAll("[data-col]");
+  for (var i = 0; i < cells.length; i++) {
+    var el = cells[i];
+    if (role && el.getAttribute("data-col") === role) el.classList.add("you");
+    else el.classList.remove("you");
+  }
+}
 function renderGovernor(gov) {
   gov = gov || {};
   setText("m-weight", gov.weight);
@@ -501,11 +521,11 @@ function renderGovernor(gov) {
 function renderJobs(jobs) {
   var tb = document.getElementById("jobs");
   if (jobs == null) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>daemon offline (unobserved)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty">daemon offline (unobserved)</td></tr>';
     return;
   }
   if (!jobs.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no active jobs on this host</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty">no active jobs on this host</td></tr>';
     return;
   }
   var now = Date.now();
@@ -542,11 +562,11 @@ function renderOci(oci) {
 function renderSwarms(swarms) {
   var tb = document.getElementById("swarms");
   if (swarms == null) {
-    tb.innerHTML = '<tr><td colspan="9" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>daemon offline (unobserved)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty">daemon offline (unobserved)</td></tr>';
     return;
   }
   if (!swarms.length) {
-    tb.innerHTML = '<tr><td colspan="9" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no swarm sessions running</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty">no swarm sessions running</td></tr>';
     return;
   }
   var off = canUse("admin") ? "" : " disabled title=\"Requires admin role\"";
@@ -611,7 +631,7 @@ async function refresh() {
         ? (cache.size_bytes / 1048576).toFixed(1) + " MB" : "–";
     var tb = document.getElementById("fleet");
     if (!runners.length) {
-      tb.innerHTML = '<tr><td colspan="7" class="empty"><svg class="hero" viewBox="0 0 160 90" aria-hidden="true"><use href="#dash-hero"/></svg>no runners registered yet</td></tr>';
+      tb.innerHTML = '<tr><td colspan="7" class="empty">no runners registered yet</td></tr>';
       return;
     }
     tb.innerHTML = runners.map(function (r) {
@@ -680,6 +700,7 @@ async function consumeStream(token, myId) {
     streamState.token = null;
     streamState.role = null;
     paintStaticButtons();
+    renderSession(null);
     if (streamState.lastEvent) renderTables(streamState.lastEvent);
     try { document.getElementById("token").focus(); } catch (e) {}
     return;
@@ -740,10 +761,11 @@ function connect(token) {
   streamState.role = null;
   paintStaticButtons();
   var myId = streamState.activeId;
-  fetchRole(token, myId).then(function (role) {
+  fetchRole(token, myId).then(function (me) {
     if (isStale(token, myId)) return;
-    streamState.role = role || "viewer";
+    streamState.role = (me && me.role) || "viewer";
     paintStaticButtons();
+    renderSession(me);
     if (streamState.lastEvent) renderTables(streamState.lastEvent);
   });
   consumeStream(token, myId);
@@ -754,6 +776,7 @@ function disconnect(silent) {
   streamState.role = null;
   disarmWatchdog();
   paintStaticButtons();
+  renderSession(null);
   if (streamState.lastEvent) renderTables(streamState.lastEvent);
   if (streamState.timer) {
     clearTimeout(streamState.timer);

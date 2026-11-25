@@ -334,7 +334,7 @@ async fn metrics_payload() -> serde_json::Value {
     let swarms = ipc_result("swarm_list")
         .await
         .and_then(|v| v.get("swarms").cloned());
-    let oci_cache = runner_sandbox::oci::cache::cache_summary();
+    let oci_cache = memoized_cache_summary();
     let ts_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -358,6 +358,33 @@ async fn metrics_payload() -> serde_json::Value {
 /// daemon IPC socket.
 const METRICS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// OCI summary freshness: disk scans are shared across viewers
+/// instead of repeating on every tick.
+const OCI_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Lock a poison-tolerant mutex (a panicked holder must not wedge
+/// metrics for the rest of the process).
+fn lock_mutex<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Memoized default-cache summary: every viewer tick reads the
+/// memo and disk is scanned only once it goes stale. The guard
+/// is never held across IO or await.
+fn memoized_cache_summary() -> runner_sandbox::oci::cache::CacheSummary {
+    use std::sync::{LazyLock, Mutex};
+    type Memo = Option<(std::time::Instant, runner_sandbox::oci::cache::CacheSummary)>;
+    static MEMO: LazyLock<Mutex<Memo>> = LazyLock::new(|| Mutex::new(None));
+    if let Some((at, summary)) = lock_mutex(&MEMO).clone() {
+        if at.elapsed() < OCI_MEMO_TTL {
+            return summary;
+        }
+    }
+    let fresh = runner_sandbox::oci::cache::cache_summary();
+    *lock_mutex(&MEMO) = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
+}
+
 /// Real-time metrics SSE (Viewer+): one JSON event every
 /// 500ms, first tick immediate. Unreachable sources surface
 /// as nulls, never break the stream; a lapsed session ends it
@@ -374,13 +401,19 @@ async fn metrics_stream(
         (tokio::time::interval(METRICS_INTERVAL), grant.expires_at),
         |(mut ticker, expires_at)| async move {
             // Sessions lapse mid-stream: end the stream rather
-            // than serve a dead credential's metrics.
+            // than serve a dead credential's metrics. Checked both
+            // before and after collection, so a grant lapsing
+            // during a slow tick emits nothing fresh.
             if grant_expired(expires_at, std::time::Instant::now()) {
                 return None;
             }
             ticker.tick().await;
+            let payload = metrics_payload().await;
+            if grant_expired(expires_at, std::time::Instant::now()) {
+                return None;
+            }
             let event = axum::response::sse::Event::default()
-                .json_data(metrics_payload().await)
+                .json_data(payload)
                 .unwrap_or_else(|_| axum::response::sse::Event::default().comment("encode error"));
             Some((Ok::<_, axum::Error>(event), (ticker, expires_at)))
         },

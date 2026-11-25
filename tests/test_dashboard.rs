@@ -171,3 +171,34 @@ async fn stream_accepts_local_console_token_as_admin() {
         .unwrap();
     assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn dashboard_page_serves_single_bundle_airgapped() {
+    let (base, _) = spawn_dashboard(None, Duration::from_secs(60)).await;
+    let page = reqwest::get(format!("{base}/"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // Stream wiring contract: consumer endpoint plus every
+    // element id the script binds.
+    for marker in [
+        "/api/v1/stream",
+        "id=\"token\"",
+        "id=\"stream\"",
+        "id=\"g-cpu\"",
+        "id=\"m-weight\"",
+        "id=\"jobs\"",
+        "id=\"oci-images\"",
+        "id=\"swarms\"",
+        "id=\"tick\"",
+        "sessionStorage",
+    ] {
+        assert!(page.contains(marker), "missing {marker}");
+    }
+    // Air-gapped: no remote URLs, no external scripts.
+    for banned in ["https://", "http://", "<script src", "<link href"] {
+        assert!(!page.contains(banned), "leaks {banned}");
+    }
+}

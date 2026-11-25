@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>runner fleet dashboard</title>
 <style>
   :root {
@@ -46,6 +47,22 @@
   .empty { color: var(--muted); padding: 16px; text-align: center; }
   #conn { display: none; background: var(--red); color: #fff; text-align: center;
     padding: 6px; font-size: 13px; }
+  header input { background: #0d1117; border: 1px solid var(--border);
+    color: var(--fg); border-radius: 6px; padding: 4px 10px;
+    font-size: 13px; width: 200px; }
+  header button { background: var(--panel); border: 1px solid var(--border);
+    color: var(--fg); border-radius: 6px; padding: 4px 12px;
+    font-size: 13px; cursor: pointer; }
+  header button:hover { border-color: var(--accent); }
+  .meters { display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 12px; }
+  .mono { font-variant-numeric: tabular-nums; }
+  .note { color: var(--muted); font-size: 12px; font-weight: 400;
+    text-transform: none; letter-spacing: normal; }
+  #storewarn { display: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .bar > div { transition: none; }
+  }
 </style>
 </head>
 <body>
@@ -55,7 +72,12 @@
   <span class="badge" id="version">…</span>
   <span class="badge" id="health">…</span>
   <span class="badge" id="cloud">cloud …</span>
+  <span class="badge" id="stream">stream …</span>
+  <span class="badge bad" id="storewarn">storage unavailable</span>
   <span class="spacer"></span>
+  <input id="token" type="password" placeholder="console token" autocomplete="off">
+  <button id="connect">Connect</button>
+  <button id="signout">Sign out</button>
   <a class="sso" href="/auth/login">Sign in via SSO</a>
 </header>
 <main>
@@ -77,6 +99,43 @@
       <div class="gauge"><div class="row"><span>IO pressure</span><span id="g-io-t">–</span></div>
         <div class="bar"><div id="g-io"></div></div></div>
     </div>
+  </section>
+  <section>
+    <h2>Governor <span class="note">(this host, live)</span></h2>
+    <div class="meters">
+      <div class="card"><div class="label">Weight</div><div class="value mono" id="m-weight">–</div></div>
+      <div class="card"><div class="label">Slots</div><div class="value mono" id="m-slots">–</div></div>
+      <div class="card"><div class="label">In flight</div><div class="value mono" id="m-inflight">–</div></div>
+      <div class="card"><div class="label">Queue depth</div><div class="value mono" id="m-queue">–</div></div>
+    </div>
+  </section>
+  <section>
+    <h2>Active jobs <span class="note">(this host, live)</span></h2>
+    <div class="card"><table>
+      <thead><tr><th>Job ID</th><th>Name</th><th>Provider</th><th>Age</th></tr></thead>
+      <tbody id="jobs"><tr><td colspan="4" class="empty">waiting for stream…</td></tr></tbody>
+    </table></div>
+  </section>
+  <section>
+    <h2>OCI layer cache</h2>
+    <div class="meters">
+      <div class="card"><div class="label">Images</div><div class="value mono" id="oci-images">–</div></div>
+      <div class="card"><div class="label">Layers present</div><div class="value mono" id="oci-present">–</div></div>
+      <div class="card"><div class="label">Cache size</div><div class="value mono" id="oci-mb">–</div></div>
+      <div class="card"><div class="label">Last event</div><div class="value mono" id="tick">–</div></div>
+    </div>
+    <div class="card" style="margin-top:12px">
+      <div class="gauge"><div class="row"><span>Blob presence</span><span id="oci-t">–</span></div>
+        <div class="bar"><div id="oci-bar"></div></div></div>
+    </div>
+  </section>
+  <section>
+    <h2>Swarm sessions <span class="note">(this host, live)</span></h2>
+    <div class="card"><table>
+      <thead><tr><th>Swarm</th><th>Status</th><th>Members</th><th>Waiting</th>
+        <th>Jobs</th><th>CPU weight</th><th>Memory</th><th>Spent</th></tr></thead>
+      <tbody id="swarms"><tr><td colspan="8" class="empty">waiting for stream…</td></tr></tbody>
+    </table></div>
   </section>
   <section>
     <h2>Active fleet nodes</h2>
@@ -106,19 +165,151 @@ function esc(s) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
   });
 }
+function setText(id, v) {
+  document.getElementById(id).textContent = (v == null || v === "") ? "–" : String(v);
+}
+function setBadge(id, text, cls) {
+  var el = document.getElementById(id);
+  el.textContent = text;
+  el.className = "badge " + (cls || "");
+}
+var pollDown = false;
+function paintBanner() {
+  var el = document.getElementById("conn");
+  var msg = streamState.bannerMsg;
+  if (msg == null && pollDown && !streamState.live) {
+    msg = "reconnecting to control plane…";
+  }
+  if (msg == null) {
+    el.style.display = "none";
+    return;
+  }
+  el.textContent = msg;
+  el.style.display = "block";
+}
+function streamBanner(msg) {
+  streamState.bannerMsg = msg;
+  paintBanner();
+}
+var streamState = { token: null, abort: null, backoffMs: 1000, timer: null, live: false, bannerMsg: null, reader: null, watchdog: null, lastChunkAt: 0 };
+function isStale(token) {
+  if (streamState.token !== token) return true;
+  return !!(streamState.abort && streamState.abort.signal.aborted);
+}
+function armWatchdog() {
+  disarmWatchdog();
+  streamState.lastChunkAt = Date.now();
+  streamState.watchdog = setInterval(function () {
+    if (streamState.token == null) return;
+    if (Date.now() - streamState.lastChunkAt > 3500) {
+      try {
+        if (streamState.reader) {
+          var cancelled = streamState.reader.cancel();
+          if (cancelled && cancelled.catch) cancelled.catch(function () {});
+        }
+      } catch (e) {}
+    }
+  }, 1000);
+}
+function disarmWatchdog() {
+  if (streamState.watchdog) {
+    clearInterval(streamState.watchdog);
+    streamState.watchdog = null;
+  }
+}
+function renderGovernor(gov) {
+  gov = gov || {};
+  setText("m-weight", gov.weight);
+  setText("m-slots", gov.slots);
+  setText("m-inflight", gov.in_flight);
+  setText("m-queue", gov.queue_depth);
+}
+function renderJobs(jobs) {
+  var tb = document.getElementById("jobs");
+  if (jobs == null) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">daemon offline (unobserved)</td></tr>';
+    return;
+  }
+  if (!jobs.length) {
+    tb.innerHTML = '<tr><td colspan="4" class="empty">no active jobs</td></tr>';
+    return;
+  }
+  var now = Date.now();
+  tb.innerHTML = jobs.map(function (j) {
+    var age = (j.started_unix_ms == null)
+      ? "–" : Math.max(0, Math.round((now - j.started_unix_ms) / 1000)) + "s";
+    return "<tr><td>" + esc(j.id == null ? "–" : j.id) + "</td><td>" +
+      esc(j.name == null ? "–" : j.name) + "</td><td>" +
+      esc(j.provider == null ? "–" : j.provider) + "</td><td>" + esc(age) + "</td></tr>";
+  }).join("");
+}
+function renderOci(oci) {
+  oci = oci || {};
+  setText("oci-images", oci.images);
+  var layers = (oci.layers == null) ? null : oci.layers;
+  var present = (oci.present_layers == null) ? null : oci.present_layers;
+  setText("oci-present", (present == null || layers == null)
+    ? null : (present + " / " + layers));
+  setText("oci-mb", (oci.size_bytes == null)
+    ? null : (oci.size_bytes / 1048576).toFixed(1) + " MB");
+  var bar = document.getElementById("oci-bar"), txt = document.getElementById("oci-t");
+  if (present == null || layers == null || layers === 0) {
+    bar.style.width = "0%"; bar.style.background = "var(--border)";
+    txt.textContent = "n/a"; return;
+  }
+  var pct = Math.round(present / layers * 100);
+  bar.style.width = pct + "%"; bar.style.background = "var(--accent)";
+  txt.textContent = pct + "% present";
+}
+function renderSwarms(swarms) {
+  var tb = document.getElementById("swarms");
+  if (swarms == null) {
+    tb.innerHTML = '<tr><td colspan="8" class="empty">daemon offline (unobserved)</td></tr>';
+    return;
+  }
+  if (!swarms.length) {
+    tb.innerHTML = '<tr><td colspan="8" class="empty">no swarm sessions</td></tr>';
+    return;
+  }
+  tb.innerHTML = swarms.map(function (s) {
+    var cpu = (s.cpu_weight_allocated == null || s.cpu_weight_max == null)
+      ? "–" : (s.cpu_weight_allocated + " / " + s.cpu_weight_max);
+    var mem = (s.memory_allocated_mb == null || s.memory_max_mb == null)
+      ? "–" : (s.memory_allocated_mb + " / " + s.memory_max_mb + " MB");
+    var spent = (s.spent_usd == null) ? "–" : ("$" + Number(s.spent_usd).toFixed(2));
+    return "<tr><td>" + esc(s.swarm_id == null ? "–" : s.swarm_id) + "</td><td>" +
+      esc(s.status == null ? "–" : s.status) + "</td><td>" +
+      esc(s.member_count == null ? "–" : s.member_count) + "</td><td>" +
+      esc(s.waiting_count == null ? "–" : s.waiting_count) + "</td><td>" +
+      esc(s.active_jobs == null ? "–" : s.active_jobs) + "</td><td>" +
+      esc(cpu) + "</td><td>" + esc(mem) + "</td><td>" + esc(spent) + "</td></tr>";
+  }).join("");
+}
+function renderEvent(evt) {
+  var psi = evt.psi || {};
+  gauge("g-cpu", psi.cpu); gauge("g-mem", psi.memory); gauge("g-io", psi.io);
+  renderGovernor(evt.governor);
+  renderJobs(evt.jobs);
+  renderOci(evt.oci_cache);
+  renderSwarms(evt.swarms);
+  setText("tick", (evt.ts_secs == null)
+    ? null : new Date(evt.ts_secs * 1000).toLocaleTimeString());
+  streamState.live = true;
+  setBadge("stream", "live", "ok");
+  paintBanner();
+}
 async function refresh() {
   try {
     var res = await Promise.all([fetch("/health"), fetch("/api/v1/fleet")]);
     var health = await res[0].json(), fleet = await res[1].json();
-    document.getElementById("conn").style.display = "none";
+    pollDown = false;
+    paintBanner();
     document.getElementById("version").textContent = "v" + health.version;
     var h = document.getElementById("health");
     h.textContent = health.status;
     h.className = "badge " + (health.status === "healthy" ? "ok" : "bad");
     document.getElementById("cloud").textContent =
       "cloud " + (health.cloud_nodes_active == null ? "n/a" : health.cloud_nodes_active);
-    var psi = health.psi || {};
-    gauge("g-cpu", psi.cpu); gauge("g-mem", psi.memory); gauge("g-io", psi.io);
     document.getElementById("k-gov").textContent = health.governor || "–";
     var runners = fleet.runners || [];
     document.getElementById("k-nodes").textContent = runners.length;
@@ -149,9 +340,122 @@ async function refresh() {
         "</td></tr>";
     }).join("");
   } catch (e) {
-    document.getElementById("conn").style.display = "block";
+    pollDown = true;
+    paintBanner();
   }
 }
+function loadToken() {
+  try { return sessionStorage.getItem("runner.token"); }
+  catch (e) { return null; }
+}
+function saveToken(t) {
+  try { sessionStorage.setItem("runner.token", t); }
+  catch (e) { document.getElementById("storewarn").style.display = "inline"; }
+}
+function clearToken() {
+  try { sessionStorage.removeItem("runner.token"); } catch (e) {}
+}
+function scheduleReconnect() {
+  streamState.live = false;
+  setBadge("stream", "reconnecting", "bad");
+  streamBanner("reconnecting to control plane…");
+  if (streamState.timer) clearTimeout(streamState.timer);
+  streamState.timer = setTimeout(function () {
+    if (streamState.token) connect(streamState.token);
+  }, streamState.backoffMs);
+  streamState.backoffMs = Math.min(streamState.backoffMs * 2, 5000);
+}
+async function consumeStream(token) {
+  var res;
+  try {
+    res = await fetch("/api/v1/stream", {
+      headers: { "Authorization": "Bearer " + token },
+      signal: streamState.abort.signal
+    });
+  } catch (e) { if (!isStale(token)) scheduleReconnect(); return; }
+  if (res.status === 401) {
+    setBadge("stream", "unauthorized", "bad");
+    streamBanner("console token rejected — enter a valid token");
+    return;
+  }
+  if (res.status === 403) {
+    setBadge("stream", "forbidden", "bad");
+    streamBanner("this token needs the operator role");
+    return;
+  }
+  if (!res.ok) { if (!isStale(token)) scheduleReconnect(); return; }
+  streamBanner(null);
+  setBadge("stream", "live", "ok");
+  streamState.backoffMs = 1000;
+  var reader = res.body.getReader();
+  streamState.reader = reader;
+  armWatchdog();
+  var decoder = new TextDecoder();
+  var buf = "";
+  try {
+    for (;;) {
+      var chunk = await reader.read();
+      streamState.lastChunkAt = Date.now();
+      if (chunk.done) break;
+      buf += decoder.decode(chunk.value, { stream: true });
+      var idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        var frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        var line = frame.split("\n").filter(function (l) {
+          return l.indexOf("data: ") === 0;
+        })[0];
+        if (line) {
+          try { renderEvent(JSON.parse(line.slice(6))); } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {}
+  disarmWatchdog();
+  if (!isStale(token)) scheduleReconnect();
+}
+function connect(token) {
+  disconnect(true);
+  streamState.token = token;
+  streamState.abort = new AbortController();
+  saveToken(token);
+  document.getElementById("token").value = "";
+  consumeStream(token);
+}
+function disconnect(silent) {
+  streamState.token = null;
+  streamState.live = false;
+  disarmWatchdog();
+  if (streamState.timer) {
+    clearTimeout(streamState.timer);
+    streamState.timer = null;
+  }
+  if (streamState.abort) {
+    try { streamState.abort.abort(); } catch (e) {}
+    streamState.abort = null;
+  }
+  if (!silent) {
+    setBadge("stream", "offline", "");
+    streamBanner(null);
+  }
+}
+document.getElementById("connect").addEventListener("click", function () {
+  var t = document.getElementById("token").value.trim();
+  if (t) connect(t);
+});
+document.getElementById("signout").addEventListener("click", function () {
+  disconnect(false);
+  clearToken();
+});
+document.getElementById("token").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") {
+    var t = e.target.value.trim();
+    if (t) connect(t);
+  }
+});
+var saved = loadToken();
+if (saved) connect(saved);
+else setBadge("stream", "offline", "");
 refresh();
 setInterval(refresh, 2500);
 </script>

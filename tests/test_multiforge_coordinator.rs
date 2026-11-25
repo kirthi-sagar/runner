@@ -198,6 +198,12 @@ async fn spawn_coordinator_supervises_forges_without_github() {
     // mutations are uncontended.
     std::env::remove_var("RUNNER_GITHUB_TOKEN");
     std::env::set_var("RUNNER_GITLAB_TOKEN", "env-gitlab-token");
+    // Hermetic audit sink: the coordinator must never append to
+    // the production trail during tests.
+    std::env::set_var(
+        "RUNNER_AUDIT_LOG",
+        std::env::temp_dir().join("runner-test-audit-sink.jsonl"),
+    );
 
     // Idle stub: the loop must poll it (204 = no work).
     let (base, seen) = serve_scripted(

@@ -7,19 +7,35 @@ use runner::control_plane::server::{serve_on, AppState};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Hermetic audit trail: the guard keeps the dir alive while the
+/// test holds it, so ledger writes never touch the real trail.
+fn hermetic_ledger(tag: &str) -> (runner::test_support::TempDir, std::path::PathBuf) {
+    let dir = runner::test_support::TempDir::new(tag).unwrap();
+    let path = dir.path().join("audit.jsonl");
+    (dir, path)
+}
+
 /// Spawn the app on an ephemeral loopback port; returns the base
 /// URL plus the session store handle for minting test sessions.
 /// Pins `RUNNER_SOCK` to a path nothing ever serves, so test
 /// mutations can never reach a live production daemon (same
-/// value on every call — safe under parallel tests).
+/// value on every call — safe under parallel tests). The audit
+/// trail is always caller-owned: no test may write the default.
 async fn spawn_dashboard(
     local_token: Option<String>,
     ttl: Duration,
     cache_dir: Option<std::path::PathBuf>,
+    audit_log: std::path::PathBuf,
 ) -> (String, Arc<SessionStore>) {
     std::env::set_var(
         "RUNNER_SOCK",
         std::env::temp_dir().join("runner-test-no-daemon.sock"),
+    );
+    // Backstop sink: any default-trail resolution lands hermetic
+    // (same value on every call — safe under parallel tests).
+    std::env::set_var(
+        "RUNNER_AUDIT_LOG",
+        std::env::temp_dir().join("runner-test-audit-sink.jsonl"),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -29,6 +45,7 @@ async fn spawn_dashboard(
         None,
         local_token,
         cache_dir,
+        Some(audit_log),
     );
     let sessions = state.sessions.clone();
     tokio::spawn(async move { serve_on(listener, state).await });
@@ -72,7 +89,8 @@ async fn read_first_event(response: &mut reqwest::Response) -> serde_json::Value
 
 #[tokio::test]
 async fn stream_rejects_missing_and_unknown_bearers() {
-    let (base, _) = spawn_dashboard(None, Duration::from_secs(60), None).await;
+    let (_audit_dir, ledger) = hermetic_ledger("stream-rejects-missing-and-unknown-bearers");
+    let (base, _) = spawn_dashboard(None, Duration::from_secs(60), None, ledger).await;
     let http = reqwest::Client::new();
     let res = http
         .get(format!("{base}/api/v1/stream"))
@@ -91,7 +109,8 @@ async fn stream_rejects_missing_and_unknown_bearers() {
 
 #[tokio::test]
 async fn stream_serves_every_role_with_shaped_events() {
-    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None).await;
+    let (_audit_dir, ledger) = hermetic_ledger("stream-serves-every-role-with-shaped-events");
+    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None, ledger).await;
     let http = reqwest::Client::new();
     // Viewers observe: the lowest role streams 200 with shape.
     let viewer = sessions.create(Some("v@x.y".to_string()), vec![]).await;
@@ -135,7 +154,8 @@ async fn stream_serves_every_role_with_shaped_events() {
 
 #[tokio::test]
 async fn stream_ends_when_session_lapses() {
-    let (base, sessions) = spawn_dashboard(None, Duration::from_millis(150), None).await;
+    let (_audit_dir, ledger) = hermetic_ledger("stream-ends-when-session-lapses");
+    let (base, sessions) = spawn_dashboard(None, Duration::from_millis(150), None, ledger).await;
     let http = reqwest::Client::new();
     let session = sessions.create(Some("e@x.y".to_string()), vec![]).await;
     let mut res = http
@@ -159,10 +179,12 @@ async fn stream_ends_when_session_lapses() {
 
 #[tokio::test]
 async fn stream_accepts_local_console_token_as_admin() {
+    let (_audit_dir, ledger) = hermetic_ledger("stream-accepts-local-console-token-as-admin");
     let (base, _) = spawn_dashboard(
         Some("console-secret".to_string()),
         Duration::from_secs(60),
         None,
+        ledger,
     )
     .await;
     let http = reqwest::Client::new();
@@ -187,7 +209,8 @@ async fn stream_accepts_local_console_token_as_admin() {
 
 #[tokio::test]
 async fn dashboard_page_serves_single_bundle_airgapped() {
-    let (base, _) = spawn_dashboard(None, Duration::from_secs(60), None).await;
+    let (_audit_dir, ledger) = hermetic_ledger("dashboard-page-serves-single-bundle-airgapped");
+    let (base, _) = spawn_dashboard(None, Duration::from_secs(60), None, ledger).await;
     let page = reqwest::get(format!("{base}/"))
         .await
         .unwrap()
@@ -218,7 +241,8 @@ async fn dashboard_page_serves_single_bundle_airgapped() {
 
 #[tokio::test]
 async fn mutations_gate_by_role_then_proxy_daemon() {
-    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None).await;
+    let (_audit_dir, ledger) = hermetic_ledger("mutations-gate-by-role-then-proxy-daemon");
+    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None, ledger).await;
     let http = reqwest::Client::new();
     let viewer = sessions.create(Some("v@x.y".to_string()), vec![]).await;
     let operator = sessions
@@ -269,7 +293,8 @@ async fn mutations_gate_by_role_then_proxy_daemon() {
 
 #[tokio::test]
 async fn prune_dry_run_reports_shape_without_deleting() {
-    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None).await;
+    let (_audit_dir, ledger) = hermetic_ledger("prune-dry-run-reports-shape-without-deleting");
+    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), None, ledger).await;
     let http = reqwest::Client::new();
     let viewer = sessions.create(Some("v@x.y".to_string()), vec![]).await;
     let operator = sessions
@@ -333,7 +358,13 @@ async fn prune_real_run_removes_only_orphans_in_custom_dir() {
             },
         )
         .unwrap();
-    let (base, sessions) = spawn_dashboard(None, Duration::from_secs(60), Some(dir.clone())).await;
+    let (base, sessions) = spawn_dashboard(
+        None,
+        Duration::from_secs(60),
+        Some(dir.clone()),
+        tmp.path().join("audit.jsonl"),
+    )
+    .await;
     let http = reqwest::Client::new();
     let operator = sessions
         .create(Some("o@x.y".to_string()), vec!["ops".to_string()])
@@ -352,4 +383,153 @@ async fn prune_real_run_removes_only_orphans_in_custom_dir() {
     assert_eq!(body["blobs_bytes"], 32);
     assert!(!cache.dir().join("b".repeat(64)).exists());
     assert!(cache.dir().join("a".repeat(64)).exists());
+}
+
+#[tokio::test]
+async fn whoami_reports_role_and_identity() {
+    let (_audit_dir, ledger) = hermetic_ledger("whoami-reports-role-and-identity");
+    let (base, sessions) =
+        spawn_dashboard(None, Duration::from_secs(60), None, ledger.clone()).await;
+    let http = reqwest::Client::new();
+    let res = http
+        .get(format!("{base}/api/v1/whoami"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+    for (groups, email, role) in [
+        (vec![], Some("v@x.y".to_string()), "viewer"),
+        (
+            vec!["ops".to_string()],
+            Some("o@x.y".to_string()),
+            "operator",
+        ),
+        (vec!["admins".to_string()], None, "admin"),
+    ] {
+        let session = sessions.create(email.clone(), groups).await;
+        let res = http
+            .get(format!("{base}/api/v1/whoami"))
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(body["role"], role);
+        match email {
+            Some(email) => assert_eq!(body["email"], email),
+            None => assert!(body["email"].is_null()),
+        }
+    }
+    // The local console token reads as admin with no email.
+    let (base, _) = spawn_dashboard(
+        Some("console-secret".to_string()),
+        Duration::from_secs(60),
+        None,
+        ledger,
+    )
+    .await;
+    let res = http
+        .get(format!("{base}/api/v1/whoami"))
+        .bearer_auth("console-secret")
+        .send()
+        .await
+        .unwrap();
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["role"], "admin");
+    assert!(body["email"].is_null());
+}
+
+#[tokio::test]
+async fn mutations_append_to_audit_trail() {
+    use runner::audit::{AuditLog, LogLevel};
+    let tmp = runner::test_support::TempDir::new("audit-ledger").unwrap();
+    let ledger = tmp.path().join("audit.jsonl");
+    let (base, sessions) =
+        spawn_dashboard(None, Duration::from_secs(60), None, ledger.clone()).await;
+    let http = reqwest::Client::new();
+    let viewer = sessions.create(Some("v@x.y".to_string()), vec![]).await;
+    let operator = sessions
+        .create(Some("o@x.y".to_string()), vec!["ops".to_string()])
+        .await;
+    let admin = sessions
+        .create(Some("a@x.y".to_string()), vec!["admins".to_string()])
+        .await;
+    // No daemon serves the hermetic socket: authorized attempts
+    // fail loud and still record the attempt + outcome.
+    let res = http
+        .post(format!("{base}/api/v1/jobs/7/cancel"))
+        .bearer_auth(&operator.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let res = http
+        .post(format!("{base}/api/v1/swarms/s1/kill"))
+        .bearer_auth(&admin.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let res = http
+        .post(format!("{base}/api/v1/cache/prune"))
+        .bearer_auth(&operator.token)
+        .json(&serde_json::json!({ "dry_run": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    let log = AuditLog::open(&ledger).unwrap();
+    assert!(log.verify());
+    assert_eq!(log.len(), 3);
+    let body = std::fs::read_to_string(&ledger).unwrap();
+    assert!(body.contains("cancel job '7' by o@x.y [operator]: daemon unreachable"));
+    assert!(body.contains("kill swarm 's1' by a@x.y [admin]: daemon unreachable"));
+    assert!(body.contains("prune cache by o@x.y [operator]: dry_run=true"));
+    // Denied attempts leave no record.
+    let res = http
+        .post(format!("{base}/api/v1/jobs/7/cancel"))
+        .bearer_auth(&viewer.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(AuditLog::open(&ledger).unwrap().len(), 3);
+    // Levels type-check through the ledger schema.
+    let levels: Vec<LogLevel> = body
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<runner::audit::AuditEntry>(line)
+                .unwrap()
+                .event
+                .level
+        })
+        .collect();
+    assert_eq!(
+        levels,
+        vec![LogLevel::Error, LogLevel::Error, LogLevel::Info]
+    );
+}
+
+#[tokio::test]
+async fn audit_attributes_emailless_sso_by_subject() {
+    let (_audit_dir, ledger) = hermetic_ledger("audit-sso-subject");
+    let (base, sessions) =
+        spawn_dashboard(None, Duration::from_secs(60), None, ledger.clone()).await;
+    let http = reqwest::Client::new();
+    // No email claim: attribution falls back to the SSO subject,
+    // never to the local console identity.
+    let session = sessions
+        .create_with_sub(None, vec!["ops".to_string()], Some("user-123".to_string()))
+        .await;
+    let res = http
+        .post(format!("{base}/api/v1/jobs/7/cancel"))
+        .bearer_auth(&session.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body = std::fs::read_to_string(&ledger).unwrap();
+    assert!(body.contains("by sso:user-123 [operator]"), "{body}");
+    assert!(!body.contains("local console"), "{body}");
 }

@@ -2142,6 +2142,7 @@ async fn main() -> Result<()> {
                 oidc,
                 None,
                 config.sandbox.container.cache_dir.clone(),
+                None,
             );
             let listener = tokio::net::TcpListener::bind(&listen).await?;
             eprintln!("runner: control plane listening on {listen}");
@@ -2171,6 +2172,7 @@ async fn main() -> Result<()> {
                 None,
                 Some(token.clone()),
                 config.sandbox.container.cache_dir.clone(),
+                None,
             );
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             // Advertise the bound address (not the requested one),

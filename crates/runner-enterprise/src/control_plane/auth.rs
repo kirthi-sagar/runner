@@ -249,11 +249,13 @@ pub fn role_for_groups(groups: &[String]) -> Role {
     role
 }
 
-/// Granted access: the caller's role plus when the grant lapses
-/// (`None` never expires — the per-run local console token).
-#[derive(Debug, Clone, Copy)]
+/// Granted access: the caller's role, identity, and lapse time.
+/// `expires_at: None` never expires (the per-run local console
+/// token); `actor: None` likewise identifies it.
+#[derive(Debug, Clone)]
 pub struct Grant {
     pub role: Role,
+    pub actor: Option<String>,
     pub expires_at: Option<std::time::Instant>,
 }
 
@@ -271,7 +273,21 @@ pub struct SessionToken {
     pub groups: Vec<String>,
     /// Resolved once at issuance from `groups`.
     pub role: Role,
+    /// OIDC subject (present for SSO-issued sessions).
+    pub sub: Option<String>,
     pub expires_at: Instant,
+}
+
+impl SessionToken {
+    /// Audit identity: verified email first, else the SSO
+    /// subject (`None` only for the local console token, which
+    /// is the sole caller that may read as local).
+    pub fn actor(&self) -> Option<String> {
+        if let Some(email) = &self.email {
+            return Some(email.clone());
+        }
+        self.sub.as_ref().map(|sub| format!("sso:{sub}"))
+    }
 }
 
 /// In-memory session store with TTL eviction.
@@ -306,11 +322,22 @@ impl SessionStore {
     }
 
     pub async fn create(&self, email: Option<String>, groups: Vec<String>) -> SessionToken {
+        self.create_with_sub(email, groups, None).await
+    }
+
+    /// Issue a session carrying its OIDC subject (SSO logins).
+    pub async fn create_with_sub(
+        &self,
+        email: Option<String>,
+        groups: Vec<String>,
+        sub: Option<String>,
+    ) -> SessionToken {
         let session = SessionToken {
             token: random_hex(32),
             email,
             role: role_for_groups(&groups),
             groups,
+            sub,
             expires_at: Instant::now() + self.ttl,
         };
         self.sessions
@@ -454,6 +481,25 @@ mod tests {
         assert!(!grant_expired(Some(now + Duration::from_secs(60)), now));
         assert!(grant_expired(Some(now), now));
         assert!(grant_expired(Some(now - Duration::from_secs(1)), now));
+    }
+
+    #[tokio::test]
+    async fn actor_prefers_email_then_sso_subject() {
+        let store = SessionStore::new(Duration::from_secs(60));
+        let both = store
+            .create_with_sub(
+                Some("a@b.c".to_string()),
+                vec![],
+                Some("user-1".to_string()),
+            )
+            .await;
+        assert_eq!(both.actor().as_deref(), Some("a@b.c"));
+        let subject_only = store
+            .create_with_sub(None, vec![], Some("user-1".to_string()))
+            .await;
+        assert_eq!(subject_only.actor().as_deref(), Some("sso:user-1"));
+        let neither = store.create(None, vec![]).await;
+        assert_eq!(neither.actor(), None);
     }
 
     #[tokio::test]

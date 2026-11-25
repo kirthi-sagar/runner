@@ -26,6 +26,12 @@ async fn spawn_with_cloud_cap_attaches_pool_without_panic() {
     // SAFETY: this test binary owns its process; no other test here
     // depends on the token value.
     std::env::set_var("RUNNER_GITHUB_TOKEN", "test-token");
+    // Hermetic audit sink: the coordinator must never append to
+    // the production trail during tests.
+    std::env::set_var(
+        "RUNNER_AUDIT_LOG",
+        std::env::temp_dir().join("runner-test-audit-sink.jsonl"),
+    );
     let config = coordinator_config();
     let state = new_shared_state();
 

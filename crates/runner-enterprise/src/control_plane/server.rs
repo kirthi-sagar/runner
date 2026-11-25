@@ -25,6 +25,9 @@ pub struct AppState {
     /// OCI cache root override (custom container cache dirs);
     /// `None` reads the default location.
     pub cache_dir: Option<PathBuf>,
+    /// Audit trail override (tests pin a hermetic file);
+    /// `None` writes the default trail.
+    pub audit_log: Option<PathBuf>,
     /// Memoized OCI summary + stamp (shared across viewer ticks).
     pub oci_memo: Arc<Mutex<Option<(Instant, cache::CacheSummary)>>>,
 }
@@ -36,6 +39,7 @@ impl AppState {
         oidc: Option<OidcManager>,
         local_token: Option<String>,
         cache_dir: Option<PathBuf>,
+        audit_log: Option<PathBuf>,
     ) -> Self {
         Self {
             fleet: Arc::new(fleet),
@@ -43,6 +47,7 @@ impl AppState {
             oidc: oidc.map(Arc::new),
             local_token,
             cache_dir,
+            audit_log,
             oci_memo: Arc::new(Mutex::new(None)),
         }
     }
@@ -228,7 +233,11 @@ async fn auth_callback(
     };
     let session = state
         .sessions
-        .create(claims.email.clone(), claims.groups)
+        .create_with_sub(
+            claims.email.clone(),
+            claims.groups,
+            Some(claims.sub.clone()),
+        )
         .await;
     (
         StatusCode::OK,
@@ -261,6 +270,7 @@ async fn authorize(
         if !local.is_empty() && token == local {
             return Ok(Grant {
                 role: Role::Admin,
+                actor: None,
                 expires_at: None,
             });
         }
@@ -298,8 +308,86 @@ async fn authorize(
     }
     Ok(Grant {
         role: session.role,
+        actor: session.actor(),
         expires_at: Some(session.expires_at),
     })
+}
+
+/// Caller identity for audit messages (`None` email and the
+/// local console token both read as the local console).
+fn actor_display(grant: &Grant) -> String {
+    let who = grant.actor.as_deref().unwrap_or("local console");
+    let role = match grant.role {
+        Role::Viewer => "viewer",
+        Role::Operator => "operator",
+        Role::Admin => "admin",
+    };
+    format!("{who} [{role}]")
+}
+
+/// Append one control-plane mutation to the tamper-evident trail
+/// (explicit path, else the default). Fail-open and loud: audit
+/// must never block console mutations, so an unwritable trail
+/// reports to stderr instead. Opens fresh per call so concurrent
+/// CLI writers are picked up; a process-wide mutex serializes
+/// open-append pairs so simultaneous mutations can't fork the
+/// chain (cross-process same-millisecond interleavings remain a
+/// pre-existing multi-writer limitation shared with every CLI
+/// appender, not introduced here).
+async fn audit_mutation(
+    audit_log: Option<&PathBuf>,
+    level: crate::audit::LogLevel,
+    message: String,
+) {
+    let path = match audit_log {
+        Some(path) => path.clone(),
+        None => match crate::audit::default_audit_path() {
+            Some(path) => path,
+            None => {
+                eprintln!("runner: audit trail has no path; skipping record");
+                return;
+            }
+        },
+    };
+    // Full-history replay off the async runtime; the mutex holds
+    // across open-append so simultaneous mutations can't fork.
+    let wrote = tokio::task::spawn_blocking(move || {
+        use std::sync::LazyLock;
+        static WRITE_LOCK: LazyLock<std::sync::Mutex<()>> =
+            LazyLock::new(|| std::sync::Mutex::new(()));
+        let _held = lock_mutex(&WRITE_LOCK);
+        match crate::audit::AuditLog::open(&path) {
+            Ok(mut log) => {
+                log.append(level, "console", &message);
+            }
+            Err(e) => {
+                eprintln!("runner: audit trail unwritable ({}): {e}", path.display());
+            }
+        }
+    })
+    .await;
+    if let Err(e) = wrote {
+        eprintln!("runner: audit task failed: {e}");
+    }
+}
+
+/// Authenticated caller's role + identity (Viewer+): lets the
+/// console enable only the actions this grant may take.
+async fn whoami(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    match authorize(&headers, &state, Role::Viewer).await {
+        Ok(grant) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "role": grant.role,
+                "email": grant.actor,
+            })),
+        )
+            .into_response(),
+        Err(response) => *response,
+    }
 }
 
 /// Daemon IPC call budget: a hung daemon degrades one source
@@ -370,7 +458,9 @@ async fn metrics_payload(state: &AppState) -> serde_json::Value {
     let swarms = ipc_result("swarm_list")
         .await
         .and_then(|v| v.get("swarms").cloned());
-    let oci_cache = oci_summary_cached(state).await;
+    let oci_cache = tokio::time::timeout(OCI_SUMMARY_TIMEOUT, oci_summary_cached(state))
+        .await
+        .unwrap_or_default();
     let ts_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -397,6 +487,11 @@ const METRICS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5
 /// OCI summary freshness: disk scans are shared across viewers
 /// instead of repeating on every tick.
 const OCI_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// OCI summary budget per tick: slow scans degrade to zeros
+/// instead of silencing the stream (same value as the daemon
+/// IPC budget, independently tunable).
+const OCI_SUMMARY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Lock a poison-tolerant mutex (a panicked holder must not wedge
 /// metrics for the rest of the process).
@@ -477,9 +572,10 @@ async fn cancel_job(
     headers: axum::http::HeaderMap,
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    if let Err(response) = authorize(&headers, &state, Role::Operator).await {
-        return *response;
-    }
+    let grant = match authorize(&headers, &state, Role::Operator).await {
+        Ok(grant) => grant,
+        Err(response) => return *response,
+    };
     if job_id.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -487,30 +583,69 @@ async fn cancel_job(
         )
             .into_response();
     }
+    let who = actor_display(&grant);
     let params = serde_json::json!({ "job_id": job_id });
     match proxy_ipc("job_cancel", Some(params)).await {
-        Err(ProxyError::Unreachable) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "daemon unreachable" })),
-        )
-            .into_response(),
-        Err(ProxyError::Daemon(message)) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": message })),
-        )
-            .into_response(),
+        Err(ProxyError::Unreachable) => {
+            audit_mutation(
+                state.audit_log.as_ref(),
+                crate::audit::LogLevel::Error,
+                format!("cancel job '{job_id}' by {who}: daemon unreachable"),
+            )
+            .await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "daemon unreachable" })),
+            )
+                .into_response()
+        }
+        Err(ProxyError::Daemon(message)) => {
+            audit_mutation(
+                state.audit_log.as_ref(),
+                crate::audit::LogLevel::Error,
+                format!("cancel job '{job_id}' by {who}: daemon error: {message}"),
+            )
+            .await;
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
         Ok(result) => {
             let cancelled = result
                 .get("cancelled")
                 .and_then(|cancelled| cancelled.as_bool())
                 .unwrap_or(false);
             if !cancelled {
+                audit_mutation(
+                    state.audit_log.as_ref(),
+                    crate::audit::LogLevel::Warn,
+                    format!("cancel job '{job_id}' by {who}: unknown job"),
+                )
+                .await;
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({ "error": format!("unknown job: '{job_id}'") })),
                 )
                     .into_response();
             }
+            let providers = result
+                .get("providers")
+                .and_then(|providers| providers.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|provider| provider.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            audit_mutation(
+                state.audit_log.as_ref(),
+                crate::audit::LogLevel::Info,
+                format!("cancel job '{job_id}' by {who}: cancelled via {providers}"),
+            )
+            .await;
             (StatusCode::OK, Json(result)).into_response()
         }
     }
@@ -523,9 +658,10 @@ async fn kill_swarm(
     headers: axum::http::HeaderMap,
     axum::extract::Path(swarm_id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    if let Err(response) = authorize(&headers, &state, Role::Admin).await {
-        return *response;
-    }
+    let grant = match authorize(&headers, &state, Role::Admin).await {
+        Ok(grant) => grant,
+        Err(response) => return *response,
+    };
     if swarm_id.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -533,28 +669,57 @@ async fn kill_swarm(
         )
             .into_response();
     }
+    let who = actor_display(&grant);
     let params = serde_json::json!({ "swarm_id": swarm_id });
     match proxy_ipc("swarm_kill", Some(params)).await {
-        Err(ProxyError::Unreachable) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "daemon unreachable" })),
-        )
-            .into_response(),
+        Err(ProxyError::Unreachable) => {
+            audit_mutation(
+                state.audit_log.as_ref(),
+                crate::audit::LogLevel::Error,
+                format!("kill swarm '{swarm_id}' by {who}: daemon unreachable"),
+            )
+            .await;
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "daemon unreachable" })),
+            )
+                .into_response()
+        }
         Err(ProxyError::Daemon(message)) => {
             if message.contains("unknown swarm_id") {
+                audit_mutation(
+                    state.audit_log.as_ref(),
+                    crate::audit::LogLevel::Warn,
+                    format!("kill swarm '{swarm_id}' by {who}: unknown swarm"),
+                )
+                .await;
                 return (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({ "error": message })),
                 )
                     .into_response();
             }
+            audit_mutation(
+                state.audit_log.as_ref(),
+                crate::audit::LogLevel::Error,
+                format!("kill swarm '{swarm_id}' by {who}: daemon error: {message}"),
+            )
+            .await;
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),
             )
                 .into_response()
         }
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Ok(result) => {
+            audit_mutation(
+                state.audit_log.as_ref(),
+                crate::audit::LogLevel::Info,
+                format!("kill swarm '{swarm_id}' by {who}: terminated"),
+            )
+            .await;
+            (StatusCode::OK, Json(result)).into_response()
+        }
     }
 }
 
@@ -622,16 +787,24 @@ async fn prune_cache(
     headers: axum::http::HeaderMap,
     Json(body): Json<PruneRequest>,
 ) -> axum::response::Response {
-    if let Err(response) = authorize(&headers, &state, Role::Operator).await {
-        return *response;
-    }
+    let grant = match authorize(&headers, &state, Role::Operator).await {
+        Ok(grant) => grant,
+        Err(response) => return *response,
+    };
     let dry_run = body.dry_run;
     let dir = state
         .cache_dir
         .clone()
         .unwrap_or_else(cache::LayerCache::default_dir);
     let outcome = tokio::task::spawn_blocking(move || run_prune(dry_run, dir)).await;
+    let who = actor_display(&grant);
     let Ok((tallies, error)) = outcome else {
+        audit_mutation(
+            state.audit_log.as_ref(),
+            crate::audit::LogLevel::Error,
+            format!("prune cache by {who}: task failed"),
+        )
+        .await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "prune task failed" })),
@@ -647,8 +820,26 @@ async fn prune_cache(
     });
     if let Some(error) = error {
         payload["error"] = serde_json::json!(error);
+        audit_mutation(
+            state.audit_log.as_ref(),
+            crate::audit::LogLevel::Error,
+            format!(
+                "prune cache by {who}: failed after {} blobs: {error}",
+                tallies.blobs,
+            ),
+        )
+        .await;
         return (StatusCode::BAD_GATEWAY, Json(payload)).into_response();
     }
+    audit_mutation(
+        state.audit_log.as_ref(),
+        crate::audit::LogLevel::Info,
+        format!(
+            "prune cache by {who}: dry_run={dry_run} removed {} blobs ({} bytes), {} staging files",
+            tallies.blobs, tallies.blob_bytes, tallies.tmps,
+        ),
+    )
+    .await;
     (StatusCode::OK, Json(payload)).into_response()
 }
 
@@ -659,6 +850,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/dashboard", get(dashboard))
         .route("/health", get(health))
         .route("/api/v1/stream", get(metrics_stream))
+        .route("/api/v1/whoami", get(whoami))
         .route("/api/v1/jobs/:id/cancel", post(cancel_job))
         .route("/api/v1/cache/prune", post(prune_cache))
         .route("/api/v1/swarms/:id/kill", post(kill_swarm))

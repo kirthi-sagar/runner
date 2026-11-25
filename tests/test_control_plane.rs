@@ -52,12 +52,19 @@ fn oidc_login_url_has_state_nonce_and_scope() {
 
 /// Spawn the app on an ephemeral loopback port; returns base URL.
 async fn spawn_app(oidc: Option<OidcManager>) -> String {
+    // Backstop sink: any default-trail resolution lands hermetic
+    // (same value on every call — safe under parallel tests).
+    std::env::set_var(
+        "RUNNER_AUDIT_LOG",
+        std::env::temp_dir().join("runner-test-audit-sink.jsonl"),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let state = AppState::new(
         FleetRegistry::new(),
         SessionStore::new(Duration::from_secs(60)),
         oidc,
+        None,
         None,
         None,
     );

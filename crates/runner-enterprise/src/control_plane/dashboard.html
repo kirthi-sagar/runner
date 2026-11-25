@@ -54,6 +54,11 @@
     color: var(--fg); border-radius: 6px; padding: 4px 12px;
     font-size: 13px; cursor: pointer; }
   header button:hover { border-color: var(--accent); }
+  main button { background: var(--panel); border: 1px solid var(--border);
+    color: var(--fg); border-radius: 6px; padding: 2px 10px;
+    font-size: 12px; cursor: pointer; }
+  main button:hover:not(:disabled) { border-color: var(--accent); }
+  main button:disabled { opacity: 0.45; cursor: not-allowed; }
   .meters { display: grid; grid-template-columns: repeat(4, 1fr);
     gap: 12px; }
   .mono { font-variant-numeric: tabular-nums; }
@@ -112,8 +117,8 @@
   <section>
     <h2>Active jobs <span class="note">(this host, live)</span></h2>
     <div class="card"><table>
-      <thead><tr><th>Job ID</th><th>Name</th><th>Provider</th><th>Age</th></tr></thead>
-      <tbody id="jobs"><tr><td colspan="4" class="empty">waiting for stream…</td></tr></tbody>
+      <thead><tr><th>Job ID</th><th>Name</th><th>Provider</th><th>Age</th><th>Action</th></tr></thead>
+      <tbody id="jobs"><tr><td colspan="5" class="empty">waiting for stream…</td></tr></tbody>
     </table></div>
   </section>
   <section>
@@ -127,14 +132,19 @@
     <div class="card" style="margin-top:12px">
       <div class="gauge"><div class="row"><span>Blob presence</span><span id="oci-t">–</span></div>
         <div class="bar"><div id="oci-bar"></div></div></div>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <button data-action="prune-preview" id="btn-preview">Preview prune</button>
+        <button data-action="prune" id="btn-prune">Prune cache</button>
+        <span id="action-status" style="color:var(--muted);font-size:13px"></span>
+      </div>
     </div>
   </section>
   <section>
     <h2>Swarm sessions <span class="note">(this host, live)</span></h2>
     <div class="card"><table>
       <thead><tr><th>Swarm</th><th>Status</th><th>Members</th><th>Waiting</th>
-        <th>Jobs</th><th>CPU weight</th><th>Memory</th><th>Spent</th></tr></thead>
-      <tbody id="swarms"><tr><td colspan="8" class="empty">waiting for stream…</td></tr></tbody>
+        <th>Jobs</th><th>CPU weight</th><th>Memory</th><th>Spent</th><th>Action</th></tr></thead>
+      <tbody id="swarms"><tr><td colspan="9" class="empty">waiting for stream…</td></tr></tbody>
     </table></div>
   </section>
   <section>
@@ -191,7 +201,81 @@ function streamBanner(msg) {
   streamState.bannerMsg = msg;
   paintBanner();
 }
-var streamState = { token: null, abort: null, backoffMs: 1000, timer: null, live: false, bannerMsg: null, reader: null, watchdog: null, lastChunkAt: 0, activeId: 0 };
+var streamState = { token: null, abort: null, backoffMs: 1000, timer: null, live: false, bannerMsg: null, reader: null, watchdog: null, lastChunkAt: 0, activeId: 0, role: null, lastEvent: null };
+function roleRank(r) {
+  if (r === "admin") return 2;
+  if (r === "operator") return 1;
+  return 0;
+}
+function canUse(min) {
+  return roleRank(streamState.role) >= roleRank(min);
+}
+function paintStaticButtons() {
+  var ops = canUse("operator");
+  var preview = document.getElementById("btn-preview");
+  var prune = document.getElementById("btn-prune");
+  preview.disabled = !ops;
+  prune.disabled = !ops;
+  preview.title = ops ? "" : "Requires operator role";
+  prune.title = ops ? "" : "Requires operator role";
+}
+function actionStatus(msg, isErr) {
+  var el = document.getElementById("action-status");
+  el.textContent = msg;
+  el.style.color = isErr ? "var(--red)" : "var(--muted)";
+}
+function authHeader() {
+  return { "Authorization": "Bearer " + streamState.token };
+}
+async function fetchRole(token) {
+  try {
+    var res = await fetch("/api/v1/whoami", {
+      headers: { "Authorization": "Bearer " + token }
+    });
+    if (!res.ok) return null;
+    var me = await res.json();
+    return (me && me.role) || null;
+  } catch (e) { return null; }
+}
+async function doCancel(id) {
+  if (!confirm("Cancel job " + id + " across all providers sharing this ID? Tracking stops; a remote worker may finish.")) return;
+  actionStatus("Cancelling " + id + "…", false);
+  try {
+    var res = await fetch("/api/v1/jobs/" + encodeURIComponent(id) + "/cancel", {
+      method: "POST", headers: authHeader()
+    });
+    if (res.ok) actionStatus("Cancelled " + id, false);
+    else actionStatus("Cancel failed (" + res.status + ")", true);
+  } catch (e) { actionStatus("Cancel failed: unreachable", true); }
+}
+async function doKill(id) {
+  if (!confirm("Terminate swarm " + id + "? Member jobs are abandoned.")) return;
+  actionStatus("Terminating " + id + "…", false);
+  try {
+    var res = await fetch("/api/v1/swarms/" + encodeURIComponent(id) + "/kill", {
+      method: "POST", headers: authHeader()
+    });
+    if (res.ok) actionStatus("Terminated " + id, false);
+    else actionStatus("Terminate failed (" + res.status + ")", true);
+  } catch (e) { actionStatus("Terminate failed: unreachable", true); }
+}
+async function doPrune(dryRun) {
+  if (!dryRun && !confirm("Prune unreferenced blobs and stale staging? This deletes cache data.")) return;
+  actionStatus(dryRun ? "Previewing prune…" : "Pruning…", false);
+  try {
+    var res = await fetch("/api/v1/cache/prune", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + streamState.token, "Content-Type": "application/json" },
+      body: JSON.stringify({ dry_run: dryRun })
+    });
+    if (!res.ok) { actionStatus("Prune failed (" + res.status + ")", true); return; }
+    var out = await res.json();
+    actionStatus(
+      (dryRun ? "Would remove " : "Removed ") +
+      out.blobs_removed + " blobs (" + out.blobs_bytes + " bytes), " +
+      out.tmps_removed + " staging files", false);
+  } catch (e) { actionStatus("Prune failed: unreachable", true); }
+}
 function isStale(token, myId) {
   if (myId !== streamState.activeId) return true;
   if (streamState.token !== token) return true;
@@ -228,20 +312,24 @@ function renderGovernor(gov) {
 function renderJobs(jobs) {
   var tb = document.getElementById("jobs");
   if (jobs == null) {
-    tb.innerHTML = '<tr><td colspan="4" class="empty">daemon offline (unobserved)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty">daemon offline (unobserved)</td></tr>';
     return;
   }
   if (!jobs.length) {
-    tb.innerHTML = '<tr><td colspan="4" class="empty">no active jobs</td></tr>';
+    tb.innerHTML = '<tr><td colspan="5" class="empty">no active jobs</td></tr>';
     return;
   }
   var now = Date.now();
+  var off = canUse("operator") ? "" : " disabled title=\"Requires operator role\"";
   tb.innerHTML = jobs.map(function (j) {
     var age = (j.started_unix_ms == null)
       ? "–" : Math.max(0, Math.round((now - j.started_unix_ms) / 1000)) + "s";
-    return "<tr><td>" + esc(j.id == null ? "–" : j.id) + "</td><td>" +
+    var id = (j.id == null) ? "–" : j.id;
+    return "<tr><td>" + esc(id) + "</td><td>" +
       esc(j.name == null ? "–" : j.name) + "</td><td>" +
-      esc(j.provider == null ? "–" : j.provider) + "</td><td>" + esc(age) + "</td></tr>";
+      esc(j.provider == null ? "–" : j.provider) + "</td><td>" + esc(age) +
+      "</td><td><button data-action=\"cancel\" data-id=\"" + esc(String(j.id == null ? "" : j.id)) +
+      "\"" + off + ">Cancel</button></td></tr>";
   }).join("");
 }
 function renderOci(oci) {
@@ -265,13 +353,14 @@ function renderOci(oci) {
 function renderSwarms(swarms) {
   var tb = document.getElementById("swarms");
   if (swarms == null) {
-    tb.innerHTML = '<tr><td colspan="8" class="empty">daemon offline (unobserved)</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty">daemon offline (unobserved)</td></tr>';
     return;
   }
   if (!swarms.length) {
-    tb.innerHTML = '<tr><td colspan="8" class="empty">no swarm sessions</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty">no swarm sessions</td></tr>';
     return;
   }
+  var off = canUse("admin") ? "" : " disabled title=\"Requires admin role\"";
   tb.innerHTML = swarms.map(function (s) {
     var cpu = (s.cpu_weight_allocated == null || s.cpu_weight_max == null)
       ? "–" : (s.cpu_weight_allocated + " / " + s.cpu_weight_max);
@@ -283,10 +372,12 @@ function renderSwarms(swarms) {
       esc(s.member_count == null ? "–" : s.member_count) + "</td><td>" +
       esc(s.waiting_count == null ? "–" : s.waiting_count) + "</td><td>" +
       esc(s.active_jobs == null ? "–" : s.active_jobs) + "</td><td>" +
-      esc(cpu) + "</td><td>" + esc(mem) + "</td><td>" + esc(spent) + "</td></tr>";
+      esc(cpu) + "</td><td>" + esc(mem) + "</td><td>" + esc(spent) +
+      "</td><td><button data-action=\"kill\" data-id=\"" +
+      esc(String(s.swarm_id == null ? "" : s.swarm_id)) + "\"" + off + ">Kill</button></td></tr>";
   }).join("");
 }
-function renderEvent(evt) {
+function renderTables(evt) {
   var psi = evt.psi || {};
   gauge("g-cpu", psi.cpu); gauge("g-mem", psi.memory); gauge("g-io", psi.io);
   renderGovernor(evt.governor);
@@ -295,6 +386,10 @@ function renderEvent(evt) {
   renderSwarms(evt.swarms);
   setText("tick", (evt.ts_secs == null)
     ? null : new Date(evt.ts_secs * 1000).toLocaleTimeString());
+}
+function renderEvent(evt) {
+  streamState.lastEvent = evt;
+  renderTables(evt);
   streamState.live = true;
   setBadge("stream", "live", "ok");
   paintBanner();
@@ -441,12 +536,25 @@ function connect(token) {
   streamState.abort = new AbortController();
   saveToken(token);
   document.getElementById("token").value = "";
+  // Least privilege until whoami answers; repaints rows too so
+  // buttons never linger enabled for a weaker grant.
+  streamState.role = null;
+  paintStaticButtons();
+  fetchRole(token).then(function (role) {
+    if (token !== streamState.token) return;
+    streamState.role = role || "viewer";
+    paintStaticButtons();
+    if (streamState.lastEvent) renderTables(streamState.lastEvent);
+  });
   consumeStream(token, streamState.activeId);
 }
 function disconnect(silent) {
   streamState.token = null;
   streamState.live = false;
+  streamState.role = null;
   disarmWatchdog();
+  paintStaticButtons();
+  if (streamState.lastEvent) renderTables(streamState.lastEvent);
   if (streamState.timer) {
     clearTimeout(streamState.timer);
     streamState.timer = null;
@@ -460,6 +568,14 @@ function disconnect(silent) {
     streamBanner(null);
   }
 }
+document.addEventListener("click", function (e) {
+  var el = e.target;
+  var action = (el && el.dataset) ? el.dataset.action : null;
+  if (action === "cancel") doCancel(el.dataset.id);
+  else if (action === "kill") doKill(el.dataset.id);
+  else if (action === "prune-preview") doPrune(true);
+  else if (action === "prune") doPrune(false);
+});
 document.getElementById("connect").addEventListener("click", function () {
   var t = document.getElementById("token").value.trim();
   if (t) connect(t);
@@ -475,6 +591,7 @@ document.getElementById("token").addEventListener("keydown", function (e) {
   }
 });
 var saved = loadToken();
+paintStaticButtons();
 if (saved) connect(saved);
 else setBadge("stream", "offline", "");
 refresh();

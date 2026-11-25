@@ -130,8 +130,16 @@ impl AuditLog {
 }
 
 /// Default audit trail (`~/.config/runner/audit.jsonl` on unix,
-/// `%APPDATA%\runner\audit.jsonl` on Windows).
+/// `%APPDATA%\runner\audit.jsonl` on Windows). `RUNNER_AUDIT_LOG`
+/// overrides everything (tests pin a hermetic path so they never
+/// append to the production trail).
 pub fn default_audit_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("RUNNER_AUDIT_LOG") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
     #[cfg(unix)]
     {
         std::env::var_os("HOME").map(|home| {
@@ -275,6 +283,28 @@ pub fn export_trail(path: &Path) -> Result<String, ExportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Path override: explicit values win, blanks fall through to
+    // the platform default (previous value restored — env is
+    // process-global).
+    #[test]
+    fn audit_path_override_respects_explicit_paths_only() {
+        let prior = std::env::var("RUNNER_AUDIT_LOG").ok();
+        std::env::set_var("RUNNER_AUDIT_LOG", "  /tmp/hermetic-audit.jsonl  ");
+        assert_eq!(
+            default_audit_path(),
+            Some(PathBuf::from("/tmp/hermetic-audit.jsonl"))
+        );
+        std::env::set_var("RUNNER_AUDIT_LOG", "   ");
+        assert_ne!(
+            default_audit_path(),
+            Some(PathBuf::from("/tmp/hermetic-audit.jsonl"))
+        );
+        match prior {
+            Some(value) => std::env::set_var("RUNNER_AUDIT_LOG", value),
+            None => std::env::remove_var("RUNNER_AUDIT_LOG"),
+        }
+    }
 
     #[test]
     fn append_verify_and_replay_round_trip() {

@@ -67,7 +67,7 @@ fn asset_pattern_matches_release_matrix() {
         "installer tarball pattern drifted"
     );
     assert!(
-        sh.contains("https://github.com/kirthi-sagar/runner/releases/download/v$VERSION"),
+        sh.contains("https://github.com/runnerhq/runner/releases/download/v$VERSION"),
         "installer base URL drifted"
     );
     // Every target the workflow builds must be installable.
@@ -95,6 +95,20 @@ fn asset_pattern_matches_release_matrix() {
     assert!(workflow.contains("STAGE=\"runner-darwin-arm64\""));
     assert!(workflow.contains("\"$STAGE.tar.gz\""));
     assert!(sh.contains("runner-darwin-arm64.tar.gz"));
+}
+
+#[test]
+fn windows_installer_pins_runnerhq_repo() {
+    let ps1 = read("install.ps1");
+    // The native installer must fetch releases from this repo.
+    assert!(
+        ps1.contains("$repo = 'runnerhq/runner'"),
+        "install.ps1 repo pin drifted"
+    );
+    assert!(
+        ps1.contains("https://raw.githubusercontent.com/runnerhq/runner/main/install.ps1"),
+        "install.ps1 bootstrap URL drifted"
+    );
 }
 
 #[test]

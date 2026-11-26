@@ -3,10 +3,10 @@
 .SYNOPSIS
   Installs the runner Windows Tier-3 binary (no admin required).
 .EXAMPLE
-  irm https://raw.githubusercontent.com/kirthi-sagar/runner/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/runnerhq/runner/main/install.ps1 | iex
 #>
 $ErrorActionPreference = 'Stop'
-$repo = 'kirthi-sagar/runner'
+$repo = 'runnerhq/runner'
 $tag = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
 $dir = Join-Path $env:LOCALAPPDATA 'runner'
 New-Item -ItemType Directory -Force -Path $dir | Out-Null

@@ -864,13 +864,13 @@ mod tests {
         assert_eq!(parsed.repository, "library/node");
         assert_eq!(parsed.manifest_ref(), "20");
         // Namespaced Hub image: no library prefix.
-        let parsed = OciReference::parse("kirthi-sagar/runner:latest").unwrap();
+        let parsed = OciReference::parse("runnerhq/runner:latest").unwrap();
         assert_eq!(parsed.registry, DOCKER_HUB_REGISTRY);
-        assert_eq!(parsed.repository, "kirthi-sagar/runner");
+        assert_eq!(parsed.repository, "runnerhq/runner");
         // Custom registries keep their paths verbatim.
-        let parsed = OciReference::parse("ghcr.io/kirthi-sagar/runner:latest").unwrap();
+        let parsed = OciReference::parse("ghcr.io/runnerhq/runner:latest").unwrap();
         assert_eq!(parsed.registry, "ghcr.io");
-        assert_eq!(parsed.repository, "kirthi-sagar/runner");
+        assert_eq!(parsed.repository, "runnerhq/runner");
         let parsed = OciReference::parse("quay.io/fedora/fedora:40").unwrap();
         assert_eq!(parsed.registry, "quay.io");
         assert_eq!(parsed.repository, "fedora/fedora");

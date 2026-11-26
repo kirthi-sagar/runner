@@ -230,6 +230,11 @@ async fn dashboard_page_serves_single_bundle_airgapped() {
         "id=\"swarms\"",
         "id=\"tick\"",
         "sessionStorage",
+        "clearToken()",
+        "id=\"role\"",
+        "id=\"theme-toggle\"",
+        "id=\"rbac-role\"",
+        "identity lookup failed",
     ] {
         assert!(page.contains(marker), "missing {marker}");
     }
